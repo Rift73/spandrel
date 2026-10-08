@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -47,6 +48,17 @@ def test_size_requirements():
         "https://github.com/OpenModelDB/model-hub/releases/download/kbnet/1x-KBNet_sidd.pth",
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # the exported graph only ran at multiples of 4
+    assert_traced_padding(
+        KBNetArch().load(
+            KBNet_s(
+                width=16, middle_blk_num=1, enc_blk_nums=[1, 1], dec_blk_nums=[1, 1]
+            ).state_dict()
+        )
+    )
 
 
 def test_derain(snapshot):

@@ -84,6 +84,33 @@ def pad_tensor(t: torch.Tensor, req: SizeRequirements):
     w = t.shape[-1]
     h = t.shape[-2]
 
+    if torch.onnx.is_in_onnx_export() and (req.multiple_of > 1 or req.square):
+        # During ONNX export, w and h are traced, and the Python branches below
+        # would freeze the example input's padding into the graph. So compute the
+        # same padding with branch-free arithmetic (`a + (a < b) * (b - a)` is
+        # max(a, b)) and always pad. A minimum alone keeps the code below: padding
+        # for it would add shape operations to graphs that have none (e.g. plain
+        # ESRGAN).
+        def padded_size(x: int) -> int:
+            x = x + (x < req.minimum) * (req.minimum - x)
+            return x + (req.multiple_of - x % req.multiple_of) % req.multiple_of
+
+        padded_w, padded_h = padded_size(w), padded_size(h)
+        if req.square:
+            padded_w = padded_h = padded_w + (padded_w < padded_h) * (
+                padded_h - padded_w
+            )
+        pad_w, pad_h = padded_w - w, padded_h - h
+
+        # reflect padding only allows a maximum padding of size - 1
+        reflect_pad_w = pad_w - (pad_w > w - 1) * (pad_w - (w - 1))
+        reflect_pad_h = pad_h - (pad_h > h - 1) * (pad_h - (h - 1))
+        t = torch.nn.functional.pad(t, (0, reflect_pad_w, 0, reflect_pad_h), "reflect")
+        t = torch.nn.functional.pad(
+            t, (0, pad_w - reflect_pad_w, 0, pad_h - reflect_pad_h), "replicate"
+        )
+        return True, t
+
     pad_w, pad_h = req.get_padding(w, h)
 
     if pad_w or pad_h:

@@ -468,7 +468,10 @@ class FastSpatialWindowAttention(nn.Module):
             (self.ws - W % self.ws) % self.ws,
             (self.ws - H % self.ws) % self.ws,
         )
-        if pad_r > 0 or pad_b > 0:
+        # During ONNX export, H and W are traced: pad (and crop) always, or the
+        # example input's padding (usually none) would be frozen into the graph
+        padded = torch.onnx.is_in_onnx_export() or pad_r > 0 or pad_b > 0
+        if padded:
             x = F.pad(x.view(B, H, W, C), (0, 0, 0, pad_r, 0, pad_b)).view(B, -1, C)
 
         H_pad, W_pad = H + pad_b, W + pad_r
@@ -497,7 +500,7 @@ class FastSpatialWindowAttention(nn.Module):
             .contiguous()
             .view(B, H_pad, W_pad, C)
         )
-        if pad_r > 0 or pad_b > 0:
+        if padded:
             x = x[:, :H, :W, :].contiguous()
         return x.view(B, L, C)
 

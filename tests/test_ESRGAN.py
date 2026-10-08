@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -39,6 +40,22 @@ def test_size_requirements():
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # a pixel-unshuffle model's exported graph only ran at multiples of 4
+    assert_traced_padding(
+        ESRGANArch().load(
+            ESRGAN(
+                in_nc=12,
+                out_nc=3,
+                num_filters=16,
+                num_blocks=1,
+                scale=4,
+                shuffle_factor=2,
+            ).state_dict()
+        )
+    )
 
 
 def test_ESRGAN_community(snapshot):

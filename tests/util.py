@@ -18,6 +18,7 @@ from inspect import getsource
 from pathlib import Path
 from textwrap import indent
 from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
+from unittest import mock
 from urllib.parse import unquote, urlencode, urlparse
 
 import cv2
@@ -708,6 +709,42 @@ def assert_size_requirements(
         raise AssertionError(
             "Failed size requirement test for non-square models"
         ) from failed_non_square
+
+
+def assert_traced_padding(
+    model: ImageModelDescriptor,
+    sizes: tuple[tuple[int, int], ...] = ((37, 51), (19, 23), (64, 72)),
+) -> None:
+    """
+    Traces the model on a 32x32 input the way `torch.onnx.export` does (the
+    TorchScript tracer with ONNX export mode on), then checks that the traced
+    graph matches the model at sizes that need other padding. A graph that froze
+    the example's padding fails here.
+    """
+    device = get_test_device()
+    model.to(device).eval()
+
+    class Traced(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model.model
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return model(x)
+
+    example = torch.rand(1, model.input_channels, 32, 32, device=device)
+    with mock.patch.object(torch.onnx, "is_in_onnx_export", return_value=True):
+        traced = torch.jit.trace(Traced(), example, check_trace=False)
+
+    for height, width in sizes:
+        x = torch.rand(1, model.input_channels, height, width, device=device)
+        try:
+            with torch.no_grad():
+                expected = model(x.clone())
+                actual = traced(x.clone())
+            torch.testing.assert_close(actual, expected)
+        except Exception as e:
+            raise AssertionError(f"Traced graph failed at {width=} {height=}") from e
 
 
 @lru_cache

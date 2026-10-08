@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -55,6 +56,23 @@ def test_size_requirements():
         name="HAT_SRx4.pth",
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # the exported graph only ran at multiples of the window size
+    assert_traced_padding(
+        HATArch().load(
+            HAT(
+                embed_dim=48,
+                depths=(2,),
+                num_heads=(2,),
+                window_size=16,
+                squeeze_factor=8,
+                upscale=2,
+                upsampler="pixelshuffle",
+            ).state_dict()
+        )
+    )
 
 
 def test_HAT_S_2x(snapshot):

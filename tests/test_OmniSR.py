@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -41,6 +42,13 @@ def test_size_requirements():
         "https://github.com/Phhofm/models/raw/main/2xHFA2kAVCOmniSR/2xHFA2kAVCOmniSR.pth"
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # upstream chaiNNer #1816: the exported graph only ran at multiples of the window
+    assert_traced_padding(
+        OmniSRArch().load(OmniSR(num_feat=16, res_num=1, up_scale=2).state_dict())
+    )
 
 
 def test_OmniSR_official_x4(snapshot):

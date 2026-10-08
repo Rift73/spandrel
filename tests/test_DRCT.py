@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -37,6 +38,22 @@ def test_size_requirements():
         "https://github.com/Phhofm/models/releases/download/4xRealWebPhoto_v4_drct-l/4xRealWebPhoto_v4_drct-l.pth"
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # the exported graph skipped the padding to multiples of 16
+    assert_traced_padding(
+        DRCTArch().load(
+            DRCT(
+                embed_dim=30,
+                depths=(2,),
+                num_heads=(2,),
+                window_size=8,
+                upscale=2,
+                upsampler="pixelshuffle",
+            ).state_dict()
+        )
+    )
 
 
 def test_community_model(snapshot):

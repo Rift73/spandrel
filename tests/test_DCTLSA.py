@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -34,6 +35,15 @@ def test_size_requirements():
         name="2x_dctlsa.pth",
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # the exported graph only ran at multiples of the window size
+    assert_traced_padding(
+        DCTLSAArch().load(
+            DCTLSA(in_nc=3, nf=20, num_modules=6, out_nc=3, upscale=2).state_dict()
+        )
+    )
 
 
 def test_x4(snapshot):

@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
     skip_if_unchanged,
 )
@@ -32,6 +33,22 @@ def test_size_requirements():
         "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/002_lightweightSR_DIV2K_s64w8_SwinIR-S_x2.pth"
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # the exported graph only ran at multiples of the window size
+    assert_traced_padding(
+        SwinIRArch().load(
+            SwinIR(
+                embed_dim=16,
+                depths=[2],
+                num_heads=[2],
+                window_size=8,
+                upscale=2,
+                upsampler="pixelshuffledirect",
+            ).state_dict()
+        )
+    )
 
 
 def test_SwinIR_M_s64w8_2x(snapshot):

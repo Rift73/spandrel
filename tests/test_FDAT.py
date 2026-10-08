@@ -6,6 +6,7 @@ from .util import (
     assert_image_inference,
     assert_loads_correctly,
     assert_size_requirements,
+    assert_traced_padding,
     disallowed_props,
 )
 
@@ -66,6 +67,23 @@ def test_size_requirements():
         name="2x_DF2K_FDAT_M_500k_fp16.safetensors",
     )
     assert_size_requirements(file.load_model())
+
+
+def test_traced_padding():
+    # the exported graph only ran at multiples of the attention window
+    assert_traced_padding(
+        FDATArch().load(
+            FDAT(
+                embed_dim=32,
+                num_groups=1,
+                depth_per_group=1,
+                num_heads=2,
+                mid_dim=16,
+                scale=2,
+                upsampler_type="pixelshuffle",
+            ).state_dict()
+        )
+    )
 
 
 def test_fdat_m(snapshot):
