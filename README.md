@@ -1,5 +1,7 @@
 # Spandrel
 
+> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with three more architectures: DRFT, DUAL and SST (with SST-Real). Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
+
 [![PyPI package](https://img.shields.io/badge/pip%20install-spandrel-brightgreen)](https://pypi.org/project/spandrel/)
 [![version number](https://img.shields.io/pypi/v/spandrel?color=green&label=version)](https://github.com/chaiNNer-org/spandrel/releases)
 [![PyPi Downloads](https://img.shields.io/pypi/dw/spandrel)](https://pypi.org/project/spandrel/#files)
@@ -111,6 +113,8 @@ Spandrel currently supports a limited amount of network architectures. If the ar
 - [RCAN](https://github.com/yulunzhang/RCAN) | [Models](https://www.dropbox.com/s/qm9vc0p0w9i4s0n/models_ECCV2018RCAN.zip?dl=0)
 - [FDAT](https://github.com/stinkybread/FDAT) | [Models](https://github.com/the-database/traiNNer-redux/releases/download/pretrained-models/2x_DF2K_FDAT_M_500k_fp16.safetensors)
 - [AuraSR](https://github.com/fal-ai/aura-sr) | Models: [v1](https://huggingface.co/fal/AuraSR) | [v2](https://huggingface.co/fal/AuraSR-v2)
+- DRFT and DUAL (this fork)
+- [SST](https://github.com/dslisleedh/SST) and SST-Real | [Models](https://github.com/dslisleedh/SST/tree/main/pretrained_models)
 
 #### Face Restoration
 
