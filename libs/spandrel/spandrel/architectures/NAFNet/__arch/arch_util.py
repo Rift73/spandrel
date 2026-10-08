@@ -7,9 +7,16 @@ class LayerNormFunction(torch.autograd.Function):
     def forward(ctx, x, weight, bias, eps):  # type: ignore
         ctx.eps = eps
         _N, C, _H, _W = x.size()
+        # fp16 overflows (x - mu)^2 once |x - mu| exceeds 256; like F.layer_norm,
+        # compute the statistics in fp32, then cast back
+        half = x.dtype == torch.float16
+        if half:
+            x = x.float()
         mu = x.mean(1, keepdim=True)
         var = (x - mu).pow(2).mean(1, keepdim=True)
         y = (x - mu) / (var + eps).sqrt()
+        if half:
+            y = y.half()
         ctx.save_for_backward(y, var, weight)
         y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
         return y

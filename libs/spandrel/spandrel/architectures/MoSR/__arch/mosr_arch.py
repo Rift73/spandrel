@@ -44,9 +44,16 @@ class LayerNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        # fp16 overflows (x - u)^2 once |x - u| exceeds 256; like F.layer_norm,
+        # compute the statistics in fp32, then cast back
+        half = x.dtype == torch.float16
+        if half:
+            x = x.float()
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
+        if half:
+            x = x.half()
         return self.weight[:, None, None] * x + self.bias[:, None, None]
 
 
