@@ -74,6 +74,37 @@ def test_loaded_model_matches(folded, pixel_unshuffle):
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("groups", [2, 3])
+def test_half_survives_a_last_group_beyond_fp16(groups):
+    torch.manual_seed(0)
+    indices = ((0, 1, 2, 5), (2, 3, 4, 5), (0, 1, 2, 5))[:groups]
+    model = DUAL(scale=2, embed_dim=32, depths=(4,) * groups, layer_indices=indices)
+    model.eval().prepare_for_export()
+    for name, parameter in model.named_parameters():
+        if name.endswith("conv.experts"):
+            parameter.data.normal_(0, 0.02)
+    # A trained 1x Light's last group conv writes about 125k from inputs of a few
+    # hundred, beyond FP16's 65504; the final norm right after it scales that back
+    # down. Here: inputs of about 50, outputs of about 250k, weights below 1000.
+    group = model.groups[-1]
+    project = group.layers[-1].ffn.project
+    for parameter in (project.weight, project.bias):
+        parameter.data.mul_(1000)
+    for parameter in (group.conv.base.weight, group.conv.base.bias, group.conv.experts):
+        parameter.data.mul_(1e4)
+    image = torch.rand(1, 3, 37, 29)
+    with torch.no_grad():
+        expected = model(image)
+        assert not torch.isfinite(copy.deepcopy(model).half()(image.half())).all()
+
+    descriptor = MAIN_REGISTRY.load(model.state_dict())
+    assert descriptor.supports_half
+    assert descriptor.model.state_dict().keys() == model.state_dict().keys()
+    with torch.no_grad():
+        actual = descriptor.model.half()(image.half()).float()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=5e-3)
+
+
 def test_size_requirements():
     assert_size_requirements(DUALArch().load(_small(scale=2).state_dict()))
     assert_size_requirements(DUALArch().load(_small(pixel_unshuffle=True).state_dict()))

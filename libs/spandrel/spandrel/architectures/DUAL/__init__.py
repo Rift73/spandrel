@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from itertools import combinations
 
+import torch
+import torch.nn as nn
 from typing_extensions import override
 
 from spandrel.util import KeyCondition, get_seq_len
@@ -13,7 +15,54 @@ from ...__helpers.model_descriptor import (
     SizeRequirements,
     StateDict,
 )
-from .__arch.dual_arch import DUAL
+from .__arch.dual_arch import (
+    DUAL,
+    PremixedDeployedDynamicConv3x3,
+    TokenNorm,
+    _premixed_conv3x3,
+)
+
+
+class _FP16SafeDynamicConv(PremixedDeployedDynamicConv3x3):
+    """The last group's dynamic convolution, in FP32 when the model runs in FP16.
+
+    Its output can far exceed FP16's 65504 (125k in a trained 1x Light) although
+    the final norm right after it scales it back down. Only this convolution and
+    the group's residual sum run in FP32; the persistent weights stay FP16.
+    """
+
+    def __init__(self, source: PremixedDeployedDynamicConv3x3) -> None:
+        nn.Module.__init__(self)
+        # Reuse loaded parameters under exactly the same state-dict keys.
+        self.base = source.base
+        self.experts = source.experts
+        self.router = source.router
+
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training or x.dtype != torch.float16:
+            return super().forward(x)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return _premixed_conv3x3(
+                x.float(),
+                self.base.weight.float(),
+                self.base.bias.float(),
+                self.experts.float(),
+                self.coefficients(x),
+            )
+
+
+class _FP16SafeTokenNorm(TokenNorm):
+    """A norm reading the FP32 sum above; it hands the trunk back its own dtype."""
+
+    def __init__(self, source: TokenNorm) -> None:
+        nn.Module.__init__(self)
+        self.norm = source.norm
+
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x).to(self.norm.weight.dtype)
+
 
 # Original layer indices of a full group: 2 and 5 are the context layers.
 _FULL = (0, 1, 2, 3, 4, 5)
@@ -166,7 +215,7 @@ class DUALArch(Architecture[DUAL]):
             architecture=self,
             purpose="Restoration" if scale == 1 else "SR",
             tags=tags,
-            supports_half=False,
+            supports_half=True,
             supports_bfloat16=True,
             scale=scale,
             input_channels=3,
@@ -175,10 +224,20 @@ class DUALArch(Architecture[DUAL]):
         )
 
         # Fold the static EDBB bases for inference after the strict load above;
-        # the routers and expert kernels stay input-dependent.
+        # the routers and expert kernels stay input-dependent. Fold on CPU in
+        # FP32 (the factors in FP64) before ModelLoader moves this module to the
+        # GPU and chaiNNer optionally calls half().
+        model.float().eval()
         if not folded:
-            model.eval()
             model.prepare_for_export()
+        last = model.groups[-1]
+        assert isinstance(last.conv, PremixedDeployedDynamicConv3x3)
+        last.conv = _FP16SafeDynamicConv(last.conv)
+        model.final_norm = _FP16SafeTokenNorm(model.final_norm)
+        if len(model.groups) == 2:
+            # The cross-scale retrieval reads group 1's output too.
+            model.xr.norm_u = _FP16SafeTokenNorm(model.xr.norm_u)
+        model.requires_grad_(False).eval()
         return descriptor
 
 
