@@ -92,7 +92,8 @@ def test_half_survives_a_last_group_beyond_fp16(groups):
         parameter.data.mul_(1000)
     for parameter in (group.conv.base.weight, group.conv.base.bias, group.conv.experts):
         parameter.data.mul_(1e4)
-    image = torch.rand(1, 3, 37, 29)
+    # Two images: a batch takes the dynamic conv's grouped path.
+    image = torch.rand(2, 3, 37, 29)
     with torch.no_grad():
         expected = model(image)
         assert not torch.isfinite(copy.deepcopy(model).half()(image.half())).all()
