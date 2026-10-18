@@ -13,6 +13,8 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
+from ...__arch_helpers.attention import pad_heads
+
 
 def img2windows(img, H_sp, W_sp, num_heads):
     """
@@ -264,28 +266,28 @@ class Spatial_Attention(nn.Module):
         # partition the q,k,v, image to window, channels last throughout
         windows = img2windows(qkv, self.H_sp, self.W_sp, self.num_heads)
         q, k, v = windows[0], windows[1], windows[2]
-
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)  # B head N C @ B head C N --> B head N N
+        N = q.shape[2]
 
         # calculate drpe
-        if self.position_bias:
-            attn = attn + self.relative_position_bias()
-
-        N = attn.shape[3]
+        bias = self.relative_position_bias() if self.position_bias else None
 
         # use mask for shift window
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(-1, nW, self.num_heads, N, N) + mask.unsqueeze(
-                1
-            ).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            mask = mask.unsqueeze(1)
+            bias = mask if bias is None else bias + mask
+            bias = bias.unsqueeze(0).expand(q.shape[0] // nW, -1, -1, -1, -1)
+            bias = bias.reshape(q.shape[0], -1, N, N)
 
-        attn = nn.functional.softmax(attn, dim=-1, dtype=attn.dtype)
-        attn = self.attn_drop(attn)
-
-        x = attn @ v  # B head N N @ B head N C
+        # B head N C @ B head C N --> B head N N, softmax, @ B head N C
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            scale=self.scale,
+        )
 
         # merge the window, window to image
         x = windows2img(x, self.H_sp, self.W_sp, H, W)  # B H' W' C
@@ -427,9 +429,17 @@ class Adaptive_Spatial_Attention(nn.Module):
         B, L, C = x.shape
         assert L == H * W, "flatten img_tokens has wrong size"
 
-        qkv = self.qkv(x).reshape(B, H, W, 3, C).permute(3, 0, 1, 2, 4)  # 3, B, H, W, C
-        # V without partition
-        v = qkv[2].permute(0, 3, 1, 2).contiguous()  # B, C, H, W
+        # Heads as wide as qkv makes them (an export may pad them); each branch has
+        # half of them
+        qkv = self.qkv(x).reshape(B, H, W, 3, self.num_heads, -1)
+        d = C // self.num_heads
+        # V without partition: its C channels
+        v = qkv[:, :, :, 2, :, :d].permute(0, 3, 4, 1, 2).reshape(B, C, H, W)
+        # heads padded to a multiple of 8 for the fused attention kernels
+        qkv = pad_heads(qkv)
+        width = qkv.shape[-1]
+        C = self.num_heads * width
+        qkv = qkv.reshape(B, H, W, 3, C).permute(3, 0, 1, 2, 4)  # 3, B, H, W, C
 
         # image padding, channels last (no round trip through B, C, H, W)
         max_split_size = max(self.split_size[0], self.split_size[1])
@@ -470,20 +480,19 @@ class Adaptive_Spatial_Attention(nn.Module):
             x2 = torch.roll(
                 x2_shift, shifts=(self.shift_size[1], self.shift_size[0]), dims=(1, 2)
             )
-            x1 = x1[:, :H, :W, :].reshape(B, L, C // 2)
-            x2 = x2[:, :H, :W, :].reshape(B, L, C // 2)
             # attention output
-            attened_x = torch.cat([x1, x2], dim=2)
+            attened_x = torch.cat([x1[:, :H, :W, :], x2[:, :H, :W, :]], dim=3)
 
         else:
-            x1 = self.attns[0](qkv[..., : C // 2], _H, _W)[:, :H, :W, :].reshape(
-                B, L, C // 2
-            )
-            x2 = self.attns[1](qkv[..., C // 2 :], _H, _W)[:, :H, :W, :].reshape(
-                B, L, C // 2
-            )
+            x1 = self.attns[0](qkv[..., : C // 2], _H, _W)[:, :H, :W, :]
+            x2 = self.attns[1](qkv[..., C // 2 :], _H, _W)[:, :H, :W, :]
             # attention output
-            attened_x = torch.cat([x1, x2], dim=2)
+            attened_x = torch.cat([x1, x2], dim=3)
+
+        # the heads' own channels: B, L, C
+        attened_x = attened_x.reshape(B, H, W, self.num_heads, width)
+        C = self.num_heads * d
+        attened_x = attened_x[..., :d].reshape(B, L, C)
 
         # convolution output
         conv_x = self.dwconv(v)

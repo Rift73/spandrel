@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
+from ...__arch_helpers.attention import pad_heads
 from ...__arch_helpers.padding import pad_to_multiple
 
 
@@ -192,7 +193,6 @@ class WindowAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         trunc_normal_(self.relative_position_bias_table, std=0.02)
-        self.softmax = nn.Softmax(dim=-1)
 
     def relative_position_bias(self, rpi):
         relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(
@@ -212,31 +212,35 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         b_, n, _ = x.shape
-        # Heads as wide as qkv makes them, which an export may pad
-        qkv = self.qkv(x).reshape(b_, n, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        # Heads as wide as qkv makes them (an export may pad them), padded to a
+        # multiple of 8 for the fused attention kernels
+        qkv = self.qkv(x).reshape(b_, n, 3, self.num_heads, -1)
+        d = qkv.shape[-1]
+        qkv = pad_heads(qkv).permute(2, 0, 3, 1, 4)
         q, k, v = (
             qkv[0],
             qkv[1],
             qkv[2],
         )  # make torchscript happy (cannot use tensor as tuple)
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn + self.relative_position_bias(rpi)
-
+        bias = self.relative_position_bias(rpi)
         if mask is not None:
+            # every window's mask on top of every head's bias
             nw = mask.shape[0]
-            attn = attn.view(b_ // nw, nw, self.num_heads, n, n) + mask.unsqueeze(
-                1
-            ).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, n, n)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
+            bias = (bias + mask.unsqueeze(1)).unsqueeze(0)
+            bias = bias.expand(b_ // nw, -1, -1, -1, -1).reshape(b_, -1, n, n)
 
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(b_, n, -1)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            scale=self.scale,
+        )
+        if x.shape[-1] != d:
+            x = x[..., :d]
+        x = x.transpose(1, 2).reshape(b_, n, -1)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -412,7 +416,6 @@ class OCAB(nn.Module):
         )  # 2*Wh-1 * 2*Ww-1, nH
 
         trunc_normal_(self.relative_position_bias_table, std=0.02)
-        self.softmax = nn.Softmax(dim=-1)
 
         self.proj = nn.Linear(dim, dim)
 
@@ -442,11 +445,14 @@ class OCAB(nn.Module):
         x = self.norm1(x)
         x = x.view(b, h, w, c)
 
-        # Channels last throughout; heads as wide as qkv makes them, which an export
-        # may pad
-        qkv = self.qkv(x).view(b, h, w, 3, -1)
-        hd = qkv.shape[-1]
-        d = hd // heads
+        # Channels last throughout; heads as wide as qkv makes them (an export may pad
+        # them), padded to a multiple of 8 for the fused attention kernels
+        qkv = self.qkv(x).view(b, h, w, 3, heads, -1)
+        width = qkv.shape[-1]
+        qkv = pad_heads(qkv)
+        d = qkv.shape[-1]
+        hd = heads * d
+        qkv = qkv.reshape(b, h, w, 3, hd)
         nh, nw = h // ws, w // ws
 
         # query windows: nw*b, nH, ws*ws, d
@@ -479,18 +485,17 @@ class OCAB(nn.Module):
         )  # 2, nw*b, nH, ow*ow, d
         k, v = kv_windows[0], kv_windows[1]
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn + self.relative_position_bias(rpi)
-
-        attn = self.softmax(attn)
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=self.relative_position_bias(rpi), scale=self.scale
+        )
+        if d != width:
+            x = x[..., :width]
 
         # merge windows
         x = (
-            (attn @ v)
-            .reshape(b, nh, nw, heads, ws, ws, d)
+            x.reshape(b, nh, nw, heads, ws, ws, width)
             .permute(0, 1, 4, 2, 5, 3, 6)
-            .reshape(b, h * w, hd)
+            .reshape(b, h * w, heads * width)
         )
 
         x = self.proj(x) + shortcut
