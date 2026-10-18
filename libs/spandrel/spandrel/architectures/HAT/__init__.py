@@ -10,6 +10,7 @@ from ...__helpers.model_descriptor import (
     SizeRequirements,
     StateDict,
 )
+from ..__arch_helpers.fp32_last_group import FP32LayerNorm, keep_last_group_in_fp32
 from .__arch.HAT import HAT
 
 
@@ -212,19 +213,24 @@ class HATArch(Architecture[HAT]):
             f"{resi_connection}",
         ]
 
-        return ImageModelDescriptor(
+        descriptor = ImageModelDescriptor(
             model,
             state_dict,
             architecture=self,
             purpose="Restoration" if upscale == 1 else "SR",
             tags=tags,
-            supports_half=False,
+            supports_half=True,
             supports_bfloat16=True,
             scale=upscale,
             input_channels=in_chans,
             output_channels=in_chans,
             size_requirements=SizeRequirements(minimum=16),
         )
+        # FP16: the last group's closing convolution writes far beyond 65504 in
+        # trained models; it, the group's residual sum and the final norm run in FP32
+        model.layers[-1].conv = keep_last_group_in_fp32(model.layers[-1].conv)
+        model.norm = FP32LayerNorm(model.norm)
+        return descriptor
 
 
 __all__ = ["HATArch", "HAT"]

@@ -1,3 +1,9 @@
+import copy
+
+import pytest
+import torch
+
+from spandrel import MAIN_REGISTRY
 from spandrel.architectures.HAT import HAT, HATArch
 
 from .util import (
@@ -191,3 +197,33 @@ def test_HAT_community2(snapshot):
         model,
         [TestImage.SR_16, TestImage.SR_32, TestImage.SR_64],
     )
+
+
+@pytest.mark.parametrize("upscale", [1, 2])
+def test_half_survives_a_last_group_beyond_fp16(upscale):
+    torch.manual_seed(0)
+    model = HAT(
+        embed_dim=24,
+        depths=(2, 2),
+        num_heads=(2, 2),
+        window_size=8,
+        compress_ratio=2,
+        squeeze_factor=4,
+        upsampler="pixelshuffle",
+        upscale=upscale,
+    ).eval()
+    # A trained 4x HAT-L writes about 722k in its last group's closing conv,
+    # beyond FP16's 65504; the final norm right after it scales that back down.
+    for parameter in model.layers[-1].get_submodule("conv").parameters():
+        parameter.data.mul_(1e5)
+    image = torch.rand(1, 3, 24, 20)
+    with torch.no_grad():
+        expected = model(image)
+        assert not torch.isfinite(copy.deepcopy(model).half()(image.half())).all()
+
+    descriptor = MAIN_REGISTRY.load(model.state_dict())
+    assert descriptor.supports_half
+    assert descriptor.model.state_dict().keys() == model.state_dict().keys()
+    with torch.no_grad():
+        actual = descriptor.model.eval().half()(image.half()).float()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=5e-3)

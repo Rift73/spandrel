@@ -1,4 +1,9 @@
-from spandrel import ModelLoader
+import copy
+
+import pytest
+import torch
+
+from spandrel import MAIN_REGISTRY, ModelLoader
 from spandrel.architectures.DAT import DAT, DATArch
 
 from .util import (
@@ -165,3 +170,31 @@ def test_DAT_tags(snapshot):
     assert loader.load_from_state_dict(dat_2.state_dict()) == snapshot(
         exclude=disallowed_props
     )
+
+
+@pytest.mark.parametrize("resi_connection", ["1conv", "3conv"])
+def test_half_survives_a_last_group_beyond_fp16(resi_connection):
+    torch.manual_seed(0)
+    model = DAT(
+        embed_dim=24,
+        depth=[2, 2],
+        num_heads=[2, 2],
+        upsampler="pixelshuffle",
+        upscale=2,
+        resi_connection=resi_connection,
+    ).eval()
+    # A trained 4x DAT2 writes about 121k in its last group's closing conv,
+    # beyond FP16's 65504; the final norm right after it scales that back down.
+    for parameter in model.layers[-1].get_submodule("conv").parameters():
+        parameter.data.mul_(1e5)
+    image = torch.rand(1, 3, 24, 20)
+    with torch.no_grad():
+        expected = model(image)
+        assert not torch.isfinite(copy.deepcopy(model).half()(image.half())).all()
+
+    descriptor = MAIN_REGISTRY.load(model.state_dict())
+    assert descriptor.supports_half
+    assert descriptor.model.state_dict().keys() == model.state_dict().keys()
+    with torch.no_grad():
+        actual = descriptor.model.eval().half()(image.half()).float()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=5e-3)
