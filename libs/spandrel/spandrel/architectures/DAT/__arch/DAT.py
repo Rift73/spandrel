@@ -638,8 +638,16 @@ class Adaptive_Channel_Attention(nn.Module):
 
         v_ = v.reshape(B, C, N).contiguous().view(B, C, H, W)
 
+        # Each norm sums the squares of every token (65,536 at 256x256), which fp16
+        # overflows when an exported graph computes it in fp16; like PyTorch's own
+        # kernels, normalize in fp32, then cast back
+        half = q.dtype == torch.float16
+        if half:
+            q, k = q.float(), k.float()
         q = torch.nn.functional.normalize(q, dim=-1)
         k = torch.nn.functional.normalize(k, dim=-1)
+        if half:
+            q, k = q.half(), k.half()
 
         attn = (q @ k.transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)

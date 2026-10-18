@@ -5,6 +5,7 @@ import torch
 
 from spandrel import MAIN_REGISTRY, ModelLoader
 from spandrel.architectures.DAT import DAT, DATArch
+from spandrel.architectures.DAT.__arch.DAT import Adaptive_Channel_Attention
 
 from .util import (
     ModelFile,
@@ -198,3 +199,29 @@ def test_half_survives_a_last_group_beyond_fp16(resi_connection):
     with torch.no_grad():
         actual = descriptor.model.eval().half()(image.half()).float()
     torch.testing.assert_close(actual, expected, rtol=0, atol=5e-3)
+
+
+def test_half_channel_attention_normalizes_in_fp32():
+    """The channel attention's norms sum the squares of every token, which overflows
+    when an exported fp16 graph (TensorRT, ONNX Runtime) computes it in fp16: they run
+    on fp32 values in a traced fp16 module."""
+
+    class Square(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = Adaptive_Channel_Attention(dim=24, num_heads=2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.attention(x, 8, 8)
+
+    module = Square().eval().half().requires_grad_(False)
+    x = torch.rand(1, 64, 24).half()
+    graph = torch.jit.trace_module(module, {"forward": x}).inlined_graph
+    norms = [
+        node
+        for node in graph.nodes()
+        if node.kind() in ("aten::linalg_vector_norm", "aten::norm")
+    ]
+    assert len(norms) == 2
+    # Each norm reads a cast (to fp32), not the fp16 q or k themselves
+    assert all(node.inputsAt(0).node().kind() == "aten::to" for node in norms)
