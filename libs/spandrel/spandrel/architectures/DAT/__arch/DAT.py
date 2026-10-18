@@ -14,29 +14,53 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
 
-def img2windows(img, H_sp, W_sp):
+def img2windows(img, H_sp, W_sp, num_heads):
     """
-    Input: Image (B, C, H, W)
-    Output: Window Partition (B', N, C)
+    Input: Images (S, B, H, W, C), channels last
+    Output: Window Partition (S, B', num_heads, N, C // num_heads)
     """
-    B, C, H, W = img.shape
-    img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
-    img_perm = (
-        img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp * W_sp, C)
+    S, B, H, W, C = img.shape
+    img_reshape = img.reshape(
+        S, B, H // H_sp, H_sp, W // W_sp, W_sp, num_heads, C // num_heads
+    )
+    img_perm = img_reshape.permute(0, 1, 2, 4, 6, 3, 5, 7).reshape(
+        S, -1, num_heads, H_sp * W_sp, C // num_heads
     )
     return img_perm
 
 
 def windows2img(img_splits_hw, H_sp, W_sp, H, W):
     """
-    Input: Window Partition (B', N, C)
+    Input: Window Partition (B', num_heads, N, C // num_heads)
     Output: Image (B, H, W, C)
     """
-    B = int(img_splits_hw.shape[0] / (H * W / H_sp / W_sp))
-
-    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1)
-    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    _, num_heads, _, head_dim = img_splits_hw.shape
+    img = img_splits_hw.view(-1, H // H_sp, W // W_sp, num_heads, H_sp, W_sp, head_dim)
+    img = img.permute(0, 1, 4, 2, 5, 3, 6).reshape(-1, H, W, num_heads * head_dim)
     return img
+
+
+def shifted_window_mask(H, W, split_h, split_w, shift_h, shift_w, dtype, device):
+    """Swin's attention mask for shifted windows (nW, N, N): 0 between tokens of the same
+    region, -100 across. Each axis has three regions, split at -split and -shift; the
+    regions come from index comparisons, so an exported graph needs no scatter and the
+    mask is built on the model's device."""
+
+    def regions(n, split, shift):
+        index = torch.arange(n, device=device)
+        past_split = (index >= n - split).to(torch.int32)
+        return past_split + (index >= n - shift).to(torch.int32)
+
+    img_mask = regions(H, split_h, shift_h)[:, None] * 3 + regions(W, split_w, shift_w)
+    mask_windows = (
+        img_mask.view(H // split_h, split_h, W // split_w, split_w)
+        .permute(0, 2, 1, 3)
+        .reshape(-1, split_h * split_w)
+    )
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    return torch.zeros(attn_mask.shape, dtype=dtype, device=device).masked_fill(
+        attn_mask != 0, -100.0
+    )
 
 
 class SpatialGate(nn.Module):
@@ -223,31 +247,14 @@ class Spatial_Attention(nn.Module):
 
         self.attn_drop = nn.Dropout(attn_drop)
 
-    def im2win(self, x, H, W):
-        B, _N, C = x.shape
-        x = x.transpose(-2, -1).contiguous().view(B, C, H, W)
-        x = img2windows(x, self.H_sp, self.W_sp)
-        x = (
-            x.reshape(-1, self.H_sp * self.W_sp, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        return x
-
     def forward(self, qkv, H, W, mask=None):
         """
-        Input: qkv: (B, 3*L, C), H, W, mask: (B, N, N), N is the window size
+        Input: qkv: (3, B, H, W, C), H, W, mask: (nW, N, N), N is the window size
         Output: x (B, H, W, C)
         """
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        B, L, C = q.shape
-        assert L == H * W, "flatten img_tokens has wrong size"
-
-        # partition the q,k,v, image to window
-        q = self.im2win(q, H, W)
-        k = self.im2win(k, H, W)
-        v = self.im2win(v, H, W)
+        # partition the q,k,v, image to window, channels last throughout
+        windows = img2windows(qkv, self.H_sp, self.W_sp, self.num_heads)
+        q, k, v = windows[0], windows[1], windows[2]
 
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)  # B head N C @ B head C N --> B head N N
@@ -269,18 +276,15 @@ class Spatial_Attention(nn.Module):
         # use mask for shift window
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(
-                0
-            )
+            attn = attn.view(-1, nW, self.num_heads, N, N) + mask.unsqueeze(
+                1
+            ).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
 
         attn = nn.functional.softmax(attn, dim=-1, dtype=attn.dtype)
         attn = self.attn_drop(attn)
 
-        x = attn @ v
-        x = x.transpose(1, 2).reshape(
-            -1, self.H_sp * self.W_sp, C
-        )  # B head N N @ B head N C
+        x = attn @ v  # B head N N @ B head N C
 
         # merge the window, window to image
         x = windows2img(x, self.H_sp, self.W_sp, H, W)  # B H' W' C
@@ -389,83 +393,29 @@ class Adaptive_Spatial_Attention(nn.Module):
             nn.Conv2d(dim // 16, 1, kernel_size=1),
         )
 
-    def calculate_mask(self, H, W, dtype=None):
+    def calculate_mask(self, H, W, dtype=None, device=None):
         # The implementation builds on Swin Transformer code https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
         # calculate attention mask for shift window
-        img_mask_0 = torch.zeros((1, H, W, 1), dtype=dtype)  # 1 H W 1 idx=0
-        img_mask_1 = torch.zeros((1, H, W, 1), dtype=dtype)  # 1 H W 1 idx=1
-        h_slices_0 = (
-            slice(0, -self.split_size[0]),
-            slice(-self.split_size[0], -self.shift_size[0]),
-            slice(-self.shift_size[0], None),
-        )
-        w_slices_0 = (
-            slice(0, -self.split_size[1]),
-            slice(-self.split_size[1], -self.shift_size[1]),
-            slice(-self.shift_size[1], None),
-        )
-
-        h_slices_1 = (
-            slice(0, -self.split_size[1]),
-            slice(-self.split_size[1], -self.shift_size[1]),
-            slice(-self.shift_size[1], None),
-        )
-        w_slices_1 = (
-            slice(0, -self.split_size[0]),
-            slice(-self.split_size[0], -self.shift_size[0]),
-            slice(-self.shift_size[0], None),
-        )
-        cnt = 0
-        for h in h_slices_0:
-            for w in w_slices_0:
-                img_mask_0[:, h, w, :] = cnt
-                cnt += 1
-        cnt = 0
-        for h in h_slices_1:
-            for w in w_slices_1:
-                img_mask_1[:, h, w, :] = cnt
-                cnt += 1
-
-        # calculate mask for window-0
-        img_mask_0 = img_mask_0.view(
-            1,
-            H // self.split_size[0],
+        attn_mask_0 = shifted_window_mask(
+            H,
+            W,
             self.split_size[0],
-            W // self.split_size[1],
             self.split_size[1],
-            1,
+            self.shift_size[0],
+            self.shift_size[1],
+            dtype,
+            device,
         )
-        img_mask_0 = (
-            img_mask_0.permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(-1, self.split_size[0], self.split_size[1], 1)
-        )  # nW, sw[0], sw[1], 1
-        mask_windows_0 = img_mask_0.view(-1, self.split_size[0] * self.split_size[1])
-        attn_mask_0 = mask_windows_0.unsqueeze(1) - mask_windows_0.unsqueeze(2)
-        attn_mask_0 = attn_mask_0.masked_fill(attn_mask_0 != 0, -100.0).masked_fill(
-            attn_mask_0 == 0, 0.0
-        )
-
-        # calculate mask for window-1
-        img_mask_1 = img_mask_1.view(
-            1,
-            H // self.split_size[1],
+        attn_mask_1 = shifted_window_mask(
+            H,
+            W,
             self.split_size[1],
-            W // self.split_size[0],
             self.split_size[0],
-            1,
+            self.shift_size[1],
+            self.shift_size[0],
+            dtype,
+            device,
         )
-        img_mask_1 = (
-            img_mask_1.permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(-1, self.split_size[1], self.split_size[0], 1)
-        )  # nW, sw[1], sw[0], 1
-        mask_windows_1 = img_mask_1.view(-1, self.split_size[1] * self.split_size[0])
-        attn_mask_1 = mask_windows_1.unsqueeze(1) - mask_windows_1.unsqueeze(2)
-        attn_mask_1 = attn_mask_1.masked_fill(attn_mask_1 != 0, -100.0).masked_fill(
-            attn_mask_1 == 0, 0.0
-        )
-
         return attn_mask_0, attn_mask_1
 
     def forward(self, x, H, W):
@@ -476,49 +426,39 @@ class Adaptive_Spatial_Attention(nn.Module):
         B, L, C = x.shape
         assert L == H * W, "flatten img_tokens has wrong size"
 
-        qkv = self.qkv(x).reshape(B, -1, 3, C).permute(2, 0, 1, 3)  # 3, B, HW, C
+        qkv = self.qkv(x).reshape(B, H, W, 3, C).permute(3, 0, 1, 2, 4)  # 3, B, H, W, C
         # V without partition
-        v = qkv[2].transpose(-2, -1).contiguous().view(B, C, H, W)
+        v = qkv[2].permute(0, 3, 1, 2).contiguous()  # B, C, H, W
 
-        # image padding
+        # image padding, channels last (no round trip through B, C, H, W)
         max_split_size = max(self.split_size[0], self.split_size[1])
-        pad_l = pad_t = 0
         pad_r = (max_split_size - W % max_split_size) % max_split_size
         pad_b = (max_split_size - H % max_split_size) % max_split_size
 
-        qkv = qkv.reshape(3 * B, H, W, C).permute(0, 3, 1, 2)  # 3B C H W
-        qkv = (
-            F.pad(qkv, (pad_l, pad_r, pad_t, pad_b))
-            .reshape(3, B, C, -1)
-            .transpose(-2, -1)
-        )  # l r t b
+        qkv = F.pad(qkv, (0, 0, 0, pad_r, 0, pad_b))  # 3, B, _H, _W, C
         _H = pad_b + H
         _W = pad_r + W
-        _L = _H * _W
 
         # window-0 and window-1 on split channels [C/2, C/2]; for square windows (e.g., 8x8), window-0 and window-1 can be merged
         # shift in block: (0, 4, 8, ...), (2, 6, 10, ...), (0, 4, 8, ...), (2, 6, 10, ...), ...
         if (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or (
             self.rg_idx % 2 != 0 and self.b_idx % 4 == 0
         ):
-            qkv = qkv.view(3, B, _H, _W, C)
             qkv_0 = torch.roll(
                 qkv[:, :, :, :, : C // 2],
                 shifts=(-self.shift_size[0], -self.shift_size[1]),
                 dims=(2, 3),
             )
-            qkv_0 = qkv_0.view(3, B, _L, C // 2)
             qkv_1 = torch.roll(
                 qkv[:, :, :, :, C // 2 :],
                 shifts=(-self.shift_size[1], -self.shift_size[0]),
                 dims=(2, 3),
             )
-            qkv_1 = qkv_1.view(3, B, _L, C // 2)
 
             if self.patches_resolution != _H or self.patches_resolution != _W:
-                mask_tmp = self.calculate_mask(_H, _W, dtype=x.dtype)
-                x1_shift = self.attns[0](qkv_0, _H, _W, mask=mask_tmp[0].to(x.device))
-                x2_shift = self.attns[1](qkv_1, _H, _W, mask=mask_tmp[1].to(x.device))
+                mask_tmp = self.calculate_mask(_H, _W, dtype=x.dtype, device=x.device)
+                x1_shift = self.attns[0](qkv_0, _H, _W, mask=mask_tmp[0])
+                x2_shift = self.attns[1](qkv_1, _H, _W, mask=mask_tmp[1])
             else:
                 x1_shift = self.attns[0](qkv_0, _H, _W, mask=self.attn_mask_0)
                 x2_shift = self.attns[1](qkv_1, _H, _W, mask=self.attn_mask_1)
@@ -535,10 +475,10 @@ class Adaptive_Spatial_Attention(nn.Module):
             attened_x = torch.cat([x1, x2], dim=2)
 
         else:
-            x1 = self.attns[0](qkv[:, :, :, : C // 2], _H, _W)[:, :H, :W, :].reshape(
+            x1 = self.attns[0](qkv[..., : C // 2], _H, _W)[:, :H, :W, :].reshape(
                 B, L, C // 2
             )
-            x2 = self.attns[1](qkv[:, :, :, C // 2 :], _H, _W)[:, :H, :W, :].reshape(
+            x2 = self.attns[1](qkv[..., C // 2 :], _H, _W)[:, :H, :W, :].reshape(
                 B, L, C // 2
             )
             # attention output
