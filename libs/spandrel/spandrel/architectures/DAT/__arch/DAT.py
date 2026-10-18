@@ -247,6 +247,15 @@ class Spatial_Attention(nn.Module):
 
         self.attn_drop = nn.Dropout(attn_drop)
 
+    def relative_position_bias(self):
+        pos = self.pos(self.rpe_biases)
+        # select position bias
+        relative_position_bias = pos[self.relative_position_index.view(-1)].view(
+            self.H_sp * self.W_sp, self.H_sp * self.W_sp, -1
+        )
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        return relative_position_bias.unsqueeze(0)
+
     def forward(self, qkv, H, W, mask=None):
         """
         Input: qkv: (3, B, H, W, C), H, W, mask: (nW, N, N), N is the window size
@@ -261,15 +270,7 @@ class Spatial_Attention(nn.Module):
 
         # calculate drpe
         if self.position_bias:
-            pos = self.pos(self.rpe_biases)
-            # select position bias
-            relative_position_bias = pos[self.relative_position_index.view(-1)].view(
-                self.H_sp * self.W_sp, self.H_sp * self.W_sp, -1
-            )
-            relative_position_bias = relative_position_bias.permute(
-                2, 0, 1
-            ).contiguous()
-            attn = attn + relative_position_bias.unsqueeze(0)
+            attn = attn + self.relative_position_bias()
 
         N = attn.shape[3]
 

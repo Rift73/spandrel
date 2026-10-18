@@ -6,7 +6,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
-from einops import rearrange
+from torch.nn import functional as F
 
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
@@ -194,27 +194,7 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=0.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, rpi, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*b, n, c)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        b_, n, c = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(b_, n, 3, self.num_heads, c // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
-        q, k, v = (
-            qkv[0],
-            qkv[1],
-            qkv[2],
-        )  # make torchscript happy (cannot use tensor as tuple)
-
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
+    def relative_position_bias(self, rpi):
         relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(
             self.window_size[0] * self.window_size[1],
             self.window_size[0] * self.window_size[1],
@@ -223,7 +203,26 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(
             2, 0, 1
         ).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+        return relative_position_bias.unsqueeze(0)
+
+    def forward(self, x, rpi, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*b, n, c)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        b_, n, _ = x.shape
+        # Heads as wide as qkv makes them, which an export may pad
+        qkv = self.qkv(x).reshape(b_, n, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = (
+            qkv[0],
+            qkv[1],
+            qkv[2],
+        )  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        attn = attn + self.relative_position_bias(rpi)
 
         if mask is not None:
             nw = mask.shape[0]
@@ -237,7 +236,7 @@ class WindowAttention(nn.Module):
 
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(b_, n, c)
+        x = (attn @ v).transpose(1, 2).reshape(b_, n, -1)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -402,11 +401,6 @@ class OCAB(nn.Module):
 
         self.norm1 = norm_layer(dim)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.unfold = nn.Unfold(
-            kernel_size=(self.overlap_win_size, self.overlap_win_size),
-            stride=window_size,
-            padding=(self.overlap_win_size - window_size) // 2,
-        )
 
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
@@ -428,62 +422,7 @@ class OCAB(nn.Module):
             in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU
         )
 
-    def forward(self, x, x_size, rpi):
-        h, w = x_size
-        b, _, c = x.shape
-
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(b, h, w, c)
-
-        qkv = self.qkv(x).reshape(b, h, w, 3, c).permute(3, 0, 4, 1, 2)  # 3, b, c, h, w
-        q = qkv[0].permute(0, 2, 3, 1)  # b, h, w, c
-        kv = torch.cat((qkv[1], qkv[2]), dim=1)  # b, 2*c, h, w
-
-        # partition windows
-        q_windows = window_partition(
-            q, self.window_size
-        )  # nw*b, window_size, window_size, c
-        q_windows = q_windows.view(
-            -1, self.window_size * self.window_size, c
-        )  # nw*b, window_size*window_size, c
-
-        kv_windows = self.unfold(kv)  # b, c*w*w, nw
-        kv_windows = rearrange(
-            kv_windows,
-            "b (nc ch owh oww) nw -> nc (b nw) (owh oww) ch",
-            nc=2,
-            ch=c,
-            owh=self.overlap_win_size,
-            oww=self.overlap_win_size,
-        ).contiguous()  # 2, nw*b, ow*ow, c
-        # Do the above rearrangement without the rearrange function
-        # kv_windows = kv_windows.view(
-        #     2, b, self.overlap_win_size, self.overlap_win_size, c, -1
-        # )
-        # kv_windows = kv_windows.permute(0, 5, 1, 2, 3, 4).contiguous()
-        # kv_windows = kv_windows.view(
-        #     2, -1, self.overlap_win_size * self.overlap_win_size, c
-        # )
-
-        k_windows, v_windows = kv_windows[0], kv_windows[1]  # nw*b, ow*ow, c
-
-        b_, nq, _ = q_windows.shape
-        _, n, _ = k_windows.shape
-        d = self.dim // self.num_heads
-        q = q_windows.reshape(b_, nq, self.num_heads, d).permute(
-            0, 2, 1, 3
-        )  # nw*b, nH, nq, d
-        k = k_windows.reshape(b_, n, self.num_heads, d).permute(
-            0, 2, 1, 3
-        )  # nw*b, nH, n, d
-        v = v_windows.reshape(b_, n, self.num_heads, d).permute(
-            0, 2, 1, 3
-        )  # nw*b, nH, n, d
-
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
+    def relative_position_bias(self, rpi):
         relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(
             self.window_size * self.window_size,
             self.overlap_win_size * self.overlap_win_size,
@@ -492,17 +431,67 @@ class OCAB(nn.Module):
         relative_position_bias = relative_position_bias.permute(
             2, 0, 1
         ).contiguous()  # nH, ws*ws, wse*wse
-        attn = attn + relative_position_bias.unsqueeze(0)
+        return relative_position_bias.unsqueeze(0)
+
+    def forward(self, x, x_size, rpi):
+        h, w = x_size
+        b, _, c = x.shape
+        ws, ows, heads = self.window_size, self.overlap_win_size, self.num_heads
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(b, h, w, c)
+
+        # Channels last throughout; heads as wide as qkv makes them, which an export
+        # may pad
+        qkv = self.qkv(x).view(b, h, w, 3, -1)
+        hd = qkv.shape[-1]
+        d = hd // heads
+        nh, nw = h // ws, w // ws
+
+        # query windows: nw*b, nH, ws*ws, d
+        q = (
+            qkv[:, :, :, 0]
+            .reshape(b, nh, ws, nw, ws, heads, d)
+            .permute(0, 1, 3, 5, 2, 4, 6)
+            .reshape(-1, heads, ws * ws, d)
+        )
+
+        # Overlapping key and value windows (Unfold's: size ows, stride ws, zero padding
+        # p on each side), cut from the padded image's g x g blocks, g = gcd(ws, ows):
+        # window i spans block rows s*i to s*i+n-1 (s = ws/g, n = ows/g), and likewise
+        # for columns. Tensors stay within TensorRT's 8 dimensions.
+        p = (ows - ws) // 2
+        g = math.gcd(ws, ows)
+        s, n = ws // g, ows // g
+        kv = F.pad(qkv[:, :, :, 1:], (0, 0, 0, 0, p, p, p, p))
+        blocks = kv.reshape(b, (h + 2 * p) // g, g, (w + 2 * p) // g, g, 2 * hd)
+        rows = torch.stack(
+            [blocks[:, i : (i - n + 1 or None) : s] for i in range(n)], dim=2
+        ).reshape(b * nh, ows, (w + 2 * p) // g, g, 2 * hd)
+        windows = torch.stack(
+            [rows[:, :, j : (j - n + 1 or None) : s] for j in range(n)], dim=3
+        )
+        kv_windows = (
+            windows.reshape(b * nh, ows, nw, ows, 2, heads, d)
+            .permute(4, 0, 2, 5, 1, 3, 6)
+            .reshape(2, -1, heads, ows * ows, d)
+        )  # 2, nw*b, nH, ow*ow, d
+        k, v = kv_windows[0], kv_windows[1]
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        attn = attn + self.relative_position_bias(rpi)
 
         attn = self.softmax(attn)
-        attn_windows = (attn @ v).transpose(1, 2).reshape(b_, nq, self.dim)
 
         # merge windows
-        attn_windows = attn_windows.view(
-            -1, self.window_size, self.window_size, self.dim
+        x = (
+            (attn @ v)
+            .reshape(b, nh, nw, heads, ws, ws, d)
+            .permute(0, 1, 4, 2, 5, 3, 6)
+            .reshape(b, h * w, hd)
         )
-        x = window_reverse(attn_windows, self.window_size, h, w)  # b h w c
-        x = x.view(b, h * w, self.dim)
 
         x = self.proj(x) + shortcut
 
