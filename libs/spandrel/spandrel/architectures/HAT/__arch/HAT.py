@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
-from ...__arch_helpers.attention import pad_heads
+from ...__arch_helpers.attention import pad_heads, window_attention
 from ...__arch_helpers.padding import pad_to_multiple
 
 
@@ -223,20 +223,14 @@ class WindowAttention(nn.Module):
             qkv[2],
         )  # make torchscript happy (cannot use tensor as tuple)
 
-        bias = self.relative_position_bias(rpi)
-        if mask is not None:
-            # every window's mask on top of every head's bias
-            nw = mask.shape[0]
-            bias = (bias + mask.unsqueeze(1)).unsqueeze(0)
-            bias = bias.expand(b_ // nw, -1, -1, -1, -1).reshape(b_, -1, n, n)
-
-        x = F.scaled_dot_product_attention(
+        x = window_attention(
             q,
             k,
             v,
-            attn_mask=bias,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-            scale=self.scale,
+            self.relative_position_bias(rpi),
+            mask,
+            self.scale,
+            self.attn_drop.p if self.training else 0.0,
         )
         if x.shape[-1] != d:
             x = x[..., :d]
@@ -485,8 +479,8 @@ class OCAB(nn.Module):
         )  # 2, nw*b, nH, ow*ow, d
         k, v = kv_windows[0], kv_windows[1]
 
-        x = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=self.relative_position_bias(rpi), scale=self.scale
+        x = window_attention(
+            q, k, v, self.relative_position_bias(rpi), None, self.scale
         )
         if d != width:
             x = x[..., :width]

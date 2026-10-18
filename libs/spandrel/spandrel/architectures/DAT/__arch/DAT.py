@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
-from ...__arch_helpers.attention import pad_heads
+from ...__arch_helpers.attention import pad_heads, window_attention
 
 
 def img2windows(img, H_sp, W_sp, num_heads):
@@ -266,27 +266,17 @@ class Spatial_Attention(nn.Module):
         # partition the q,k,v, image to window, channels last throughout
         windows = img2windows(qkv, self.H_sp, self.W_sp, self.num_heads)
         q, k, v = windows[0], windows[1], windows[2]
-        N = q.shape[2]
 
-        # calculate drpe
-        bias = self.relative_position_bias() if self.position_bias else None
-
-        # use mask for shift window
-        if mask is not None:
-            nW = mask.shape[0]
-            mask = mask.unsqueeze(1)
-            bias = mask if bias is None else bias + mask
-            bias = bias.unsqueeze(0).expand(q.shape[0] // nW, -1, -1, -1, -1)
-            bias = bias.reshape(q.shape[0], -1, N, N)
-
-        # B head N C @ B head C N --> B head N N, softmax, @ B head N C
-        x = F.scaled_dot_product_attention(
+        # B head N C @ B head C N --> B head N N, plus the drpe and, for shifted
+        # windows, the mask; softmax; @ B head N C
+        x = window_attention(
             q,
             k,
             v,
-            attn_mask=bias,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-            scale=self.scale,
+            self.relative_position_bias() if self.position_bias else None,
+            mask,
+            self.scale,
+            self.attn_drop.p if self.training else 0.0,
         )
 
         # merge the window, window to image
