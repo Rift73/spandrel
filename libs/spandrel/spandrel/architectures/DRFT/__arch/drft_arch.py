@@ -1345,8 +1345,7 @@ class _EDBBSeqConv3x3(nn.Module):
                     [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
                     dtype=torch.float32,
                 )
-            for i in range(dim):
-                mask[i, 0] = kernel
+            mask[:, 0] = kernel
             self.register_buffer("mask", mask)
         else:
             raise ValueError(f"Unsupported seq_type: {seq_type}")
@@ -1384,8 +1383,8 @@ class _EDBBSeqConv3x3(nn.Module):
 
         tmp = self.scale * self.mask
         k1 = torch.zeros(self.dim, self.dim, 3, 3, device=device, dtype=dtype)
-        for i in range(self.dim):
-            k1[i, i, :, :] = tmp[i, 0, :, :]
+        channel_index = torch.arange(self.dim, device=device)
+        k1[channel_index, channel_index] = tmp[:, 0].to(device=device, dtype=dtype)
         rep_bias = torch.ones(
             1, self.dim, 3, 3, device=device, dtype=dtype
         ) * self.b0.view(1, -1, 1, 1)
