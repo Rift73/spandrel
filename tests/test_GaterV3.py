@@ -9,9 +9,12 @@ from .util import assert_loads_correctly, assert_size_requirements, skip_if_unch
 
 skip_if_unchanged(__file__)
 
-# GateRV3 has no presets; the source repo holds no configs.
+# The source repo holds no presets or configs; traiNNer-redux registers gaterv3_r (the
+# defaults) and gaterv3_s (three levels).
 VARIANTS = [
     {},
+    {"enc_blocks": (2, 2, 4), "dec_blocks": (2, 2, 2)},
+    {"enc_blocks": (2, 2, 4), "dec_blocks": (2, 2, 2), "scale": 4},
     {"scale": 1},
     {"scale": 3},
     {"scale": 4},

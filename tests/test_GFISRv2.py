@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 import torch
@@ -28,9 +29,10 @@ UPSAMPLERS = (
 )
 
 
-def _small(**kwargs) -> GFISRV2:
+def _small(**kwargs: Any) -> GFISRV2:
     # four blocks: the Fourier branch moves through all four inception slots
-    return GFISRV2(**{"dim": 24, "n_blocks": 4, "mid_dim": 16, **kwargs})
+    options: dict[str, Any] = {"dim": 24, "n_blocks": 4, "mid_dim": 16}
+    return GFISRV2(**(options | kwargs))
 
 
 CASES = [

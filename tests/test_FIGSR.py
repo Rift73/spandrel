@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 import torch
@@ -28,8 +29,9 @@ UPSAMPLERS = (
 )
 
 
-def _small(**kwargs) -> FIGSR:
-    return FIGSR(**{"dim": 24, "n_blocks": 2, "gc": 4, "mid_dim": 16, **kwargs})
+def _small(**kwargs: Any) -> FIGSR:
+    options: dict[str, Any] = {"dim": 24, "n_blocks": 2, "gc": 4, "mid_dim": 16}
+    return FIGSR(**(options | kwargs))
 
 
 # The basicsr, neosr and traiNNer-redux configs of the source repository all

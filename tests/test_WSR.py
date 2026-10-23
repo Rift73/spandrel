@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 
 import pytest
@@ -64,7 +66,7 @@ VARIANTS = {
 }
 
 
-def _activate(model: torch.nn.Module) -> torch.nn.Module:
+def _activate(model: WESR | WideContextSR) -> WESR | WideContextSR:
     """Give every zero-initialized weight (context merge and gates, attention
     values) some value so that the whole model is exercised."""
     with torch.no_grad():
@@ -73,7 +75,7 @@ def _activate(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def _build(name: str) -> torch.nn.Module:
+def _build(name: str) -> WESR | WideContextSR:
     torch.manual_seed(0)
     return _activate(VARIANTS[name]()).eval()
 
