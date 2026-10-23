@@ -23,6 +23,7 @@ from ..architectures import (
     SAFMNBCIE,
     SPAN,
     SST,
+    WSR,
     AuraSR,
     Compact,
     DnCNN,
@@ -103,4 +104,5 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(DUAL.DUALArch()),
     ArchSupport.from_architecture(SST.SSTArch()),
     ArchSupport.from_architecture(SST.SSTRealArch()),
+    ArchSupport.from_architecture(WSR.WSRArch()),
 )
