@@ -12,6 +12,7 @@ from ..architectures import (
     ESRGAN,
     FBCNN,
     FDAT,
+    FIGSR,
     GFPGAN,
     GRL,
     HAT,
@@ -28,6 +29,7 @@ from ..architectures import (
     DnCNN,
     DRUNet,
     FFTformer,
+    GFISRv2,
     HVICIDNet,
     KBNet,
     LaMa,
@@ -103,4 +105,6 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(DUAL.DUALArch()),
     ArchSupport.from_architecture(SST.SSTArch()),
     ArchSupport.from_architecture(SST.SSTRealArch()),
+    ArchSupport.from_architecture(FIGSR.FIGSRArch()),
+    ArchSupport.from_architecture(GFISRv2.GFISRv2Arch()),
 )

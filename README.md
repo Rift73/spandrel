@@ -115,6 +115,8 @@ Spandrel currently supports a limited amount of network architectures. If the ar
 - [AuraSR](https://github.com/fal-ai/aura-sr) | Models: [v1](https://huggingface.co/fal/AuraSR) | [v2](https://huggingface.co/fal/AuraSR-v2)
 - DRFT and DUAL (this fork)
 - [SST](https://github.com/dslisleedh/SST) and SST-Real | [Models](https://github.com/dslisleedh/SST/tree/main/pretrained_models)
+- [FIGSR](https://github.com/enhancr/figsr)
+- [GFISRv2](https://github.com/umzi2/gfisrv2)
 
 #### Face Restoration
 
