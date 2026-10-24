@@ -12,7 +12,7 @@ skip_if_unchanged(__file__)
 # SMoSR has no presets; the source repo holds no configs. With rep, the conv in
 # front of DySample outputs out_ch instead of upsampler_mid_dim, so rep and
 # dysample only run together when upsampler_mid_dim is DySample's input width
-# (dim + in_ch * scale**2), which drops that conv.
+# (dim + in_ch * scale**2), which drops that conv, or equals out_ch.
 VARIANTS = [
     {},
     {"rep": True},
@@ -33,8 +33,13 @@ VARIANTS = [
     {"upsampler": "dysample", "upsampler_mid_dim": 60},
     {"upsampler": "dysample", "upsampler_mid_dim": 60, "rep": True},
     {"upsampler": "dysample", "upsampler_mid_dim": 16},
+    {"upsampler": "dysample", "upsampler_mid_dim": 16, "out_ch": 16, "rep": True},
     {"upsampler": "dysample", "d_kernel": 1},
     {"upsampler": "dysample", "d_kernel": 5},
+    # DySample at upsampler.0 or absent: resselt's loader reads d_kernel from
+    # upsampler.2 and cannot load these
+    {"upsampler": "dysample", "scale": 4, "upsampler_mid_dim": 96, "d_kernel": 5},
+    {"upsampler": "dysample", "scale": 1, "rep": True},
     {"upsampler": "pixelshuffle", "upsampler_mid_dim": 64},
     {"upsampler": "pa_up", "upsampler_mid_dim": 16},
     # kept only in the upsampler's MetaUpsample buffer
@@ -111,6 +116,25 @@ def test_variant(kwargs):
     del descriptor, loaded
     # now in eval mode: the folded state dict, also through safetensors
     assert_loads_correctly(SMoSRArch(), lambda: model)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"out_ch": 4}, {"out_ch": 12}, {"out_ch": 3, "rep": True}], ids=str
+)
+def test_conv_upsampler_above_scale_1_is_rejected(kwargs):
+    # "conv" returns (H + 4 - 4 * scale) x (W + 4 - 4 * scale), not an upscale
+    state_dict = SMoSR(upsampler="conv", scale=2, **kwargs).state_dict()
+    if kwargs["out_ch"] % 4 == 0:
+        # only the MetaUpsample buffer tells it from pixelshuffledirect
+        psd = SMoSR(
+            upsampler="pixelshuffledirect", scale=2, out_ch=kwargs["out_ch"] // 4
+        ).state_dict()
+        assert {k: v.shape for k, v in state_dict.items()} == {
+            k: v.shape for k, v in psd.items()
+        }
+    assert _claimants(state_dict) == ["SMoSR"]
+    with pytest.raises(ValueError, match="'conv' upsampler does not upscale"):
+        MAIN_REGISTRY.load(state_dict)
 
 
 @pytest.mark.parametrize("kwargs", MOSR_VARIANTS, ids=str)
