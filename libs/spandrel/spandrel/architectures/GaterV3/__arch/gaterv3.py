@@ -540,6 +540,14 @@ class GateRV3(nn.Module):
             state_dict["dim_to_in.MetaUpsample"] = self.dim_to_in.MetaUpsample
         if "gamma" not in state_dict:
             state_dict["gamma"] = self.gamma
+
+        # Add missing flash buffers for compatibility with older models
+        for i, block in enumerate(self.latent):
+            if isinstance(block.token_mix, Attention):
+                key = f"latent.{i}.token_mix.flash"
+                if key not in state_dict:
+                    state_dict[key] = block.token_mix.flash
+
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     def check_img_size(self, x, resolution: tuple[int, int]):
@@ -573,3 +581,6 @@ class GateRV3(nn.Module):
 
         x = self.dim_to_in(x + sisr) + self.gamma * self.short_to_dim(inp)
         return x[:, :, : H * self.scale, : W * self.scale]
+
+
+GaterV3 = GateRV3
