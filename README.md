@@ -1,6 +1,6 @@
 # Spandrel
 
-> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with three more architectures: DRFT, DUAL and SST (with SST-Real). Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
+> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with eight more architectures: DRFT, DUAL, SST (with SST-Real), WSR, GaterV3, SMoSR, FIGSR and GFISRv2. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
 
 [![PyPI package](https://img.shields.io/badge/pip%20install-spandrel-brightgreen)](https://pypi.org/project/spandrel/)
 [![version number](https://img.shields.io/pypi/v/spandrel?color=green&label=version)](https://github.com/chaiNNer-org/spandrel/releases)
@@ -110,11 +110,14 @@ Spandrel currently supports a limited amount of network architectures. If the ar
 - [SeemoRe](https://github.com/eduardzamfir/seemoredetails) | [Models](https://drive.google.com/drive/folders/15jtvcS4jL_6QqEwaRodEN8FBrqVPrO2u?usp=share_link)
 - [MoSR](https://github.com/umzi2/MoSR) | [Models](https://drive.google.com/drive/u/0/folders/1HPy7M4Zzq8oxhdsQ2cnfqy73klmQWp_r)
 - [MoESR](https://github.com/umzi2/MoESR) | [Models](https://github.com/the-database/traiNNer-redux/releases/download/pretrained-models/4x_DF2K_MoESR_500k.safetensors)
+- [GaterV3](https://github.com/umzi2/GaterV3) and [SMoSR](https://github.com/umzi2/SMoSR)
 - [RCAN](https://github.com/yulunzhang/RCAN) | [Models](https://www.dropbox.com/s/qm9vc0p0w9i4s0n/models_ECCV2018RCAN.zip?dl=0)
 - [FDAT](https://github.com/stinkybread/FDAT) | [Models](https://github.com/the-database/traiNNer-redux/releases/download/pretrained-models/2x_DF2K_FDAT_M_500k_fp16.safetensors)
 - [AuraSR](https://github.com/fal-ai/aura-sr) | Models: [v1](https://huggingface.co/fal/AuraSR) | [v2](https://huggingface.co/fal/AuraSR-v2)
-- DRFT and DUAL (this fork)
+- DRFT, DUAL and WSR (this fork)
 - [SST](https://github.com/dslisleedh/SST) and SST-Real | [Models](https://github.com/dslisleedh/SST/tree/main/pretrained_models)
+- [FIGSR](https://github.com/enhancr/figsr)
+- [GFISRv2](https://github.com/umzi2/gfisrv2)
 
 #### Face Restoration
 

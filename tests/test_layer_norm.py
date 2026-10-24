@@ -11,6 +11,7 @@ LAYER_NORMS = [
     ("NAFNet.__arch.arch_util", "LayerNorm2d", {}),
     ("KBNet.__arch.kb_utils", "LayerNorm2d", {}),
     ("FDAT.__arch.fdat", "LayerNorm", {}),
+    ("GFISRv2.__arch.gfisrv2", "LayerNorm", {}),
     ("HVICIDNet.__arch.transformer_utils", "LayerNorm", {}),
     ("MoESR.__arch.MoESR", "LayerNorm", {}),
     ("MoSR.__arch.mosr_arch", "LayerNorm", {}),

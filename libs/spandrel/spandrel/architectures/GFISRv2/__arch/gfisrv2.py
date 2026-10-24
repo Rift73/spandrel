@@ -1,43 +1,15 @@
-"""
-GFISRV2 Architecture adapted for Spandrel.
-"""
-
-from __future__ import annotations
-
 import math
+from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.onnx
-from torch import Tensor
-from torch import nn
-
-import os
-import ctypes
-
-try:
-    import tensorrt
-except ImportError:
-    pass
-
-try:
-    plugin_path = os.path.join(os.path.dirname(__file__), "trt_dft_plugins.dll")
-    if os.path.exists(plugin_path):
-        ctypes.CDLL(plugin_path, winmode=0)
-except Exception:
-    pass
+from einops import rearrange
+from torch import Tensor, nn
 
 from spandrel.util import store_hyperparameters
-# pylint: disable=relative-beyond-top-level
-from ...__arch_helpers.padding import pad_to_multiple
 
-# pylint: disable=invalid-name, too-many-arguments, too-many-positional-arguments
-# pylint: disable=too-many-locals, too-many-statements, too-many-branches
-# pylint: disable=too-many-instance-attributes, not-callable, abstract-method
-# pylint: disable=arguments-differ
-
-SAMPLE_MODS = (
+SampleMods = Literal[
     "conv",
     "pixelshuffledirect",
     "pixelshuffle",
@@ -46,13 +18,13 @@ SAMPLE_MODS = (
     "transpose+conv",
     "lda",
     "pa_up",
-)
+]
 
 
 class DySample(nn.Module):
-    """
-    Adapted from 'Learning to Upsample by Learning to Sample':
+    """Adapted from 'Learning to Upsample by Learning to Sample':
     https://arxiv.org/abs/2308.15085
+    https://github.com/tiny-smart/dysample
     """
 
     def __init__(
@@ -62,7 +34,7 @@ class DySample(nn.Module):
         scale: int = 2,
         groups: int = 4,
         end_convolution: bool = True,
-        end_kernel: int = 1,
+        end_kernel=1,
     ) -> None:
         super().__init__()
 
@@ -87,7 +59,6 @@ class DySample(nn.Module):
         self.register_buffer("init_pos", self._init_pos())
 
     def _init_pos(self) -> Tensor:
-        """Initialize the default sampling positions."""
         h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
         return (
             torch.stack(torch.meshgrid([h, h], indexing="ij"))
@@ -97,12 +68,11 @@ class DySample(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of DySample."""
         offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
-        b, _, h, w = offset.shape
-        offset = offset.view(b, 2, -1, h, w)
-        coords_h = torch.arange(h) + 0.5
-        coords_w = torch.arange(w) + 0.5
+        B, _, H, W = offset.shape
+        offset = offset.view(B, 2, -1, H, W)
+        coords_h = torch.arange(H) + 0.5
+        coords_w = torch.arange(W) + 0.5
 
         coords = (
             torch.stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
@@ -113,24 +83,27 @@ class DySample(nn.Module):
             .to(x.device, non_blocking=True)
         )
         normalizer = torch.tensor(
-            [w, h], dtype=x.dtype, device=x.device, pin_memory=True
+            [W, H],
+            dtype=x.dtype,
+            device=x.device,
+            pin_memory=False,  # pin_memory was originally True
         ).view(1, 2, 1, 1, 1)
         coords = 2 * (coords + offset) / normalizer - 1
 
         coords = (
-            F.pixel_shuffle(coords.reshape(b, -1, h, w), self.scale)
-            .view(b, 2, -1, self.scale * h, self.scale * w)
+            F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
+            .view(B, 2, -1, self.scale * H, self.scale * W)
             .permute(0, 2, 3, 4, 1)
             .contiguous()
             .flatten(0, 1)
         )
         output = F.grid_sample(
-            x.reshape(b * self.groups, -1, h, w),
+            x.reshape(B * self.groups, -1, H, W),
             coords,
             mode="bilinear",
             align_corners=False,
             padding_mode="border",
-        ).view(b, -1, self.scale * h, self.scale * w)
+        ).view(B, -1, self.scale * H, self.scale * W)
 
         if self.end_convolution:
             output = self.end_conv(output)
@@ -139,8 +112,6 @@ class DySample(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    """Custom LayerNorm implementation."""
-
     def __init__(self, dim: int = 64, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -148,32 +119,36 @@ class LayerNorm(nn.Module):
         self.eps = eps
         self.dim = (dim,)
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of LayerNorm."""
+    def forward(self, x):
         if x.is_contiguous(memory_format=torch.channels_last):
             return F.layer_norm(
                 x.permute(0, 2, 3, 1), self.dim, self.weight, self.bias, self.eps
             ).permute(0, 3, 1, 2)
+        # fp16 overflows (x - u)^2 once |x - u| exceeds 256; like F.layer_norm,
+        # compute the statistics in fp32, then cast back
+        half = x.dtype == torch.float16
+        if half:
+            x = x.float()
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
+        if half:
+            x = x.half()
         return self.weight[:, None, None] * x + self.bias[:, None, None]
 
 
-class LdaAqu(nn.Module):
-    """Linear Deformable Attention module."""
-
+class LDA_AQU(nn.Module):
     def __init__(
         self,
-        in_channels: int = 48,
-        reduction_factor: int = 4,
-        nh: int = 1,
-        scale_factor: float = 2.0,
-        k_e: int = 3,
-        k_u: int = 3,
-        n_groups: int = 2,
-        range_factor: int = 11,
-        rpb: bool = True,
+        in_channels=48,
+        reduction_factor=4,
+        nh=1,
+        scale_factor=2.0,
+        k_e=3,
+        k_u=3,
+        n_groups=2,
+        range_factor=11,
+        rpb=True,
     ) -> None:
         super().__init__()
         self.k_u = k_u
@@ -209,7 +184,6 @@ class LdaAqu(nn.Module):
             nn.SiLU(),
             nn.Conv2d(self.group_channel, 2 * k_u**2, k_e, 1, k_e // 2),
         )
-
         self.layer_norm = LayerNorm(in_channels)
 
         self.pad = int((self.k_u - 1) / 2)
@@ -229,91 +203,70 @@ class LdaAqu(nn.Module):
             nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
 
     def init_weights(self) -> None:
-        """Initialize weights of the module."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, LayerNorm):
+                nn.init.xavier_uniform(m)
+            elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
         nn.init.constant_(self.conv_offset[-1].weight, 0)
-        if self.conv_offset[-1].bias is not None:
-            nn.init.constant_(self.conv_offset[-1].bias, 0)
+        nn.init.constant_(self.conv_offset[-1].bias, 0)
 
-    def get_offset(self, offset: Tensor, h_out: int, w_out: int) -> Tensor:
-        """Compute the final offset for deformable attention."""
-        b = offset.shape[0]
+    def get_offset(self, offset, Hout, Wout):
+        B, _, _, _ = offset.shape
         device = offset.device
-        row_indices = torch.arange(h_out, device=device)
-        col_indices = torch.arange(w_out, device=device)
-        row_indices, col_indices = torch.meshgrid(row_indices, col_indices, indexing="ij")
+        row_indices = torch.arange(Hout, device=device)
+        col_indices = torch.arange(Wout, device=device)
+        row_indices, col_indices = torch.meshgrid(row_indices, col_indices)
         index_tensor = torch.stack((row_indices, col_indices), dim=-1).view(
-            1, h_out, w_out, 2
+            1, Hout, Wout, 2
         )
+        offset = rearrange(
+            offset, "b (kh kw d) h w -> b kh h kw w d", kh=self.k_u, kw=self.k_u
+        )
+        offset = offset + index_tensor.view(1, 1, Hout, 1, Wout, 2)
+        offset = offset.contiguous().view(B, self.k_u * Hout, self.k_u * Wout, 2)
 
-        d = offset.shape[1] // (self.k_u * self.k_u)
-        offset = offset.view(b, self.k_u, self.k_u, d, h_out, w_out).permute(0, 1, 4, 2, 5, 3)
-
-        offset = offset + index_tensor.view(1, 1, h_out, 1, w_out, 2)
-        offset = offset.contiguous().view(b, self.k_u * h_out, self.k_u * w_out, 2)
-
-        offset[..., 0] = 2 * offset[..., 0] / (h_out - 1) - 1
-        offset[..., 1] = 2 * offset[..., 1] / (w_out - 1) - 1
+        offset[..., 0] = 2 * offset[..., 0] / (Hout - 1) - 1
+        offset[..., 1] = 2 * offset[..., 1] / (Wout - 1) - 1
         offset = offset.flip(-1)
         return offset
 
-    def extract_feats(self, x: Tensor, offset: Tensor, ks: int = 3) -> Tensor:
-        """Extract features using grid_sample."""
-        out = F.grid_sample(
+    def extract_feats(self, x, offset, ks=3):
+        out = nn.functional.grid_sample(
             x, offset, mode="bilinear", padding_mode="zeros", align_corners=True
         )
-        b, c, h_ks, w_ks = out.shape
-        h = h_ks // ks
-        w = w_ks // ks
-        out = out.view(b, c, ks, h, ks, w).permute(0, 2, 4, 1, 3, 5).reshape(b, ks * ks, c, h, w)
+        out = rearrange(out, "b c (ksh h) (ksw w) -> b (ksh ksw) c h w", ksh=ks, ksw=ks)
         return out
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of LdaAqu."""
-        b, c, h, w = x.shape
-        out_h, out_w = int(h * self.scale_factor), int(w * self.scale_factor)
+    def forward(self, x):
+        B, C, H, W = x.shape
+        out_H, out_W = int(H * self.scale_factor), int(W * self.scale_factor)
         v = x
         x = self.layer_norm(x)
         q = self.proj_q(x)
         k = self.proj_k(x)
 
-        q = F.interpolate(
-            q, (out_h, out_w), mode="bilinear", align_corners=True
+        q = torch.nn.functional.interpolate(
+            q, (out_H, out_W), mode="bilinear", align_corners=True
         )
-        q_off = q.view(b * self.n_groups, -1, out_h, out_w)
+        q_off = q.view(B * self.n_groups, -1, out_H, out_W)
         pred_offset = self.conv_offset(q_off)
         offset = pred_offset.tanh().mul(self.offset_range_factor) + self.base_offset.to(
             x.dtype
         )
 
-        k = k.view(b * self.n_groups, self.hidden_dim // self.n_groups, h, w)
-        v = v.view(b * self.n_groups, c // self.n_groups, h, w)
-        offset = self.get_offset(offset, out_h, out_w)
+        k = k.view(B * self.n_groups, self.hidden_dim // self.n_groups, H, W)
+        v = v.view(B * self.n_groups, C // self.n_groups, H, W)
+        offset = self.get_offset(offset, out_H, out_W)
         k = self.extract_feats(k, offset=offset)
         v = self.extract_feats(v, offset=offset)
 
-        c_q = q.shape[1] // self.num_head
-        q = q.view(b, self.num_head, c_q, out_h, out_w).permute(0, 1, 3, 4, 2)
-        q = q.reshape(b, self.num_head, out_h * out_w, 1, c_q)
-
-        bg, n, c_dim, h_feat, w_feat = k.shape
-        b_orig = bg // self.n_groups
-        k = k.view(b_orig, self.n_groups, n, c_dim, h_feat, w_feat).permute(0, 4, 5, 2, 1, 3)
-        k = k.reshape(b_orig, h_feat * w_feat, n, self.n_groups * c_dim)
-
-        v = v.view(b_orig, self.n_groups, n, c_dim, h_feat, w_feat).permute(0, 4, 5, 2, 1, 3)
-        v = v.reshape(b_orig, h_feat * w_feat, n, self.n_groups * c_dim)
-
-        c_k = k.shape[-1] // self.num_head
-        k = k.view(b_orig, h_feat * w_feat, n, self.num_head, c_k).permute(0, 3, 1, 2, 4)
-        v = v.view(b_orig, h_feat * w_feat, n, self.num_head, c_k).permute(0, 3, 1, 2, 4)
+        q = rearrange(q, "b (nh c) h w -> b nh (h w) () c", nh=self.num_head)
+        k = rearrange(k, "(b g) n c h w -> b (h w) n (g c)", g=self.n_groups)
+        v = rearrange(v, "(b g) n c h w -> b (h w) n (g c)", g=self.n_groups)
+        k = rearrange(k, "b n1 n (nh c) -> b nh n1 n c", nh=self.num_head)
+        v = rearrange(v, "b n1 n (nh c) -> b nh n1 n c", nh=self.num_head)
 
         if self.rpb:
             k = k + self.relative_position_bias_table
@@ -323,45 +276,31 @@ class LdaAqu(nn.Module):
         attn = attn.softmax(dim=-1)
         out = attn @ v
 
-        t = out.shape[-2]
-        c_out = out.shape[-1]
-        out = out.view(b_orig, self.num_head, out_h, out_w, t, c_out).permute(0, 1, 5, 4, 2, 3)
-        out = out.reshape(b_orig, self.num_head * c_out, t * out_h, out_w)
-
+        out = rearrange(out, "b nh (h w) t c -> b (nh c) (t h) w", h=out_H)
         return out
 
 
 class PA(nn.Module):
-    """Pixel Attention Module."""
-
-    def __init__(self, dim: int) -> None:
+    def __init__(self, dim) -> None:
         super().__init__()
         self.conv = nn.Sequential(nn.Conv2d(dim, dim, 1), nn.Sigmoid())
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of PA."""
+    def forward(self, x):
         return x.mul(self.conv(x))
 
 
 class UniUpsampleV3(nn.Sequential):
-    """Universal Upsample Module Version 3."""
-
     def __init__(
         self,
-        upsample: str = "pa_up",
+        upsample: SampleMods = "pa_up",
         scale: int = 2,
         in_dim: int = 48,
         out_dim: int = 3,
         mid_dim: int = 48,
-        group: int = 4,
-        dysample_end_kernel: int = 1,
+        group: int = 4,  # Only DySample
+        dysample_end_kernel=1,  # needed only for compatibility with version 2
     ) -> None:
         m = []
-
-        if upsample not in SAMPLE_MODS:
-            raise ValueError(
-                f"An invalid Upsample was selected. Please choose one of {SAMPLE_MODS}"
-            )
 
         if scale == 1 or upsample == "conv":
             m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
@@ -371,7 +310,7 @@ class UniUpsampleV3(nn.Sequential):
             )
         elif upsample == "pixelshuffle":
             m.extend([nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)])
-            if (scale & (scale - 1)) == 0:
+            if (scale & (scale - 1)) == 0:  # scale = 2^n
                 for _ in range(int(math.log2(scale))):
                     m.extend(
                         [nn.Conv2d(mid_dim, 4 * mid_dim, 3, 1, 1), nn.PixelShuffle(2)]
@@ -379,7 +318,9 @@ class UniUpsampleV3(nn.Sequential):
             elif scale == 3:
                 m.extend([nn.Conv2d(mid_dim, 9 * mid_dim, 3, 1, 1), nn.PixelShuffle(3)])
             else:
-                raise ValueError(f"scale {scale} is not supported. Supported scales: 2^n and 3.")
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
             m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
         elif upsample == "nearest+conv":
             if (scale & (scale - 1)) == 0:
@@ -408,7 +349,9 @@ class UniUpsampleV3(nn.Sequential):
                     )
                 )
             else:
-                raise ValueError(f"scale {scale} is not supported. Supported scales: 2^n and 3.")
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
             m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
         elif upsample == "dysample":
             if mid_dim != in_dim:
@@ -418,6 +361,7 @@ class UniUpsampleV3(nn.Sequential):
             m.append(
                 DySample(mid_dim, out_dim, scale, group, end_kernel=dysample_end_kernel)
             )
+            # m.append(nn.Conv2d(mid_dim, out_dim, dysample_end_kernel, 1, dysample_end_kernel//2)) # kernel 1 causes chromatic artifacts
         elif upsample == "transpose+conv":
             if scale == 2:
                 m.append(nn.ConvTranspose2d(in_dim, out_dim, 4, 2, 1))
@@ -432,14 +376,16 @@ class UniUpsampleV3(nn.Sequential):
                     ]
                 )
             else:
-                raise ValueError(f"scale {scale} is not supported. Supported scales: 2, 3, 4")
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2, 3, 4"
+                )
             m.append(nn.Conv2d(out_dim, out_dim, 3, 1, 1))
         elif upsample == "lda":
             if mid_dim != in_dim:
                 m.extend(
                     [nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)]
                 )
-            m.append(LdaAqu(mid_dim, scale_factor=scale))
+            m.append(LDA_AQU(mid_dim, scale_factor=scale))
             m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
         elif upsample == "pa_up":
             if (scale & (scale - 1)) == 0:
@@ -467,17 +413,22 @@ class UniUpsampleV3(nn.Sequential):
                     ]
                 )
             else:
-                raise ValueError(f"scale {scale} is not supported. Supported scales: 2^n and 3.")
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
             m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
-
+        else:
+            raise ValueError(
+                f"An invalid Upsample was selected. Please choose one of {SampleMods}"
+            )
         super().__init__(*m)
 
         self.register_buffer(
             "MetaUpsample",
             torch.tensor(
                 [
-                    3,
-                    SAMPLE_MODS.index(upsample),
+                    3,  # Block version, if you change something, please number from the end so that you can distinguish between authorized changes and third parties
+                    list(SampleMods.__args__).index(upsample),  # UpSample method index
                     scale,
                     in_dim,
                     out_dim,
@@ -490,16 +441,13 @@ class UniUpsampleV3(nn.Sequential):
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Normalization."""
-
     def __init__(self, dim: int = 64, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones([dim, 1, 1]))
         self.offset = nn.Parameter(torch.zeros([dim, 1, 1]))
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of RMSNorm."""
+    def forward(self, x):
         norm_x = x.norm(2, dim=1, keepdim=True)
         d_x = x.size(1)
         rms_x = norm_x * (d_x ** (-1.0 / 2))
@@ -507,9 +455,57 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed + self.offset
 
 
-class CustomRFFT2(torch.autograd.Function):
-    """Custom ONNX-compatible Real FFT2 Function (TRT Plugin Stub)."""
+# ==============================================================================
+# Реализация cuFFT для кастомного .dll (trt_dft_plugins.dll).
+# Используйте этот вариант вместо стандартного CustomRFFT2/CustomIRFFT2 ниже,
+# если требуется сборка/экспорт под кастомный плагин TensorRT com.microsoft::Rfft2 / Irfft2:
+# ==============================================================================
+# import os
+# import ctypes
+#
+# try:
+#     import tensorrt
+# except ImportError:
+#     pass
+#
+# try:
+#     plugin_path = os.path.join(os.path.dirname(__file__), "trt_dft_plugins.dll")
+#     if os.path.exists(plugin_path):
+#         ctypes.CDLL(plugin_path, winmode=0)
+# except Exception:
+#     pass
+#
+#
+# class CustomRFFT2(torch.autograd.Function):
+#     """Custom ONNX-compatible Real FFT2 Function (TRT Plugin Stub)."""
+#
+#     @staticmethod
+#     def forward(ctx, x: torch.Tensor):
+#         y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
+#         return torch.view_as_real(y)
+#
+#     @staticmethod
+#     def symbolic(g, x: torch.Value):
+#         # Для кастомного .dll (com.microsoft::Rfft2 - плагин Алексея)
+#         return g.op("com.microsoft::Rfft2", x)
+#
+#
+# class CustomIRFFT2(torch.autograd.Function):
+#     """Custom ONNX-compatible Inverse Real FFT2 Function (TRT Plugin Stub)."""
+#
+#     @staticmethod
+#     def forward(ctx, x_ri: torch.Tensor):
+#         x_c = torch.view_as_complex(x_ri)
+#         return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")
+#
+#     @staticmethod
+#     def symbolic(g, x: torch.Value):
+#         # Для кастомного .dll (com.microsoft::Irfft2 - плагин Алексея)
+#         return g.op("com.microsoft::Irfft2", x)
+# ==============================================================================
 
+
+class CustomRFFT2(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor):
         y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
@@ -517,14 +513,25 @@ class CustomRFFT2(torch.autograd.Function):
 
     @staticmethod
     def symbolic(g, x: torch.Value):
-        # Важно! Используем домен com.microsoft, как прописано в C++ коде плагина Алексея
-        # Нормализация (norm="ortho") в ONNX-стандарте передается как пустой атрибут или решается внутри
-        return g.op("com.microsoft::Rfft2", x)
+        axes_last = g.op("Constant", value_t=torch.tensor([4], dtype=torch.int64))
+        x_u = g.op("Unsqueeze", x, axes_last)
+        zero = g.op("Sub", x_u, x_u)
+        x_c = g.op("Concat", x_u, zero, axis_i=4)
+        shp = g.op("Shape", x)
+        iH = g.op("Constant", value_t=torch.tensor([2], dtype=torch.int64))
+        iW = g.op("Constant", value_t=torch.tensor([3], dtype=torch.int64))
+        nH = g.op("Gather", shp, iH, axis_i=0)
+        nW = g.op("Gather", shp, iW, axis_i=0)
+        Hf = g.op("Cast", nH, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        Wf = g.op("Cast", nW, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        y = g.op("DFT", x_c, axis_i=3, onesided_i=1)
+        y = g.op("Div", y, g.op("Sqrt", Wf))
+        y = g.op("DFT", y, axis_i=2, onesided_i=0)
+        y = g.op("Div", y, g.op("Sqrt", Hf))
+        return y
 
 
 class CustomIRFFT2(torch.autograd.Function):
-    """Custom ONNX-compatible Inverse Real FFT2 Function (TRT Plugin Stub)."""
-
     @staticmethod
     def forward(ctx, x_ri: torch.Tensor):
         x_c = torch.view_as_complex(x_ri)
@@ -532,41 +539,72 @@ class CustomIRFFT2(torch.autograd.Function):
 
     @staticmethod
     def symbolic(g, x: torch.Value):
-        return g.op("com.microsoft::Irfft2", x)
+        shp = g.op("Shape", x)
+        iH = g.op("Constant", value_t=torch.tensor([2], dtype=torch.int64))
+        iWr = g.op("Constant", value_t=torch.tensor([3], dtype=torch.int64))
+        nH = g.op("Gather", shp, iH, axis_i=0)
+        nWr = g.op("Gather", shp, iWr, axis_i=0)
+        one = g.op("Constant", value_t=torch.tensor(1, dtype=torch.int64))
+        two = g.op("Constant", value_t=torch.tensor(2, dtype=torch.int64))
+        nW = g.op("Mul", g.op("Sub", nWr, one), two)
+        Hf = g.op("Cast", nH, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        Wf = g.op("Cast", nW, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        yH = g.op("DFT", x, axis_i=2, inverse_i=1, onesided_i=0)
+        yH = g.op("Mul", yH, g.op("Sqrt", Hf))
+        start = g.op("Sub", nWr, two)  # Wr-2
+        start = g.op(
+            "Squeeze",
+            start,
+            g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
+        )
+        limit = g.op("Constant", value_t=torch.tensor(0, dtype=torch.int64))
+        step = g.op("Constant", value_t=torch.tensor(-1, dtype=torch.int64))
+        idx_r = g.op("Range", start, limit, step)
+        mirW = g.op("Gather", yH, idx_r, axis_i=3)
+        maskW = g.op("Constant", value_t=torch.tensor([1.0, -1.0], dtype=torch.float32))
+        maskW = g.op(
+            "Unsqueeze",
+            maskW,
+            g.op("Constant", value_t=torch.tensor([0, 1, 2, 3], dtype=torch.int64)),
+        )
+        mirWc = g.op("Mul", mirW, maskW)
+        x_full = g.op("Concat", yH, mirWc, axis_i=3)
+        y = g.op("DFT", x_full, axis_i=3, inverse_i=1, onesided_i=0)
+        y = g.op("Mul", y, g.op("Sqrt", Wf))
+        s0 = g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))
+        s1 = g.op("Constant", value_t=torch.tensor([1], dtype=torch.int64))
+        axC = g.op("Constant", value_t=torch.tensor([4], dtype=torch.int64))
+        y = g.op("Slice", y, s0, s1, axC)
+        y = g.op("Squeeze", y, axC)
+        return y
 
 
 class CustomRfft2Wrap(nn.Module):
-    """Wrapper for Custom RFFT2."""
-
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of CustomRfft2Wrap."""
+    def forward(self, x):
         if self.training:
             y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
             return torch.view_as_real(y)
-        return CustomRFFT2.apply(x)
+        else:
+            return CustomRFFT2.apply(x)
 
 
 class CustomIrfft2Wrap(nn.Module):
-    """Wrapper for Custom IRFFT2."""
-
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of CustomIrfft2Wrap."""
+    def forward(self, x):
         if self.training:
-            x_c = torch.view_as_complex(x)
-            return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")
-        return CustomIRFFT2.apply(x)
+            x_c = torch.view_as_complex(x)  # [B,C,H,Wr]
+            return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")  # [B,C,H,W]
+        else:
+            return CustomIRFFT2.apply(x)
 
 
 class FourierUnit(nn.Module):
-    """Fourier Unit for Global Feature Extraction."""
-
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(self, in_channels, out_channels) -> None:
         super().__init__()
         self.rn = RMSNorm(out_channels * 2)
         self.post_norm = RMSNorm(out_channels)
@@ -590,11 +628,10 @@ class FourierUnit(nn.Module):
         self.irfft2 = CustomIrfft2Wrap()
         self.rfft2 = CustomRfft2Wrap()
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of Fourier Unit."""
+    def forward(self, x):
         orig_dtype = x.dtype
         x = x.to(torch.float32)
-        b, c, h, _ = x.shape
+        b, c, h, w = x.shape
         ffted = self.rfft2(x)
         ffted = ffted.permute(0, 4, 1, 2, 3).contiguous()
         ffted = ffted.view(b, c * 2, h, -1).to(orig_dtype)
@@ -609,21 +646,20 @@ class FourierUnit(nn.Module):
 
 
 class InceptionDWConv2d(nn.Module):
-    """Inception depthwise convolution."""
+    """Inception depthwise convolution"""
 
     def __init__(
         self,
-        in_channels: int,
-        square_kernel_size: int = 3,
-        band_kernel_size: int = 11,
-        branch_ratio: float = 0.125,
-        shift: int = 0,
+        in_channels,
+        square_kernel_size=3,
+        band_kernel_size=11,
+        branch_ratio=0.125,
+        shift=0,
     ) -> None:
         super().__init__()
 
         gc = int(in_channels * branch_ratio)
 
-        # Removed nn.ModuleList to maintain strict compatibility with the original state dict keys
         self.convs = [
             FourierUnit(in_channels - 3 * gc, in_channels - 3 * gc),
             nn.Conv2d(
@@ -663,8 +699,7 @@ class InceptionDWConv2d(nn.Module):
             self.slices.append((s, s + idx))
             s += idx
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of Inception depthwise convolution."""
+    def forward(self, x):
         x_id, x_hw, x_w, x_h = torch.split(x, self.split_indexes, dim=1)
         return torch.cat(
             (
@@ -678,8 +713,6 @@ class InceptionDWConv2d(nn.Module):
 
 
 class GatedCNNBlock(nn.Module):
-    """Gated CNN Block for GFISRV2."""
-
     def __init__(
         self, dim: int = 64, expansion_ratio: float = 8 / 3, shift: int = 0
     ) -> None:
@@ -696,15 +729,13 @@ class GatedCNNBlock(nn.Module):
         self.apply(self._init_weights)
 
     @staticmethod
-    def _init_weights(m: nn.Module) -> None:
-        """Initialize weights."""
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
+    def _init_weights(m) -> None:
+        if isinstance(m, nn.Conv2d | nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of Gated CNN Block."""
+    def forward(self, x):
         shortcut = x
         x = self.norm(x)
         x = self.fc1(x)
@@ -717,27 +748,22 @@ class GatedCNNBlock(nn.Module):
 
 @store_hyperparameters()
 class GFISRV2(nn.Module):
-    """GFISRV2 Architecture implemented for Spandrel."""
-
     hyperparameters = {}
 
     def __init__(
         self,
         *,
-        in_nc: int = 3,
-        dim: int = 48,
-        expansion_ratio: float = 8 / 3,
-        scale: int = 4,
-        out_nc: int = 3,
-        upsampler: str = "pixelshuffledirect",
-        mid_dim: int = 32,
-        pixel_unshuffle: bool = False,
-        n_blocks: int = 24,
+        in_nc=3,
+        dim=48,
+        expansion_ratio=8 / 3,
+        scale=4,
+        out_nc=3,
+        upsampler: SampleMods = "pixelshuffledirect",
+        mid_dim=32,
+        pixel_unshuffle=False,
+        n_blocks=24,
     ) -> None:
         super().__init__()
-
-        self.true_scale = scale
-
         if pixel_unshuffle and scale in [1, 2]:
             down = 4 // scale
             self.in_to_dim = nn.Sequential(
@@ -748,7 +774,6 @@ class GFISRV2(nn.Module):
         else:
             self.in_to_dim = nn.Conv2d(in_nc, dim, 3, 1, 1)
             self.pad = 2
-
         self.gfisr_body = nn.Sequential(
             *[
                 GatedCNNBlock(dim, expansion_ratio=expansion_ratio, shift=i)
@@ -768,20 +793,16 @@ class GFISRV2(nn.Module):
         self.scale = scale
 
     def load_state_dict(self, state_dict, *args, **kwargs):
-        """Override load_state_dict to handle MetaUpsample buffer."""
-        if "upscale.MetaUpsample" not in state_dict:
-            state_dict["upscale.MetaUpsample"] = self.upscale.MetaUpsample
+        state_dict["upscale.MetaUpsample"] = self.upscale.MetaUpsample
         return super().load_state_dict(state_dict, *args, **kwargs)
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of GFISRV2."""
-        _, _, h, w = x.shape
+    def forward(self, x):
+        B, C, H, W = x.shape
+        mod_pad_h = (self.pad - H % self.pad) % self.pad
+        mod_pad_w = (self.pad - W % self.pad) % self.pad
 
-        # Uses standard Spandrel arch helper instead of manual modulo padding
-        x = pad_to_multiple(x, self.pad, mode="reflect")
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
         x = self.in_to_dim(x)
 
         x = self.gfisr_body(x) + x
-        out = self.upscale(x)
-
-        return out[:, :, : h * self.true_scale, : w * self.true_scale]
+        return self.upscale(x)[:, :, : H * self.scale, : W * self.scale]
