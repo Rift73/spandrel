@@ -43,7 +43,9 @@ class DySample(nn.Module):
     ) -> None:
         super().__init__()
 
-        if in_channels <= groups or in_channels % groups != 0:
+        # one channel per group works: as in the fork's other DySample, only
+        # fewer channels than groups are rejected (resselt rejects equal too)
+        if in_channels < groups or in_channels % groups != 0:
             msg = "Incorrect in_channels and groups values."
             raise ValueError(msg)
 

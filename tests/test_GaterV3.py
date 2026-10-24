@@ -70,6 +70,8 @@ RESSELT_VARIANTS = [
         }
         for scale, mid, end_kernel in ((2, 32, 3), (3, 48, 1), (4, 64, 3))
     ),
+    # one channel per DySample group, which resselt's DySample rejects
+    {**_V3, "upsample": "dysample", "upsample_mid_dim": 4},
     {**_V3, "upsample": "lda", "upsample_mid_dim": 32},
     {**_V3, "upsample": "pa_up", "scale": 4, "upsample_mid_dim": 64},
     {**_V3, "upsample": "pa_up", "scale": 3, "upsample_mid_dim": 16},
