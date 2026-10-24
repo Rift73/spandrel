@@ -3,27 +3,302 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
+from einops import rearrange
+from torch import Tensor, nn
 
-from spandrel.architectures.__arch_helpers.dysample import DySample
 from spandrel.util import store_hyperparameters
 
+# The upsampler code below (DySample to UniUpsampleV3) is resselt's gaterv3.3.
+# gaterv3.2 (the GitHub repo, traiNNer-redux) has UniUpsample, MetaUpsample
+# version 1: the first five upsamplers, and a DySample without a conv in front.
 SampleMods = Literal[
-    "conv", "pixelshuffledirect", "pixelshuffle", "nearest+conv", "dysample"
+    "conv",
+    "pixelshuffledirect",
+    "pixelshuffle",
+    "nearest+conv",
+    "dysample",
+    "transpose+conv",
+    "lda",
+    "pa_up",
 ]
 
 
-class UniUpsample(nn.Sequential):
+class DySample(nn.Module):
+    """Adapted from 'Learning to Upsample by Learning to Sample':
+    https://arxiv.org/abs/2308.15085
+    https://github.com/tiny-smart/dysample
+    """
+
     def __init__(
         self,
-        upsample: SampleMods,
+        in_channels: int = 64,
+        out_ch: int = 3,
         scale: int = 2,
-        in_dim: int = 64,
+        groups: int = 4,
+        end_convolution: bool = True,
+        end_kernel=1,
+    ) -> None:
+        super().__init__()
+
+        # one channel per group works: as in the fork's other DySample, only
+        # fewer channels than groups are rejected (resselt rejects equal too)
+        if in_channels < groups or in_channels % groups != 0:
+            msg = "Incorrect in_channels and groups values."
+            raise ValueError(msg)
+
+        out_channels = 2 * groups * scale**2
+        self.scale = scale
+        self.groups = groups
+        self.end_convolution = end_convolution
+        if end_convolution:
+            self.end_conv = nn.Conv2d(
+                in_channels, out_ch, end_kernel, 1, end_kernel // 2
+            )
+        self.offset = nn.Conv2d(in_channels, out_channels, 1)
+        self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        if self.training:
+            nn.init.trunc_normal_(self.offset.weight, std=0.02)
+            nn.init.constant_(self.scope.weight, val=0)
+
+        self.register_buffer("init_pos", self._init_pos())
+
+    def _init_pos(self) -> Tensor:
+        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
+        return (
+            torch.stack(torch.meshgrid([h, h], indexing="ij"))
+            .transpose(1, 2)
+            .repeat(1, self.groups, 1)
+            .reshape(1, -1, 1, 1)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        B, _, H, W = offset.shape
+        offset = offset.view(B, 2, -1, H, W)
+        coords_h = torch.arange(H) + 0.5
+        coords_w = torch.arange(W) + 0.5
+
+        coords = (
+            torch.stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
+            .transpose(1, 2)
+            .unsqueeze(1)
+            .unsqueeze(0)
+            .type(x.dtype)
+            .to(x.device, non_blocking=True)
+        )
+        normalizer = torch.tensor(
+            [W, H],
+            dtype=x.dtype,
+            device=x.device,
+            pin_memory=False,  # pin_memory was originally True
+        ).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+
+        coords = (
+            F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
+            .view(B, 2, -1, self.scale * H, self.scale * W)
+            .permute(0, 2, 3, 4, 1)
+            .contiguous()
+            .flatten(0, 1)
+        )
+        output = F.grid_sample(
+            x.reshape(B * self.groups, -1, H, W),
+            coords,
+            mode="bilinear",
+            align_corners=False,
+            padding_mode="border",
+        ).view(B, -1, self.scale * H, self.scale * W)
+
+        if self.end_convolution:
+            output = self.end_conv(output)
+
+        return output
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim: int = 64, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+        self.dim = (dim,)
+
+    def forward(self, x):
+        if x.is_contiguous(memory_format=torch.channels_last):
+            return F.layer_norm(
+                x.permute(0, 2, 3, 1), self.dim, self.weight, self.bias, self.eps
+            ).permute(0, 3, 1, 2)
+        # fp16 overflows (x - u)^2 once |x - u| exceeds 256; like F.layer_norm,
+        # compute the statistics in fp32, then cast back
+        half = x.dtype == torch.float16
+        if half:
+            x = x.float()
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        if half:
+            x = x.half()
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
+
+
+class LDA_AQU(nn.Module):
+    # resselt prints 2 * k_u**2 here and has an init_weights method that
+    # nothing calls; both are left out
+    def __init__(
+        self,
+        in_channels=48,
+        reduction_factor=4,
+        nh=1,
+        scale_factor=2.0,
+        k_e=3,
+        k_u=3,
+        n_groups=2,
+        range_factor=11,
+        rpb=True,
+    ) -> None:
+        super().__init__()
+        self.k_u = k_u
+        self.num_head = nh
+        self.scale_factor = scale_factor
+        self.n_groups = n_groups
+        self.offset_range_factor = range_factor
+
+        self.attn_dim = in_channels // (reduction_factor * self.num_head)
+        self.scale = self.attn_dim**-0.5
+        self.rpb = rpb
+        self.hidden_dim = in_channels // reduction_factor
+        self.proj_q = nn.Conv2d(
+            in_channels, self.hidden_dim, kernel_size=1, stride=1, padding=0, bias=False
+        )
+
+        self.proj_k = nn.Conv2d(
+            in_channels, self.hidden_dim, kernel_size=1, stride=1, padding=0, bias=False
+        )
+
+        self.group_channel = in_channels // (reduction_factor * self.n_groups)
+        self.conv_offset = nn.Sequential(
+            nn.Conv2d(
+                self.group_channel,
+                self.group_channel,
+                3,
+                1,
+                1,
+                groups=self.group_channel,
+                bias=False,
+            ),
+            LayerNorm(self.group_channel),
+            nn.SiLU(),
+            nn.Conv2d(self.group_channel, 2 * k_u**2, k_e, 1, k_e // 2),
+        )
+        self.layer_norm = LayerNorm(in_channels)
+
+        self.pad = int((self.k_u - 1) / 2)
+        base = np.arange(-self.pad, self.pad + 1).astype(np.float32)
+        base_y = np.repeat(base, self.k_u)
+        base_x = np.tile(base, self.k_u)
+        base_offset = np.stack([base_y, base_x], axis=1).flatten()
+        base_offset = torch.tensor(base_offset).view(1, -1, 1, 1)
+        self.register_buffer("base_offset", base_offset, persistent=False)
+
+        if self.rpb:
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros(
+                    1, self.num_head, 1, self.k_u**2, self.hidden_dim // self.num_head
+                )
+            )
+            nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def get_offset(self, offset, Hout, Wout):
+        B, _, _, _ = offset.shape
+        device = offset.device
+        row_indices = torch.arange(Hout, device=device)
+        col_indices = torch.arange(Wout, device=device)
+        row_indices, col_indices = torch.meshgrid(row_indices, col_indices)
+        index_tensor = torch.stack((row_indices, col_indices), dim=-1).view(
+            1, Hout, Wout, 2
+        )
+        offset = rearrange(
+            offset, "b (kh kw d) h w -> b kh h kw w d", kh=self.k_u, kw=self.k_u
+        )
+        offset = offset + index_tensor.view(1, 1, Hout, 1, Wout, 2)
+        offset = offset.contiguous().view(B, self.k_u * Hout, self.k_u * Wout, 2)
+
+        offset[..., 0] = 2 * offset[..., 0] / (Hout - 1) - 1
+        offset[..., 1] = 2 * offset[..., 1] / (Wout - 1) - 1
+        offset = offset.flip(-1)
+        return offset
+
+    def extract_feats(self, x, offset, ks=3):
+        out = nn.functional.grid_sample(
+            x, offset, mode="bilinear", padding_mode="zeros", align_corners=True
+        )
+        out = rearrange(out, "b c (ksh h) (ksw w) -> b (ksh ksw) c h w", ksh=ks, ksw=ks)
+        return out
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        out_H, out_W = int(H * self.scale_factor), int(W * self.scale_factor)
+        v = x
+        x = self.layer_norm(x)
+        q = self.proj_q(x)
+        k = self.proj_k(x)
+
+        q = torch.nn.functional.interpolate(
+            q, (out_H, out_W), mode="bilinear", align_corners=True
+        )
+        q_off = q.view(B * self.n_groups, -1, out_H, out_W)
+        pred_offset = self.conv_offset(q_off)
+        offset = pred_offset.tanh().mul(self.offset_range_factor) + self.base_offset.to(
+            x.dtype
+        )
+
+        k = k.view(B * self.n_groups, self.hidden_dim // self.n_groups, H, W)
+        v = v.view(B * self.n_groups, C // self.n_groups, H, W)
+        offset = self.get_offset(offset, out_H, out_W)
+        k = self.extract_feats(k, offset=offset)
+        v = self.extract_feats(v, offset=offset)
+
+        q = rearrange(q, "b (nh c) h w -> b nh (h w) () c", nh=self.num_head)
+        k = rearrange(k, "(b g) n c h w -> b (h w) n (g c)", g=self.n_groups)
+        v = rearrange(v, "(b g) n c h w -> b (h w) n (g c)", g=self.n_groups)
+        k = rearrange(k, "b n1 n (nh c) -> b nh n1 n c", nh=self.num_head)
+        v = rearrange(v, "b n1 n (nh c) -> b nh n1 n c", nh=self.num_head)
+
+        if self.rpb:
+            k = k + self.relative_position_bias_table
+
+        q = q * self.scale
+        attn = q @ k.transpose(-1, -2)
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+
+        out = rearrange(out, "b nh (h w) t c -> b (nh c) (t h) w", h=out_H)
+        return out
+
+
+class PA(nn.Module):
+    def __init__(self, dim) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv2d(dim, dim, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        return x.mul(self.conv(x))
+
+
+class UniUpsampleV3(nn.Sequential):
+    def __init__(
+        self,
+        upsample: SampleMods = "pa_up",
+        scale: int = 2,
+        in_dim: int = 48,
         out_dim: int = 3,
-        mid_dim: int = 64,  # Only pixelshuffle
+        mid_dim: int = 48,
         group: int = 4,  # Only DySample
+        dysample_end_kernel=1,  # needed only for compatibility with version 2
+        version: int = 3,  # added: 1 builds gaterv3.2's UniUpsample
     ) -> None:
         m = []
 
@@ -78,8 +353,75 @@ class UniUpsample(nn.Sequential):
                     f"scale {scale} is not supported. Supported scales: 2^n and 3."
                 )
             m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
+        elif upsample == "dysample" and version == 1:
+            # gaterv3.2's UniUpsample: mid_dim is only recorded in MetaUpsample
+            m.append(
+                DySample(in_dim, out_dim, scale, group, end_kernel=dysample_end_kernel)
+            )
         elif upsample == "dysample":
-            m.append(DySample(in_dim, out_dim, scale, group))
+            if mid_dim != in_dim:
+                m.extend(
+                    [nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)]
+                )
+            m.append(
+                DySample(mid_dim, out_dim, scale, group, end_kernel=dysample_end_kernel)
+            )
+            # m.append(nn.Conv2d(mid_dim, out_dim, dysample_end_kernel, 1, dysample_end_kernel//2)) # kernel 1 causes chromatic artifacts
+        elif upsample == "transpose+conv":
+            if scale == 2:
+                m.append(nn.ConvTranspose2d(in_dim, out_dim, 4, 2, 1))
+            elif scale == 3:
+                m.append(nn.ConvTranspose2d(in_dim, out_dim, 3, 3, 0))
+            elif scale == 4:
+                m.extend(
+                    [
+                        nn.ConvTranspose2d(in_dim, in_dim, 4, 2, 1),
+                        nn.GELU(),
+                        nn.ConvTranspose2d(in_dim, out_dim, 4, 2, 1),
+                    ]
+                )
+            else:
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2, 3, 4"
+                )
+            m.append(nn.Conv2d(out_dim, out_dim, 3, 1, 1))
+        elif upsample == "lda":
+            if mid_dim != in_dim:
+                m.extend(
+                    [nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)]
+                )
+            m.append(LDA_AQU(mid_dim, scale_factor=scale))
+            m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
+        elif upsample == "pa_up":
+            if (scale & (scale - 1)) == 0:
+                for _ in range(int(math.log2(scale))):
+                    m.extend(
+                        [
+                            nn.Upsample(scale_factor=2),
+                            nn.Conv2d(in_dim, mid_dim, 3, 1, 1),
+                            PA(mid_dim),
+                            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                            nn.Conv2d(mid_dim, mid_dim, 3, 1, 1),
+                            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                        ]
+                    )
+                    in_dim = mid_dim
+            elif scale == 3:
+                m.extend(
+                    [
+                        nn.Upsample(scale_factor=3),
+                        nn.Conv2d(in_dim, mid_dim, 3, 1, 1),
+                        PA(mid_dim),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                        nn.Conv2d(mid_dim, mid_dim, 3, 1, 1),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                    ]
+                )
+            else:
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
+            m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
         else:
             raise ValueError(
                 f"An invalid Upsample was selected. Please choose one of {SampleMods}"
@@ -90,7 +432,7 @@ class UniUpsample(nn.Sequential):
             "MetaUpsample",
             torch.tensor(
                 [
-                    1,  # Block version, if you change something, please number from the end so that you can distinguish between authorized changes and third parties
+                    version,  # Block version, if you change something, please number from the end so that you can distinguish between authorized changes and third parties
                     list(SampleMods.__args__).index(upsample),  # UpSample method index
                     scale,
                     in_dim,
@@ -470,6 +812,9 @@ class Block(nn.Module):
 class GateRV3(nn.Module):
     hyperparameters = {}
 
+    # The defaults are gaterv3.2's. resselt's gaterv3.3 has enc_blocks=(2, 2, 4, 8),
+    # num_latent=12, scale=1, upsample_mid_dim=32, end_kernel=3, MetaUpsample
+    # version 3, and calls sisr_blocks span_blocks.
     def __init__(
         self,
         *,
@@ -485,6 +830,8 @@ class GateRV3(nn.Module):
         attention=False,
         sisr_blocks=4,
         flash=True,
+        end_kernel=1,
+        upsample_version=1,
     ) -> None:
         super().__init__()
 
@@ -530,7 +877,15 @@ class GateRV3(nn.Module):
 
         if scale != 1:
             self.short_to_dim = nn.Upsample(scale_factor=scale)  # ConvBlock(in_ch, dim)
-            self.dim_to_in = UniUpsample(upsample, scale, dim, in_ch, upsample_mid_dim)
+            self.dim_to_in = UniUpsampleV3(
+                upsample,
+                scale,
+                dim,
+                in_ch,
+                upsample_mid_dim,
+                dysample_end_kernel=end_kernel,
+                version=upsample_version,
+            )
         else:
             self.dim_to_in = nn.Conv2d(dim, in_ch, 3, 1, 1)
             self.short_to_dim = nn.Identity()
@@ -540,14 +895,11 @@ class GateRV3(nn.Module):
             state_dict["dim_to_in.MetaUpsample"] = self.dim_to_in.MetaUpsample
         if "gamma" not in state_dict:
             state_dict["gamma"] = self.gamma
-
-        # Add missing flash buffers for compatibility with older models
-        for i, block in enumerate(self.latent):
-            if isinstance(block.token_mix, Attention):
-                key = f"latent.{i}.token_mix.flash"
-                if key not in state_dict:
-                    state_dict[key] = block.token_mix.flash
-
+        # The first gaterv3.py and resselt's gaterv3.3 have no flash buffer (their
+        # attention is always the channel attention)
+        for name, buffer in self.named_buffers():
+            if name.endswith("token_mix.flash") and name not in state_dict:
+                state_dict[name] = buffer
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     def check_img_size(self, x, resolution: tuple[int, int]):

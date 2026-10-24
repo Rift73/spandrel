@@ -76,6 +76,22 @@ CASES = [
         lambda: _small(in_nc=1, out_nc=1, scale=2, pixel_unshuffle=True),
         id="gray-2x-pu",
     ),
+    # 16 unshuffled channels also fit 1 channel at 1x: in_nc == out_nc wins
+    pytest.param(
+        lambda: _small(in_nc=4, out_nc=4, scale=2, pixel_unshuffle=True),
+        id="rgba-2x-pu",
+    ),
+    # pixel_unshuffle with in_nc != out_nc: the unshuffled count decides
+    *(
+        pytest.param(
+            lambda in_nc=in_nc, out_nc=out_nc, scale=scale: _small(
+                in_nc=in_nc, out_nc=out_nc, scale=scale, pixel_unshuffle=True
+            ),
+            id=f"in{in_nc}-out{out_nc}-{scale}x-pu",
+        )
+        for in_nc, out_nc in ((3, 1), (1, 3))
+        for scale in (1, 2)
+    ),
     pytest.param(
         lambda: _small(upsampler="pixelshuffle", mid_dim=24), id="pixelshuffle-mid-24"
     ),
