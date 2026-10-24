@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 from typing_extensions import override
 
 from spandrel.util import KeyCondition, get_seq_len
@@ -49,11 +47,21 @@ class GFISRv2Arch(Architecture[GFISRV2]):
         pixel_unshuffle = "in_to_dim.1.weight" in state_dict
         if pixel_unshuffle:
             # At scales 1 and 2 the input is unshuffled by 4 // scale and the
-            # upsampler runs at 4x. The weights only hold in_nc * (4 // scale)**2,
-            # so in_nc is taken to be out_nc.
+            # upsampler runs at 4x. The weights only hold in_nc * (4 // scale)**2:
+            # take the reading with in_nc == out_nc, else 1x when the count
+            # allows it (resselt's reading), else 2x. Some counts fit both
+            # (16 = 4 channels at 2x or 1 channel at 1x).
             dim, unshuffled = state_dict["in_to_dim.1.weight"].shape[:2]
-            in_nc = out_nc
-            scale = 4 // math.isqrt(unshuffled // in_nc)
+            readings = [
+                (s, unshuffled // (4 // s) ** 2)
+                for s in (1, 2)
+                if unshuffled % (4 // s) ** 2 == 0
+            ]
+            if not readings:
+                raise ValueError(
+                    f"in_to_dim.1 takes {unshuffled} channels: not in_nc * 4 or 16"
+                )
+            scale, in_nc = next((r for r in readings if r[1] == out_nc), readings[0])
         else:
             dim, in_nc = state_dict["in_to_dim.weight"].shape[:2]
             scale = upscale
