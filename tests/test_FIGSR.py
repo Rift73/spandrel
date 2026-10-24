@@ -39,7 +39,16 @@ def _small(**kwargs: Any) -> FIGSR:
 CASES = [
     pytest.param(lambda: FIGSR(), id="defaults-and-configs"),
     pytest.param(lambda: FIGSR(scale=2), id="defaults-2x"),
-    pytest.param(lambda: _small(scale=8), id="pixelshuffledirect-8x"),
+    # 8x: pixelshuffle, nearest+conv and pa_up repeat their 2x stage;
+    # transpose+conv stops at 4x
+    *(
+        pytest.param(
+            lambda upsampler=upsampler: _small(upsampler=upsampler, scale=8),
+            id=f"{upsampler}-8x",
+        )
+        for upsampler in UPSAMPLERS
+        if upsampler not in ("conv", "transpose+conv")
+    ),
     # "conv" is a plain conv at any scale: a 1x-only upsampler
     *(
         pytest.param(

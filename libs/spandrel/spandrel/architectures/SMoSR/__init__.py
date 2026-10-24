@@ -26,8 +26,8 @@ def _get_upsampler(
 ) -> tuple[SampleMods, int, int, int]:
     """The upsampler, out_ch, upsampler_mid_dim and d_kernel."""
     # The model cannot load without this buffer (strict loading). It records
-    # the upsampler (its only trace at scale 1) and mid_dim, which only some
-    # upsamplers' layers show.
+    # the upsampler (its only trace at scale 1, and what tells "conv" from
+    # pixelshuffledirect) and mid_dim, which only some upsamplers' layers show.
     meta = state_dict[_META]
     upsampler = _UPSAMPLERS[int(meta[1])]
     mid_dim = int(meta[5])
@@ -44,6 +44,12 @@ def _get_upsampler(
         # a single conv, whatever the upsampler
         assert last_conv is not None
         return upsampler, last_conv.shape[0], mid_dim, d_kernel
+    if upsampler == "conv":
+        # "conv" keeps the single conv of scale 1, so the output is
+        # (H + 4 - 4 * scale) x (W + 4 - 4 * scale), not scale times the
+        # input. With out_ch divisible by scale**2 its keys and shapes are
+        # those of pixelshuffledirect with out_ch // scale**2.
+        raise ValueError("SMoSR's 'conv' upsampler does not upscale (scale > 1)")
     if dysample is not None:
         # DySample, after a conv to mid_dim unless mid_dim is its input width
         end_conv = state_dict[f"upsampler.{dysample}.end_conv.weight"]

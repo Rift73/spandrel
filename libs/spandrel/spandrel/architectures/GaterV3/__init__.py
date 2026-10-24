@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 from typing_extensions import override
 
 from spandrel.util import KeyCondition, get_seq_len
@@ -19,36 +17,28 @@ from .__arch.gaterv3 import GateRV3, SampleMods
 _META = "dim_to_in.MetaUpsample"
 
 
-def _get_upsampler(state_dict: StateDict, in_ch: int) -> tuple[int, SampleMods, int]:
-    """The scale, upsampler and upsample_mid_dim of a model with scale > 1."""
-    # The model cannot load without this buffer (strict loading).
-    meta = state_dict[_META]
-    # upsample_mid_dim only shapes the pixelshuffle upsampler's layers; the
-    # buffer records it for the others
-    mid_dim = int(meta[5])
-    convs = sum(f"dim_to_in.{i}.weight" in state_dict for i in range(32))
+def _get_upsampler(state_dict: StateDict) -> tuple[int, SampleMods, int, int, int]:
+    """The scale, upsampler, upsample_mid_dim, end_kernel and MetaUpsample version
+    of a model with scale > 1."""
+    # The model cannot load without this buffer (strict loading). Version 1 is
+    # gaterv3.2's UniUpsample, version 3 resselt's gaterv3.3; both write
+    # upsample_mid_dim, which shapes no layer for some upsamplers, and the scale,
+    # which is the only difference between nearest+conv at x2 and at x3.
+    version, index, scale, _, _, mid_dim, _ = (
+        int(value) for value in state_dict[_META].tolist()
+    )
+    upsample: SampleMods = list(SampleMods.__args__)[index]
+    if upsample == "conv":
+        # one conv at the input size: its output cannot be added to the
+        # upscaled input, so no such model can run
+        raise ValueError(f"GaterV3's conv upsampler cannot upscale {scale}x")
 
-    upsample: SampleMods
-    if "dim_to_in.0.offset.weight" in state_dict:
-        upsample = "dysample"
-        # 2 * groups (4) * scale**2 offsets
-        scale = math.isqrt(state_dict["dim_to_in.0.offset.weight"].shape[0] // 8)
-    elif "dim_to_in.2.weight" in state_dict:
-        upsample = "pixelshuffle"
-        mid_dim = state_dict["dim_to_in.0.weight"].shape[0]
-        if state_dict["dim_to_in.2.weight"].shape[0] == 9 * mid_dim:
-            scale = 3
-        else:
-            # in conv, one conv per x2 step, out conv
-            scale = 2 ** (convs - 2)
-    elif "dim_to_in.3.weight" in state_dict:
-        upsample = "nearest+conv"
-        # x2 and x3 have the same layers; only the buffer tells them apart
-        scale = int(meta[2])
-    else:
-        upsample = "pixelshuffledirect"
-        scale = math.isqrt(state_dict["dim_to_in.0.weight"].shape[0] // in_ch)
-    return scale, upsample, mid_dim
+    end_kernel = 1
+    for key in ("dim_to_in.0.end_conv.weight", "dim_to_in.2.end_conv.weight"):
+        if key in state_dict:
+            # dysample's last conv, after the conv in front of it if any
+            end_kernel = state_dict[key].shape[2]
+    return scale, upsample, mid_dim, end_kernel, version
 
 
 class GaterV3Arch(Architecture[GateRV3]):
@@ -67,11 +57,8 @@ class GaterV3Arch(Architecture[GateRV3]):
                 "sisr_end_conv.eval_conv.weight",
                 "sisr_cat_conv.weight",
                 "sisr_cat_conv.bias",
-                KeyCondition.has_any(
-                    "dim_to_in.weight",
-                    "dim_to_in.0.weight",
-                    "dim_to_in.0.offset.weight",
-                ),
+                # scale 1 ends in a plain conv, higher scales in an upsampler
+                KeyCondition.has_any("dim_to_in.weight", _META),
             ),
         )
 
@@ -92,19 +79,26 @@ class GaterV3Arch(Architecture[GateRV3]):
 
         attention = "latent.0.token_mix.qkv.weight" in state_dict
         # flash chooses the attention's math (spatial SDPA or channel attention)
-        # and is kept in a buffer; without attention it leaves no trace (default)
+        # and is kept in a buffer; the first gaterv3.py had no buffer and always
+        # ran channel attention. Without attention it leaves no trace (default).
         flash = True
-        if "latent.0.token_mix.flash" in state_dict:
-            flash = bool(state_dict["latent.0.token_mix.flash"].item())
+        if attention:
+            flash = "latent.0.token_mix.flash" in state_dict and bool(
+                state_dict["latent.0.token_mix.flash"].item()
+            )
 
         if "dim_to_in.weight" in state_dict:
-            # scale 1 ends in a plain conv: upsample and upsample_mid_dim
-            # leave no trace and keep their defaults
+            # scale 1 ends in a plain conv: the upsampler's options leave no
+            # trace and keep their defaults
             scale = 1
             upsample: SampleMods = "pixelshuffle"
             upsample_mid_dim = 48
+            end_kernel = 1
+            upsample_version = 1
         else:
-            scale, upsample, upsample_mid_dim = _get_upsampler(state_dict, in_ch)
+            scale, upsample, upsample_mid_dim, end_kernel, upsample_version = (
+                _get_upsampler(state_dict)
+            )
 
         # end_gamma_init only sets gamma's initial value, which the weights replace
         model = GateRV3(
@@ -119,6 +113,8 @@ class GaterV3Arch(Architecture[GateRV3]):
             attention=attention,
             sisr_blocks=sisr_blocks,
             flash=flash,
+            end_kernel=end_kernel,
+            upsample_version=upsample_version,
         )
 
         tags = [f"{dim}dim"]
@@ -144,4 +140,6 @@ class GaterV3Arch(Architecture[GateRV3]):
         )
 
 
-__all__ = ["GaterV3Arch", "GateRV3"]
+GaterV3 = GateRV3
+
+__all__ = ["GaterV3Arch", "GateRV3", "GaterV3"]
