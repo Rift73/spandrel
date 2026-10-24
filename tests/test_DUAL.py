@@ -6,6 +6,7 @@ import torch
 
 from spandrel import MAIN_REGISTRY
 from spandrel.architectures.DUAL import DUAL, DUALArch
+from spandrel.architectures.DUAL.__arch import dual_arch
 from spandrel.architectures.DUAL.__arch.dual_arch import (
     _SpatialAttention,
     dual_light,
@@ -129,15 +130,32 @@ def test_neighborhood_attention_matches_dense_reference(window, shape, grad):
     torch.testing.assert_close(actual.detach(), expected, rtol=0, atol=1e-10)
 
 
-def test_neighborhood_attention_inference_bands():
-    # 15 x 10 query tiles: inference takes two bands, training 38 chunks
+@pytest.mark.parametrize(
+    ("cap", "calls"),
+    [
+        # 15 x 10 query tiles, batch 2: bands of 6 whole rows
+        (dual_arch.NA_INFERENCE_MASK_ELEMENTS, 3),
+        # a row above the cap: chunks of 4 tiles within the row
+        (4 * 16 * 16 * 63 * 63 * 2, 38),
+    ],
+)
+def test_neighborhood_attention_inference_chunks(monkeypatch, cap, calls):
     torch.manual_seed(0)
     attention = _SpatialAttention(8, 2, 48, rank=4, context_na=True).eval()
-    x = torch.randn(1, 8, 240, 160)
+    x = torch.randn(2, 8, 240, 160)
+    training = attention.pre_gate_core(x).detach()
+    monkeypatch.setattr(dual_arch, "NA_INFERENCE_MASK_ELEMENTS", cap)
+    sdpa = dual_arch.F.scaled_dot_product_attention
+    counted = []
+    monkeypatch.setattr(
+        dual_arch.F,
+        "scaled_dot_product_attention",
+        lambda *a, **k: counted.append(1) or sdpa(*a, **k),
+    )
     with torch.no_grad():
-        bands = attention.pre_gate_core(x)
-    chunks = attention.pre_gate_core(x).detach()
-    torch.testing.assert_close(bands, chunks)
+        inference = attention.pre_gate_core(x)
+    assert len(counted) == calls
+    torch.testing.assert_close(inference, training, rtol=0, atol=0)
 
 
 def test_neighborhood_attention_dispatch(monkeypatch):

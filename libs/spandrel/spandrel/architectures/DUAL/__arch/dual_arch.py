@@ -479,6 +479,11 @@ def _na_coordinates(height: int, width: int, device: torch.device) -> Tensor:
     return torch.stack((yy, xx), dim=-1).reshape(-1, 2)
 
 
+# spandrel: the boolean mask elements one inference attention call of _na_core
+# covers (its query, key and value copies scale with it).
+NA_INFERENCE_MASK_ELEMENTS = 2**27
+
+
 class _SpatialAttention(_WindowAttention):
     """Original projections with optional per-query context neighborhoods."""
 
@@ -595,14 +600,18 @@ class _SpatialAttention(_WindowAttention):
         qlocal = _na_coordinates(tile, tile, x.device)
         klocal = _na_coordinates(uh, uw, x.device)
         tiles = [(y, z) for y in range(0, height, tile) for z in range(0, width, tile)]
-        # spandrel: at inference, batch bands of whole tile rows (up to 2**27 mask
-        # elements) and write each band at once. Each tile's math is unchanged;
-        # training keeps the original chunks.
+        # spandrel: at inference, batch bands of whole tile rows (up to
+        # NA_INFERENCE_MASK_ELEMENTS mask elements per call) and write each band at
+        # once; a row above that cap goes in chunks of tiles. Each tile's math is
+        # unchanged; training keeps the original chunks.
         across = -(-width // tile)
-        bands = not (self.training or torch.is_grad_enabled())
-        if bands:
-            rows = max(1, 2**27 // (tile * tile * uh * uw * across))
-            chunk_size = rows * across
+        bands = False
+        if not (self.training or torch.is_grad_enabled()):
+            per_call = max(
+                1, NA_INFERENCE_MASK_ELEMENTS // (batch * tile * tile * uh * uw)
+            )
+            bands = per_call >= across
+            chunk_size = per_call // across * across if bands else per_call
 
         def gather(t: Tensor, index: Tensor, count: int) -> Tensor:
             return (
