@@ -193,6 +193,10 @@ class DUALArch(Architecture[DUAL]):
             pixel_unshuffle=pixel_unshuffle,
             dynamic_experts=dynamic_experts,
             # c_windows cannot be deduced from the state dict (default 32/64)
+            # Routing is not in the weights either: neighborhood attention
+            # wherever it is defined (RFB bias and dot attention), legacy
+            # non-overlapping windows otherwise.
+            context_na=c_pos_bias == "rfb" and qk == "dot",
             g_window=g_window,
             c_pos_bias=c_pos_bias,
             rfb_rank=rfb_rank,
