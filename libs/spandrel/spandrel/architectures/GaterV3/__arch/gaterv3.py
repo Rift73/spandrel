@@ -540,6 +540,11 @@ class GateRV3(nn.Module):
             state_dict["dim_to_in.MetaUpsample"] = self.dim_to_in.MetaUpsample
         if "gamma" not in state_dict:
             state_dict["gamma"] = self.gamma
+        # The first gaterv3.py had no flash buffer (its attention was always the
+        # channel attention)
+        for name, buffer in self.named_buffers():
+            if name.endswith("token_mix.flash") and name not in state_dict:
+                state_dict[name] = buffer
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     def check_img_size(self, x, resolution: tuple[int, int]):

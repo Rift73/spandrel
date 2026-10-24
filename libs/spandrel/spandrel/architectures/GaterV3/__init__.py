@@ -92,10 +92,13 @@ class GaterV3Arch(Architecture[GateRV3]):
 
         attention = "latent.0.token_mix.qkv.weight" in state_dict
         # flash chooses the attention's math (spatial SDPA or channel attention)
-        # and is kept in a buffer; without attention it leaves no trace (default)
+        # and is kept in a buffer; the first gaterv3.py had no buffer and always
+        # ran channel attention. Without attention it leaves no trace (default).
         flash = True
-        if "latent.0.token_mix.flash" in state_dict:
-            flash = bool(state_dict["latent.0.token_mix.flash"].item())
+        if attention:
+            flash = "latent.0.token_mix.flash" in state_dict and bool(
+                state_dict["latent.0.token_mix.flash"].item()
+            )
 
         if "dim_to_in.weight" in state_dict:
             # scale 1 ends in a plain conv: upsample and upsample_mid_dim

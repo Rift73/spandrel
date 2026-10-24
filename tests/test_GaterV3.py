@@ -104,6 +104,27 @@ def test_variant(kwargs):
     assert_loads_correctly(GaterV3Arch(), lambda: model)
 
 
+@pytest.mark.parametrize("with_gamma", [False, True])
+def test_checkpoint_without_flash_buffers(with_gamma):
+    # The first gaterv3.py had no flash buffer and always ran channel attention,
+    # and no gamma; released checkpoints have neither, or gamma alone
+    torch.manual_seed(0)
+    model = GateRV3(attention=True, flash=False, num_latent=2).eval()
+    state_dict = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not key.endswith("token_mix.flash") and (with_gamma or key != "gamma")
+    }
+
+    descriptor = MAIN_REGISTRY.load(state_dict)
+    assert isinstance(descriptor, ImageModelDescriptor)
+    assert isinstance(descriptor.model, GateRV3)
+    assert descriptor.model.hyperparameters["flash"] is False
+    image = torch.rand(1, 3, 20, 24)
+    with torch.no_grad():
+        torch.testing.assert_close(descriptor.model.eval()(image), model(image))
+
+
 @pytest.mark.parametrize("kwargs", MOSR_VARIANTS, ids=str)
 def test_mosr_is_not_claimed(kwargs):
     state_dict = MoSR(**kwargs).state_dict()
