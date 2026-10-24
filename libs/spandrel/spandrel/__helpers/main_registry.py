@@ -50,9 +50,11 @@ from ..architectures import (
     SCUNet,
     SeemoRe,
     SMoSR,
+    SRResNet,
     SwiftSRGAN,
     Swin2SR,
     SwinIR,
+    SwinUNet,
     Uformer,
     UNet,
 )
@@ -121,4 +123,6 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(WSR.WSRArch()),
     ArchSupport.from_architecture(FIGSR.FIGSRArch()),
     ArchSupport.from_architecture(GFISRv2.GFISRv2Arch()),
+    ArchSupport.from_architecture(SRResNet.SRResNetArch()),
+    ArchSupport.from_architecture(SwinUNet.SwinUNetArch()),
 )
