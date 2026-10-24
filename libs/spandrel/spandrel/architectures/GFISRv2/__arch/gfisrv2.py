@@ -455,6 +455,56 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed + self.offset
 
 
+# ==============================================================================
+# Реализация cuFFT для кастомного .dll (trt_dft_plugins.dll).
+# Используйте этот вариант вместо стандартного CustomRFFT2/CustomIRFFT2 ниже,
+# если требуется сборка/экспорт под кастомный плагин TensorRT com.microsoft::Rfft2 / Irfft2:
+# ==============================================================================
+# import os
+# import ctypes
+#
+# try:
+#     import tensorrt
+# except ImportError:
+#     pass
+#
+# try:
+#     plugin_path = os.path.join(os.path.dirname(__file__), "trt_dft_plugins.dll")
+#     if os.path.exists(plugin_path):
+#         ctypes.CDLL(plugin_path, winmode=0)
+# except Exception:
+#     pass
+#
+#
+# class CustomRFFT2(torch.autograd.Function):
+#     """Custom ONNX-compatible Real FFT2 Function (TRT Plugin Stub)."""
+#
+#     @staticmethod
+#     def forward(ctx, x: torch.Tensor):
+#         y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
+#         return torch.view_as_real(y)
+#
+#     @staticmethod
+#     def symbolic(g, x: torch.Value):
+#         # Для кастомного .dll (com.microsoft::Rfft2 - плагин Алексея)
+#         return g.op("com.microsoft::Rfft2", x)
+#
+#
+# class CustomIRFFT2(torch.autograd.Function):
+#     """Custom ONNX-compatible Inverse Real FFT2 Function (TRT Plugin Stub)."""
+#
+#     @staticmethod
+#     def forward(ctx, x_ri: torch.Tensor):
+#         x_c = torch.view_as_complex(x_ri)
+#         return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")
+#
+#     @staticmethod
+#     def symbolic(g, x: torch.Value):
+#         # Для кастомного .dll (com.microsoft::Irfft2 - плагин Алексея)
+#         return g.op("com.microsoft::Irfft2", x)
+# ==============================================================================
+
+
 class CustomRFFT2(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor):

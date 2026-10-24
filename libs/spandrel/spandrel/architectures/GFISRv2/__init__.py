@@ -106,4 +106,6 @@ class GFISRv2Arch(Architecture[GFISRV2]):
         )
 
 
-__all__ = ["GFISRv2Arch", "GFISRV2"]
+GFISRV2Arch = GFISRv2Arch
+
+__all__ = ["GFISRv2Arch", "GFISRV2Arch", "GFISRV2"]
