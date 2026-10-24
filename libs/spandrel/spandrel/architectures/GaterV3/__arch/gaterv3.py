@@ -933,3 +933,6 @@ class GateRV3(nn.Module):
 
         x = self.dim_to_in(x + sisr) + self.gamma * self.short_to_dim(inp)
         return x[:, :, : H * self.scale, : W * self.scale]
+
+
+GaterV3 = GateRV3
