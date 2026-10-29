@@ -1,10 +1,16 @@
 import copy
+from contextlib import nullcontext
+from unittest import mock
 
 import pytest
 import torch
 from torch import nn
 
 from spandrel import MAIN_REGISTRY
+from spandrel.architectures.__arch_helpers.attention import (
+    migraphx_export,
+    window_attention,
+)
 from spandrel.architectures.HAT import HAT, HATArch
 from spandrel.architectures.HAT.__arch.HAT import (
     OCAB,
@@ -233,6 +239,27 @@ def test_half_survives_a_last_group_beyond_fp16(upscale):
     with torch.no_grad():
         actual = descriptor.model.eval().half()(image.half()).float()
     torch.testing.assert_close(actual, expected, rtol=0, atol=5e-3)
+
+
+@pytest.mark.parametrize("migraphx", [False, True])
+def test_exported_window_attention_matches_the_run(migraphx):
+    # Two images of three shifted windows, masked with -100 as HAT and DAT do: the
+    # export's explicit operations, with the mask added through a view of each image's
+    # windows or selected through the mask tiled over the images (migraphx_export), give
+    # scaled_dot_product_attention's result
+    torch.manual_seed(0)
+    images, windows, heads, n, d = 2, 3, 2, 16, 8
+    q, k, v = torch.rand(3, images * windows, heads, n, d, dtype=torch.float64)
+    bias = torch.rand(1, heads, n, n, dtype=torch.float64)
+    mask = torch.zeros(windows, n, n, dtype=torch.float64)
+    mask[torch.rand(windows, n, n) < 0.5] = -100.0
+    expected = window_attention(q, k, v, bias, mask, 0.3)
+    with (
+        mock.patch.object(torch.onnx, "is_in_onnx_export", return_value=True),
+        migraphx_export() if migraphx else nullcontext(),
+    ):
+        actual = window_attention(q, k, v, bias, mask, 0.3)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12)
 
 
 def _unfold_ocab(ocab: OCAB, x: torch.Tensor, h: int, w: int, rpi: torch.Tensor):

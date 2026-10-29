@@ -1,9 +1,12 @@
 import copy
+from contextlib import nullcontext
+from unittest import mock
 
 import pytest
 import torch
 
 from spandrel import MAIN_REGISTRY, ModelLoader
+from spandrel.architectures.__arch_helpers.attention import migraphx_export
 from spandrel.architectures.DAT import DAT, DATArch
 from spandrel.architectures.DAT.__arch.DAT import Adaptive_Channel_Attention
 
@@ -225,3 +228,23 @@ def test_half_channel_attention_normalizes_in_fp32():
     assert len(norms) == 2
     # Each norm reads a cast (to fp32), not the fp16 q or k themselves
     assert all(node.inputsAt(0).node().kind() == "aten::to" for node in norms)
+
+
+@pytest.mark.parametrize("migraphx", [False, True])
+def test_export_operations_match_the_run(migraphx):
+    # Spatial, channel and shifted spatial attention: the export's explicit operations,
+    # with MIGraphX's layout (migraphx_export) or not, give the run's result
+    torch.manual_seed(0)
+    model = DAT(
+        embed_dim=24, depth=[3], num_heads=[2], upsampler="pixelshuffle", upscale=2
+    )
+    model = model.eval().double()
+    image = torch.rand(1, 3, 20, 28, dtype=torch.float64)
+    with torch.no_grad():
+        expected = model(image)
+        with (
+            mock.patch.object(torch.onnx, "is_in_onnx_export", return_value=True),
+            migraphx_export() if migraphx else nullcontext(),
+        ):
+            actual = model(image)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12)

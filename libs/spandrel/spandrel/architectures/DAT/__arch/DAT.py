@@ -13,7 +13,11 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
-from ...__arch_helpers.attention import pad_heads, window_attention
+from ...__arch_helpers.attention import (
+    in_migraphx_export,
+    pad_heads,
+    window_attention,
+)
 
 
 def img2windows(img, H_sp, W_sp, num_heads):
@@ -594,7 +598,12 @@ class Adaptive_Channel_Attention(nn.Module):
         attn = self.attn_drop(attn)
 
         # attention output
-        attened_x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
+        if in_migraphx_export():
+            # transposed, which MIGraphX does not fuse into one attention kernel
+            attened_x = v.transpose(-2, -1) @ attn.transpose(-2, -1)
+            attened_x = attened_x.permute(0, 2, 1, 3).reshape(B, N, C)
+        else:
+            attened_x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
 
         # convolution output
         conv_x = self.dwconv(v_)
