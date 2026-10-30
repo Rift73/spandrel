@@ -19,6 +19,7 @@ import torch
 from torch import Tensor
 from typing_extensions import Self, override
 
+from .rocm.common import patch_depthwise_convs
 from .size_req import SizeRequirements, pad_tensor
 
 T = TypeVar("T", bound=torch.nn.Module, covariant=True)
@@ -162,6 +163,8 @@ class ModelBase(ABC, Generic[T]):
         tiling: ModelTiling = ModelTiling.SUPPORTED,
     ):
         self._model: T = model
+        # ROCm only: depthwise 3x3 convs through a custom HIP kernel
+        patch_depthwise_convs(model)
         self._architecture: Architecture[T] = architecture
         self.tags: list[str] = tags
         """
