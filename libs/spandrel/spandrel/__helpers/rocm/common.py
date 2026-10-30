@@ -7,9 +7,10 @@ Adapted from florentia-mysteria/spandrel-rocm (MIT).
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 import torch
 from torch import nn
@@ -17,6 +18,12 @@ from torch import nn
 from . import kernels
 
 logger = logging.getLogger("spandrel.rocm")
+
+# The number of active TorchDispatchModes. PyTorch has no public API for it;
+# looked up by name because strict type checking rejects torch._C's members.
+_dispatch_mode_count: Callable[[], int] = importlib.import_module(
+    "torch._C"
+)._len_torch_dispatch_stack
 
 
 def version_of(t: torch.Tensor) -> int:
@@ -54,8 +61,14 @@ def plain_inference(x: torch.Tensor, module: nn.Module) -> bool:
     inference only. Tracing (torch.jit, ONNX export), torch.compile and
     torch.export, tensor subclasses (fake or functional tensors), training,
     autograd and autocast keep the original code, which they can see through.
+
+    So does an active TorchDispatchMode: a mode sees every operation and may
+    act on tensors between them (e.g. move an idle tensor to host memory),
+    while a kernel reads raw pointers it cannot see.
     """
     if _tracing() or type(x) is not torch.Tensor or module.training:
+        return False
+    if _dispatch_mode_count() > 0:
         return False
     if torch.is_autocast_enabled(x.device.type):
         return False
@@ -95,7 +108,8 @@ class HipDepthwiseConv2d(nn.Conv2d):
 
     # (key, fp32 weights in the kernel's (C, 9) layout, fp32 bias); the key
     # changes when the module moves to another device or dtype or its
-    # parameters are replaced or modified in place
+    # parameters are replaced or modified in place. In-place edits through
+    # `.data` are not detected: they do not change the version counter.
     _hip_weights: tuple[tuple[object, ...], torch.Tensor, torch.Tensor | None] | None
     _hip_weights = None
 

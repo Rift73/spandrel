@@ -25,6 +25,7 @@ import pytest
 import torch
 from torch import nn
 from torch.nn.functional import conv2d, leaky_relu
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from spandrel import ImageModelDescriptor, ModelDescriptor
 from spandrel.__helpers.rocm import kernels
@@ -43,6 +44,7 @@ rrdb_path = importlib.import_module("spandrel.architectures.__arch_helpers._rocm
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 SUFFIX_DTYPE = {"f32": torch.float32, "f16": torch.float16, "bf16": torch.bfloat16}
 DTYPE_SUFFIX = {dtype: suffix for suffix, dtype in SUFFIX_DTYPE.items()}
+BUFFER = "_spandrel_rrdb_buffer"  # set by the RRDB path on its outputs
 
 
 def _memory(address: int, count: int, dtype: torch.dtype) -> torch.Tensor:
@@ -60,9 +62,18 @@ class EmulatedHip:
         self.launched: list[str] = []
         self.attempts = 0
         self.fail: Exception | None = None
+        # devices made current with torch.cuda.device, innermost last
+        self.current: list[torch.device] = []
+        # (kernel, current device) at every get and launch
+        self.gets: list[tuple[str, torch.device | None]] = []
+        self.launches: list[tuple[str, torch.device | None]] = []
+
+    def current_device(self) -> torch.device | None:
+        return self.current[-1] if self.current else None
 
     def get(self, device_index: int, program: str, name: str) -> str:
         assert program in kernels.PROGRAM_NAMES
+        self.gets.append((name, self.current_device()))
         return name
 
     def launch(
@@ -76,6 +87,7 @@ class EmulatedHip:
         stream: int,
     ) -> None:
         self.attempts += 1
+        self.launches.append((fn, self.current_device()))
         if self.fail is not None:
             raise self.fail
         kind, suffix = fn.rsplit("_", 1)
@@ -123,6 +135,17 @@ def emulated_hip(monkeypatch: pytest.MonkeyPatch) -> EmulatedHip:
     monkeypatch.setattr(kernels, "_get_hip", lambda: hip)
     monkeypatch.setattr(HipDepthwiseConv2d, "kernel_failed", False)
     monkeypatch.setattr(rrdb_path, "_failed", False)
+
+    @contextmanager
+    def current_device(device: torch.device) -> Iterator[None]:
+        hip.current.append(device)
+        try:
+            yield
+        finally:
+            hip.current.pop()
+
+    # stands in for torch.cuda.device, which only takes GPUs
+    monkeypatch.setattr(torch.cuda, "device", current_device)
     return hip
 
 
@@ -163,7 +186,7 @@ def test_rrdb_buffer_path_is_bit_identical(
 
     def input_buffer(t: torch.Tensor, channels: int) -> torch.Tensor:
         buf = original_input_buffer(t, channels)
-        reused.append(buf is t._base)
+        reused.append(buf is getattr(t, BUFFER, None))
         return buf
 
     monkeypatch.setattr(rrdb_path, "_input_buffer", input_buffer)
@@ -178,6 +201,56 @@ def test_rrdb_buffer_path_is_bit_identical(
     assert reused == [False, True]
     assert torch.equal(x, x_before)
     assert fast.dtype == expected.dtype == dtype
+    assert torch.equal(fast, expected)
+
+
+def _grad_mode(name: str) -> torch.inference_mode | torch.no_grad:
+    return torch.inference_mode() if name == "inference_mode" else torch.no_grad()
+
+
+@pytest.mark.parametrize("grad_mode", ["no_grad", "inference_mode"])
+def test_rrdb_reuses_only_its_own_buffers(
+    emulated_hip: EmulatedHip, monkeypatch: pytest.MonkeyPatch, grad_mode: str
+):
+    model = _rrdb_chain(16, 8, 3, torch.float32)
+    x = torch.randn(2, 16, 9, 7)
+    inputs: list[torch.Tensor] = []
+    copies: list[bool] = []
+    original_input_buffer = rrdb_path._input_buffer
+
+    def input_buffer(t: torch.Tensor, channels: int) -> torch.Tensor:
+        buf = original_input_buffer(t, channels)
+        inputs.append(t)
+        copies.append(buf is not getattr(t, BUFFER, None))
+        return buf
+
+    monkeypatch.setattr(rrdb_path, "_input_buffer", input_buffer)
+    with _grad_mode(grad_mode):
+        fast = model(x)
+        with kernels_off(monkeypatch):
+            expected = model(x)
+    # views made in inference mode have no _base: the mark is an attribute
+    assert copies == [True, False, False]
+    assert all(getattr(t, BUFFER, None) is not None for t in inputs[1:])
+    assert getattr(fast, BUFFER).shape == (2, 16 + 4 * 8, 9, 7)
+    assert torch.equal(fast, expected)
+
+
+@pytest.mark.parametrize("grad_mode", ["no_grad", "inference_mode"])
+def test_rrdb_never_writes_into_a_callers_buffer(
+    emulated_hip: EmulatedHip, monkeypatch: pytest.MonkeyPatch, grad_mode: str
+):
+    nf, gc = 16, 8
+    model = _rrdb_chain(nf, gc, 1, torch.float32)
+    with _grad_mode(grad_mode):
+        # the caller's own buffer of the size the RRDB path works in
+        own = torch.randn(1, nf + 4 * gc, 8, 8)
+        before = own.clone()
+        fast = model(own[:, :nf])
+        with kernels_off(monkeypatch):
+            expected = model(own[:, :nf])
+    assert len(emulated_hip.launched) == 15
+    assert torch.equal(own, before)
     assert torch.equal(fast, expected)
 
 
@@ -525,6 +598,48 @@ def test_fast_paths_are_skipped(
             with torch.no_grad():
                 model(x)
     assert emulated_hip.launched == []
+
+
+class PassThroughMode(TorchDispatchMode):
+    """A dispatch mode that sees every operation and changes nothing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ops = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.ops += 1
+        return func(*args, **(kwargs or {}))
+
+
+def test_dispatch_modes_keep_the_original_code(
+    emulated_hip: EmulatedHip, monkeypatch: pytest.MonkeyPatch
+):
+    for model, channels in zip(_models(), (6, 16)):
+        x = torch.randn(1, channels, 8, 8)
+        with torch.no_grad():
+            with kernels_off(monkeypatch):
+                expected = model(x)
+            mode = PassThroughMode()
+            with mode:
+                actual = model(x)
+        assert mode.ops > 0  # the original operations ran under the mode
+        assert torch.equal(actual, expected)
+    assert emulated_hip.launched == []
+    assert emulated_hip.attempts == 0
+
+
+def test_kernels_launch_on_the_tensors_device(emulated_hip: EmulatedHip):
+    # The default stream (handle 0) is the null stream of the current device,
+    # so the tensor's device must be current at every launch (and compile).
+    for model, channels in zip(_models(), (6, 16)):
+        x = torch.randn(1, channels, 8, 8)
+        with torch.no_grad():
+            model(x)
+    assert len(emulated_hip.launches) == 1 + 15
+    assert emulated_hip.gets == emulated_hip.launches
+    assert all(device == torch.device("cpu") for _, device in emulated_hip.launches)
+    assert emulated_hip.current == []
 
 
 def test_tensor_subclasses_keep_the_original_code(emulated_hip: EmulatedHip):

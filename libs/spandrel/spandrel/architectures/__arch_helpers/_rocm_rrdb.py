@@ -33,6 +33,9 @@ logger = logging.getLogger("spandrel.rocm")
 
 _failed = False
 
+# attribute of an RRDB output (a channel prefix) holding the buffer it lives in
+_BUFFER = "_spandrel_rrdb_buffer"
+
 # per dense block: [(conv, LeakyReLU slope)] * 4 + [(conv5, 0.0)]
 _Layers = list[tuple[nn.Conv2d, float]]
 
@@ -94,23 +97,25 @@ def _layouts(module: nn.Module) -> list[_Layers] | None:
 
 def _input_buffer(x: torch.Tensor, channels: int) -> torch.Tensor:
     """
-    A (B, channels, H, W) buffer whose first channels hold x. The output of the
-    previous RRDB already is the first slot of such a buffer, so it is reused
-    (only its other slots are written).
+    A (B, channels, H, W) buffer whose first channels hold x. When x is the
+    output of the previous RRDB on this path, it already is the first slot of
+    such a buffer (marked by rrdb_forward), which is reused: only its other
+    slots are written. Any other tensor is copied, so a caller's own buffer is
+    never written into. The mark is an attribute rather than x._base, which
+    views made in inference mode do not have.
     """
-    base = x._base
-    if (
-        base is not None
-        and base.dim() == 4
-        and base.shape[0] == x.shape[0]
-        and base.shape[1] == channels
-        and base.shape[2:] == x.shape[2:]
-        and base.is_contiguous()
-        and x.data_ptr() == base.data_ptr()
-        and x.stride() == base.stride()
-    ):
-        return base
     b, c, h, w = x.shape
+    buf = getattr(x, _BUFFER, None)
+    if (
+        isinstance(buf, torch.Tensor)
+        and buf.shape == (b, channels, h, w)
+        and buf.dtype == x.dtype
+        and buf.device == x.device
+        and buf.is_contiguous()
+        and x.data_ptr() == buf.data_ptr()
+        and x.stride() == buf[:, :c].stride()
+    ):
+        return buf
     buf = torch.empty((b, channels, h, w), device=x.device, dtype=x.dtype)
     buf[:, :c].copy_(x)
     return buf
@@ -154,7 +159,9 @@ def rrdb_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
                 # last RDB and the RRDB around it: (x5 * 0.2 + x) * 0.2 + x_rrdb
                 kernels.residual_add(y5, cur[:, :nf], nxt[:, :nf], 0.2, x, 0.2)
             cur = nxt
-        return cur[:, :nf]
+        out = cur[:, :nf]
+        setattr(out, _BUFFER, cur)
+        return out
     except torch.cuda.OutOfMemoryError:
         raise
     except kernels.FAILURES as e:

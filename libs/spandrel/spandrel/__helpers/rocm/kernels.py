@@ -639,6 +639,25 @@ def _stream(t: torch.Tensor) -> int:
     return torch.cuda.current_stream(t.device).cuda_stream
 
 
+def _launch(
+    t: torch.Tensor,
+    program: str,
+    name: str,
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    args: Sequence[_KernelArg],
+) -> None:
+    """
+    Launches a kernel of a program on t's device, on that device's current
+    stream. The device is made current for the launch: the default stream
+    (handle 0) is the null stream of whichever device is current.
+    """
+    hip = _get_hip()
+    with torch.cuda.device(t.device):
+        fn = hip.get(t.get_device(), program, name)
+        hip.launch(fn, grid, block, args, _stream(t))
+
+
 # --- depthwise 3x3 convolution ----------------------------------------------------
 
 
@@ -673,8 +692,6 @@ def dwconv3x3(
     """
     x = x.contiguous()
     b, c, h, w = x.shape
-    hip = _get_hip()
-    fn = hip.get(x.get_device(), "dwconv", f"dwconv3x3_{_DTYPE_SUFFIX[x.dtype]}")
     y = torch.empty_like(x)
     args: list[_KernelArg] = [
         ctypes.c_void_p(x.data_ptr()),
@@ -686,7 +703,9 @@ def dwconv3x3(
         ctypes.c_int(w),
     ]
     grid = ((w + _TW - 1) // _TW, (h + _TH - 1) // _TH, b * c)
-    hip.launch(fn, grid, (_TW, _TH, 1), args, _stream(x))
+    _launch(
+        x, "dwconv", f"dwconv3x3_{_DTYPE_SUFFIX[x.dtype]}", grid, (_TW, _TH, 1), args
+    )
     return y
 
 
@@ -731,6 +750,7 @@ def act_into(
     if (
         dst_stride is None
         or dst.dtype != src.dtype
+        or dst.device != src.device
         or dst.shape[0] != b
         or dst.shape[2:] != src.shape[2:]
         or channel_offset + c > dst.shape[1]
@@ -741,7 +761,6 @@ def act_into(
         )
     src = src.contiguous()
     n = c * h * w
-    hip = _get_hip()
     args: list[_KernelArg] = [
         ctypes.c_void_p(src.data_ptr()),
         ctypes.c_void_p(dst.data_ptr()),
@@ -750,12 +769,13 @@ def act_into(
         ctypes.c_int64(channel_offset * h * w),
         ctypes.c_float(slope),
     ]
-    hip.launch(
-        hip.get(dst.get_device(), "rrdb", f"act_into_{_DTYPE_SUFFIX[src.dtype]}"),
+    _launch(
+        src,
+        "rrdb",
+        f"act_into_{_DTYPE_SUFFIX[src.dtype]}",
         _grid(n, b),
         (256, 1, 1),
         args,
-        _stream(src),
     )
 
 
@@ -781,7 +801,10 @@ def residual_add(
         x1_stride is None
         or dst_stride is None
         or x2_stride is None
-        or any(t.shape != a.shape or t.dtype != a.dtype for t in others)
+        or any(
+            t.shape != a.shape or t.dtype != a.dtype or t.device != a.device
+            for t in others
+        )
     ):
         raise HipKernelError(
             "residual_add: unsupported tensors "
@@ -789,7 +812,6 @@ def residual_add(
         )
     a = a.contiguous()
     n = c * h * w
-    hip = _get_hip()
     args: list[_KernelArg] = [
         ctypes.c_void_p(a.data_ptr()),
         ctypes.c_void_p(x1.data_ptr()),
@@ -803,10 +825,6 @@ def residual_add(
         ctypes.c_float(s2),
         ctypes.c_int(1 if x2 is not None else 0),
     ]
-    hip.launch(
-        hip.get(a.get_device(), "rrdb", f"res_add_{_DTYPE_SUFFIX[a.dtype]}"),
-        _grid(n, b),
-        (256, 1, 1),
-        args,
-        _stream(a),
+    _launch(
+        a, "rrdb", f"res_add_{_DTYPE_SUFFIX[a.dtype]}", _grid(n, b), (256, 1, 1), args
     )
