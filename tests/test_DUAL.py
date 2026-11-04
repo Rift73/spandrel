@@ -109,11 +109,12 @@ def _na_reference(attention, x):
 
 
 # odd and rectangular inputs, one axis at or below the window, partial 16x16
-# query tiles, a window above the tile size; with autograd (training chunks)
-# and without (inference bands)
+# query tiles, a window above the tile size, clear tiles sharing a mask; with
+# autograd (training chunks) and without (inference calls)
 @pytest.mark.parametrize("grad", [False, True])
 @pytest.mark.parametrize(
-    ("window", "shape"), [(6, (13, 21)), (7, (5, 37)), (6, (34, 6)), (20, (45, 23))]
+    ("window", "shape"),
+    [(6, (13, 21)), (7, (5, 37)), (6, (34, 6)), (20, (45, 23)), (6, (45, 50))],
 )
 def test_neighborhood_attention_matches_dense_reference(window, shape, grad):
     torch.manual_seed(0)
@@ -133,9 +134,9 @@ def test_neighborhood_attention_matches_dense_reference(window, shape, grad):
 @pytest.mark.parametrize(
     ("cap", "calls"),
     [
-        # 15 x 10 query tiles, batch 2: bands of 6 whole rows
+        # 15 x 10 query tiles, batch 2: up to 66 a call, 84 edge and 66 clear ones
         (dual_arch.NA_INFERENCE_MASK_ELEMENTS, 3),
-        # a row above the cap: chunks of 4 tiles within the row
+        # 4 a call
         (4 * 16 * 16 * 63 * 63 * 2, 38),
     ],
 )
@@ -176,6 +177,75 @@ def test_ambiguous_schedule_is_refused():
     model = DUAL(embed_dim=32, depths=(3, 3), layer_indices=((0, 1, 2), (3, 4, 5)))
     with pytest.raises(ValueError, match="layer schedule"):
         DUALArch().load(model.state_dict())
+
+
+def _regional_class(rca, q, k, v, sy, sx):
+    """One class padding its own copies and working out its own geometry."""
+    b, c, h, w = q.shape
+    heads, d = rca.heads, c // rca.heads
+    ph, pw = h + sy + (-(h + sy) % 32), w + sx + (-(w + sx) % 32)
+    ny, nx = ph // 32, pw // 32
+
+    def windows(t):
+        return (
+            torch.nn.functional.pad(t, (sx, pw - w - sx, sy, ph - h - sy))
+            .reshape(b, heads, d, ny, 32, nx, 32)
+            .permute(0, 3, 5, 1, 2, 4, 6)
+            .reshape(b, ny * nx, heads, d, 1024)
+        )
+
+    y0, x0 = torch.arange(ny) * 32 - sy, torch.arange(nx) * 32 - sx
+    yc = (y0 + 32).clamp(max=h) - y0.clamp(min=0)
+    xc = (x0 + 32).clamp(max=w) - x0.clamp(min=0)
+    count = (yc[:, None] * xc[None, :]).reshape(1, ny * nx, 1, 1)
+    a = rca.channel_attention(windows(q), windows(k), count)
+    o = (
+        (a @ windows(v))
+        .reshape(b, ny, nx, heads, d, 32, 32)
+        .permute(0, 3, 4, 1, 5, 2, 6)
+        .reshape(b, c, ph, pw)[:, :, sy : sy + h, sx : sx + w]
+    )
+    wy = dual_arch.hat_weights(h, sy)[None, None, :, None]
+    wx = dual_arch.hat_weights(w, sx)[None, None, None, :]
+    return o * wy * wx
+
+
+# every residue of the two axes against the 32-pixel grids of the shifted classes;
+# with autograd (geometry computed) and without (geometry reused)
+@pytest.mark.parametrize("grad", [False, True])
+@pytest.mark.parametrize("shape", [(33, 47), (64, 32), (16, 48), (5, 7), (48, 16)])
+def test_regional_mix_matches_per_class_padding(shape, grad):
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(64, 2).eval()
+    q, k, v = torch.randn(3, 1, 64, *shape).unbind(0)
+    with torch.set_grad_enabled(grad):
+        actual = rca.mix(q, k, v)
+    with torch.no_grad():
+        expected = (
+            _regional_class(rca, q, k, v, 0, 0)
+            + _regional_class(rca, q, k, v, 0, 16)
+            + _regional_class(rca, q, k, v, 16, 0)
+            + _regional_class(rca, q, k, v, 16, 16)
+        )
+    torch.testing.assert_close(actual.detach(), expected, rtol=0, atol=0)
+
+
+# A convolution's rounding depends on the layout of its input; layers run channels-last
+@pytest.mark.parametrize("layout", [torch.contiguous_format, torch.channels_last])
+def test_group_convolutions_see_the_input_layout(layout):
+    model = _small(scale=2).eval()
+    model.prepare_for_export()
+    seen = []
+    for module in model.modules():
+        if isinstance(module, dual_arch.PremixedDeployedDynamicConv3x3):
+            module.register_forward_pre_hook(
+                lambda _, inputs: seen.append(
+                    inputs[0].is_contiguous(memory_format=layout)
+                )
+            )
+    with torch.no_grad():
+        model(torch.rand(1, 3, 37, 29).contiguous(memory_format=layout))
+    assert seen == [True, True]
 
 
 @pytest.mark.parametrize("folded", [False, True])

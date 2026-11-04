@@ -45,6 +45,7 @@ import math
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 import torch
@@ -479,8 +480,45 @@ def _na_coordinates(height: int, width: int, device: torch.device) -> Tensor:
     return torch.stack((yy, xx), dim=-1).reshape(-1, 2)
 
 
-# spandrel: the boolean mask elements one inference attention call of _na_core
-# covers (its query, key and value copies scale with it).
+@lru_cache(maxsize=16)
+def _inference_na_coordinates(height: int, width: int, device: torch.device) -> Tensor:
+    """Small read-only integer grids, reused across forwards; normal tensors, so a
+    later caller with autograd can still read them."""
+    with torch.inference_mode(False):
+        return _na_coordinates(height, width, device)
+
+
+@lru_cache(maxsize=16)
+def _inference_na_tiles(
+    height: int, width: int, window: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """The 16x16 query tiles' origins: those a clamp reaches, and the clear ones,
+    whose key union and whose queries' neighborhoods all stay inside the image."""
+    with torch.inference_mode(False):
+        tiles = _na_coordinates(-(-height // 16), -(-width // 16), device) * 16
+        clear = torch.ones(tiles.shape[0], dtype=torch.bool, device=device)
+        for axis, length in enumerate((height, width)):
+            k = min(length, window)
+            # k + 15 fits the axis: the last clear origin keeps its union inside it.
+            clear &= (tiles[:, axis] >= k // 2) & (
+                tiles[:, axis] <= length - (k + 15) + k // 2
+            )
+        return tiles[~clear], tiles[clear]
+
+
+def _eager_inference(module: nn.Module) -> bool:
+    """Plain inference: with no autograd, compilation or export in play, tensors may
+    be shared between tiles and classes and kept across forwards."""
+    return not (
+        module.training
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or torch.onnx.is_in_onnx_export()
+    )
+
+
+# spandrel: the tiles (times batch and mask elements per tile) one inference attention
+# call of _na_inference covers: its query, key and value copies scale with it.
 NA_INFERENCE_MASK_ELEMENTS = 2**27
 
 
@@ -594,24 +632,14 @@ class _SpatialAttention(_WindowAttention):
         qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         query = query * dim**-0.5
+        if _eager_inference(self):
+            return self._na_inference(query, key, value, height, width)
         dtype = query.dtype
         output = x.new_empty((batch, channels, height, width), dtype=dtype)
         uh, uw = min(height, kh + tile - 1), min(width, kw + tile - 1)
         qlocal = _na_coordinates(tile, tile, x.device)
         klocal = _na_coordinates(uh, uw, x.device)
         tiles = [(y, z) for y in range(0, height, tile) for z in range(0, width, tile)]
-        # spandrel: at inference, batch bands of whole tile rows (up to
-        # NA_INFERENCE_MASK_ELEMENTS mask elements per call) and write each band at
-        # once; a row above that cap goes in chunks of tiles. Each tile's math is
-        # unchanged; training keeps the original chunks.
-        across = -(-width // tile)
-        bands = False
-        if not (self.training or torch.is_grad_enabled()):
-            per_call = max(
-                1, NA_INFERENCE_MASK_ELEMENTS // (batch * tile * tile * uh * uw)
-            )
-            bands = per_call >= across
-            chunk_size = per_call // across * across if bands else per_call
 
         def gather(t: Tensor, index: Tensor, count: int) -> Tensor:
             return (
@@ -684,19 +712,131 @@ class _SpatialAttention(_WindowAttention):
                 .permute(0, 1, 2, 5, 3, 4)
                 .reshape(batch, count, channels, tile, tile)
             )
-            if bands:
-                rows, y = count // across, current[0][0]
-                band = (
-                    attended.reshape(batch, rows, across, channels, tile, tile)
-                    .permute(0, 3, 1, 4, 2, 5)
-                    .reshape(batch, channels, rows * tile, across * tile)
-                )
-                output[:, :, y : y + rows * tile] = band[:, :, : height - y, :width]
-                continue
             for j, (y, z) in enumerate(current):
                 th, tw = min(tile, height - y), min(tile, width - z)
                 output[:, :, y : y + th, z : z + tw] = attended[:, j, :, :th, :tw]
         return output
+
+    def _na_inference(
+        self, query: Tensor, key: Tensor, value: Tensor, height: int, width: int
+    ) -> Tensor:
+        """spandrel: _na_core's arithmetic per query with less work around it.
+
+        Both Fourier factors come from one evaluation per forward over the key
+        union, which holds every query's coordinates. Clear tiles relate their
+        queries to their keys alike, so they share one mask, which attention reads by
+        broadcasting. Calls cover up to NA_INFERENCE_MASK_ELEMENTS: a call's time
+        has a floor that grows with the keys, so the tiles that need their own masks
+        go together too.
+        """
+        batch, heads, _, dim = query.shape
+        device, dtype = query.device, query.dtype
+        tile, rank = 16, self.factored_bias.rank
+        kh, kw = min(height, self.window), min(width, self.window)
+        uh, uw = min(height, kh + tile - 1), min(width, kw + tile - 1)
+        qlocal = _inference_na_coordinates(tile, tile, device)
+        klocal = _inference_na_coordinates(uh, uw, device)
+        edge_tiles, clear_tiles = _inference_na_tiles(
+            height, width, self.window, device
+        )
+        query_factors, key_factors = self.factored_bias.factors(klocal, dtype)
+        stride = -(-width // tile) * tile
+        output = query.new_empty(
+            (batch, -(-height // tile) * tile, stride, heads * dim)
+        )
+        slots = output.reshape(batch, -1, heads * dim)
+        # NVIDIA's attention kernels round the same without the zero lanes that only
+        # match the width of the keys' factors. The CPU's do not; ROCm's are unmeasured.
+        narrow_values = device.type == "cuda" and torch.version.hip is None
+        per_call = max(1, NA_INFERENCE_MASK_ELEMENTS // (batch * tile * tile * uh * uw))
+        shared_mask = None
+
+        def gather(t: Tensor, index: Tensor, count: int) -> Tensor:
+            return (
+                t.index_select(2, index.reshape(-1))
+                .reshape(batch, heads, count, index.shape[1], dim)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(batch * count, heads, index.shape[1], dim)
+            )
+
+        def neighborhoods(qp: Tensor, ko: Tensor) -> Tensor:
+            sy = (qp[..., 0] - kh // 2).clamp(0, height - kh)
+            sx = (qp[..., 1] - kw // 2).clamp(0, width - kw)
+            ky = ko[:, 0, None] + torch.arange(uh, device=device)[None]
+            kx = ko[:, 1, None] + torch.arange(uw, device=device)[None]
+            my = (ky[:, None, :] >= sy[..., None]) & (
+                ky[:, None, :] < sy[..., None] + kh
+            )
+            mx = (kx[:, None, :] >= sx[..., None]) & (
+                kx[:, None, :] < sx[..., None] + kw
+            )
+            return (my[..., :, None] & mx[..., None, :]).reshape(
+                qp.shape[0], tile * tile, uh * uw
+            )
+
+        for tiles, shared in ((edge_tiles, False), (clear_tiles, True)):
+            for first in range(0, tiles.shape[0], per_call):
+                start = tiles[first : first + per_call]
+                count = start.shape[0]
+                whole = start[:, None] + qlocal[None]
+                # Partial tiles repeat a valid query to avoid all-masked softmax; the
+                # slots they write lie outside the returned crop.
+                qp = torch.stack(
+                    (
+                        whole[..., 0].clamp(max=height - 1),
+                        whole[..., 1].clamp(max=width - 1),
+                    ),
+                    -1,
+                )
+                ko = torch.stack(
+                    (
+                        (start[:, 0] - kh // 2).clamp(0, height - uh),
+                        (start[:, 1] - kw // 2).clamp(0, width - uw),
+                    ),
+                    -1,
+                )
+                kp = ko[:, None] + klocal[None]
+                qi = qp[..., 0] * width + qp[..., 1]
+                ki = kp[..., 0] * width + kp[..., 1]
+                relative = qp - ko[:, None]
+                bq = (
+                    query_factors.index_select(
+                        1, (relative[..., 0] * uw + relative[..., 1]).reshape(-1)
+                    )
+                    .reshape(heads, count, tile * tile, rank)
+                    .permute(1, 0, 2, 3)[None]
+                    .expand(batch, -1, -1, -1, -1)
+                    .reshape(batch * count, heads, tile * tile, rank)
+                )
+                bk = key_factors[None].expand(batch * count, -1, -1, -1)
+                qt = torch.cat((gather(query, qi, count), bq), -1)
+                kt = torch.cat((gather(key, ki, count), bk), -1)
+                vt = gather(value, ki, count)
+                vt = vt.contiguous() if narrow_values else F.pad(vt, (0, rank))
+                if not shared:
+                    mask = (
+                        neighborhoods(qp, ko)[None]
+                        .expand(batch, -1, -1, -1)
+                        .reshape(batch * count, 1, tile * tile, uh * uw)
+                        .contiguous()
+                    )
+                else:
+                    if shared_mask is None:
+                        shared_mask = neighborhoods(qp[:1], ko[:1])[None].contiguous()
+                    mask = shared_mask
+                attended = F.scaled_dot_product_attention(
+                    qt, kt, vt, attn_mask=mask, dropout_p=0.0, scale=1.0
+                )[..., :dim]
+                slots.index_copy_(
+                    1,
+                    (whole[..., 0] * stride + whole[..., 1]).reshape(-1),
+                    attended.transpose(1, 2).reshape(
+                        batch, count * tile * tile, heads * dim
+                    ),
+                )
+        # BCHW memory: the projection's matmul takes another path on channels-last
+        # features, and low-precision rounding depends on the path.
+        return output[:, :height, :width].permute(0, 3, 1, 2).contiguous()
 
     def pre_gate_core(self, x: Tensor) -> Tensor:
         if x.ndim != 4 or x.shape[1] != self.channels or min(x.shape[2:]) < 1:
@@ -965,6 +1105,31 @@ def hat_weights(
     return (1 - ((t.to(dtype) - 15.5).abs() / 16)).to(dtype)
 
 
+def _regional_geometry(
+    h: int, w: int, sy: int, sx: int, device: torch.device, dtype: torch.dtype
+) -> tuple[Tensor, Tensor, Tensor]:
+    """One regional class's real token count per window and its two hats."""
+    ny, nx = -(-(h + sy) // 32), -(-(w + sx) // 32)
+    # Real clipped lengths rather than a stored pixel-validity tensor.
+    y0 = torch.arange(ny, device=device) * 32 - sy
+    x0 = torch.arange(nx, device=device) * 32 - sx
+    yc = (y0 + 32).clamp(max=h) - y0.clamp(min=0)
+    xc = (x0 + 32).clamp(max=w) - x0.clamp(min=0)
+    count = (yc[:, None] * xc[None, :]).reshape(1, ny * nx, 1, 1).to(dtype)
+    wy = hat_weights(h, sy, device=device, dtype=dtype)
+    wx = hat_weights(w, sx, device=device, dtype=dtype)
+    return count, wy[None, None, :, None], wx[None, None, None, :]
+
+
+@lru_cache(maxsize=32)
+def _inference_regional_geometry(
+    h: int, w: int, sy: int, sx: int, device: torch.device, dtype: torch.dtype
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reused across forwards, as _inference_na_coordinates."""
+    with torch.inference_mode(False):
+        return _regional_geometry(h, w, sy, sx, device, dtype)
+
+
 class RegionalChannelAttention(nn.Module):
     """Pre-norm residual BRANCH (the caller adds x); no hidden mutable state."""
 
@@ -1002,25 +1167,28 @@ class RegionalChannelAttention(nn.Module):
             tau = self.theta.to(dtype).clamp(max=math.log(100)).exp()
             return (cosine * tau[:, None, None]).softmax(-1)
 
-    def _class_core(self, q: Tensor, k: Tensor, v: Tensor, sy: int, sx: int) -> Tensor:
-        b, c, h, w = q.shape
+    def _class_core(
+        self, q: Tensor, k: Tensor, v: Tensor, h: int, w: int, sy: int, sx: int
+    ) -> Tensor:
+        """q, k and v are mix's padded copies; h and w the real size."""
+        b, c = q.shape[:2]
         ph, pw = h + sy + (-(h + sy) % 32), w + sx + (-(w + sx) % 32)
         ny, nx, d = ph // 32, pw // 32, c // self.heads
 
         def windows(t: Tensor) -> Tensor:
-            t = F.pad(t, (sx, pw - w - sx, sy, ph - h - sy))
             return (
-                t.reshape(b, self.heads, d, ny, 32, nx, 32)
+                t[:, :, 16 - sy : 16 - sy + ph, 16 - sx : 16 - sx + pw]
+                .reshape(b, self.heads, d, ny, 32, nx, 32)
                 .permute(0, 3, 5, 1, 2, 4, 6)
                 .reshape(b, ny * nx, self.heads, d, 1024)
             )
 
-        # Real clipped lengths rather than a stored pixel-validity tensor.
-        y0 = torch.arange(ny, device=q.device) * 32 - sy
-        x0 = torch.arange(nx, device=q.device) * 32 - sx
-        yc = (y0 + 32).clamp(max=h) - y0.clamp(min=0)
-        xc = (x0 + 32).clamp(max=w) - x0.clamp(min=0)
-        count = (yc[:, None] * xc[None, :]).reshape(1, ny * nx, 1, 1)
+        geometry = (
+            _inference_regional_geometry
+            if _eager_inference(self)
+            else _regional_geometry
+        )
+        count, wy, wx = geometry(h, w, sy, sx, q.device, q.dtype)
         a = self.channel_attention(windows(q), windows(k), count)
         # The probability cast is part of the stated BF16 training function.
         # Keep matmul dtype explicit even under a surrounding autocast context.
@@ -1032,19 +1200,23 @@ class RegionalChannelAttention(nn.Module):
                 .reshape(b, c, ph, pw)[:, :, sy : sy + h, sx : sx + w]
                 .to(a.dtype)
             )
-            wy = hat_weights(h, sy, device=q.device, dtype=a.dtype)
-            wx = hat_weights(w, sx, device=q.device, dtype=a.dtype)
-            return o * wy[None, None, :, None] * wx[None, None, None, :]
+            return o * wy * wx
 
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """Blend four class outputs without an H*W*d*d matrix field."""
         check = self.core_checkpoint and self.training and torch.is_grad_enabled()
+        h, w = q.shape[-2:]
+        # spandrel: one zero-padded copy serves all four classes, which crop their
+        # window grids from it; q and k are read in the calculation dtype anyway.
+        dtype = calculation_dtype(q.dtype)
+        pad = (16, max(-w % 32, -(w + 16) % 32), 16, max(-h % 32, -(h + 16) % 32))
+        q, k, v = F.pad(q.to(dtype), pad), F.pad(k.to(dtype), pad), F.pad(v, pad)
         result = None
         for sy, sx in ((0, 0), (0, 16), (16, 0), (16, 16)):
             out = (
-                checkpoint(self._class_core, q, k, v, sy, sx, use_reentrant=False)
+                checkpoint(self._class_core, q, k, v, h, w, sy, sx, use_reentrant=False)
                 if check
-                else self._class_core(q, k, v, sy, sx)
+                else self._class_core(q, k, v, h, w, sy, sx)
             )
             result = out if result is None else result + out
         return result
@@ -1410,6 +1582,13 @@ class _Layer(nn.Module):
         return x + self.ffn(self.norm2(x))
 
 
+def _layers_layout(x: Tensor) -> torch.memory_format:
+    """The layout to give the group convolution back (spandrel): layers run in
+    channels-last order, as their norms write it, so their residuals add in one layout;
+    a convolution's rounding depends on the layout of its input, so it keeps x's."""
+    return torch.contiguous_format if x.is_contiguous() else torch.channels_last
+
+
 class _Group(nn.Module):
     """Six layers and a group residual; optional activation checkpointing."""
 
@@ -1451,12 +1630,14 @@ class _Group(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         residual = x
+        layout = _layers_layout(x)
+        x = x.contiguous(memory_format=torch.channels_last)
         for layer in self.layers:
             if self.use_checkpoint and self.training and torch.is_grad_enabled():
                 x = checkpoint(layer, x, use_reentrant=False)
             else:
                 x = layer(x)
-        return residual + self.conv(x)
+        return residual + self.conv(x.contiguous(memory_format=layout))
 
 
 @store_hyperparameters()
@@ -1652,7 +1833,8 @@ class DUAL(nn.Module):
         mean = self.mean.to(dtype=x.dtype)
         shifted = x - mean
         stem = self.stem(F.pixel_unshuffle(shifted, 2) if self.unshuffle else shifted)
-        h = stem
+        layout = _layers_layout(stem)
+        h = stem.contiguous(memory_format=torch.channels_last)
         group = self.groups[0]
         check = group.use_checkpoint and self.training and torch.is_grad_enabled()
         fine = h
@@ -1660,12 +1842,12 @@ class DUAL(nn.Module):
             h = checkpoint(layer, h, use_reentrant=False) if check else layer(h)
             if index == 1:
                 fine = h
-        h = stem + group.conv(h)
+        h = stem + group.conv(h.contiguous(memory_format=layout))
         h = self.groups[1](h)
         coarse_input = self.xr.downsample(shifted)
         coarse = self.stem(
             F.pixel_unshuffle(coarse_input, 2) if self.unshuffle else coarse_input
-        )
+        ).contiguous(memory_format=torch.channels_last)
         for layer in group.layers[:2]:
             coarse = (
                 checkpoint(layer, coarse, use_reentrant=False)
