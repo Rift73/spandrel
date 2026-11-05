@@ -86,7 +86,7 @@ def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=
 
 
 def _fold_again_after_load(module: Conv3XC, _incompatible_keys: object) -> None:
-    module.folded_for = None
+    module.folded = False
 
 
 class Conv3XC(nn.Module):
@@ -101,9 +101,10 @@ class Conv3XC(nn.Module):
         relu=False,
     ):
         super().__init__()
-        # The device and dtype eval_conv was last folded for; None: its folded weights
-        # are out of date. The fold is exact only for the device and dtype that ran it.
-        self.folded_for: tuple[torch.device, torch.dtype] | None = None
+        # Whether eval_conv holds the fold of the weights as they are, on their device and
+        # in their dtype. Not locked: threads on a first call each fold, to the same
+        # values, but a move, a cast or a load next to a forward is not safe.
+        self.folded = False
         self.stride = s
         self.has_relu = relu
         gain = gain1
@@ -156,6 +157,12 @@ class Conv3XC(nn.Module):
             self.update_params()
         self.register_load_state_dict_post_hook(_fold_again_after_load)
 
+    def _apply(self, fn, recurse=True):
+        # A fold's rounding depends on the device and dtype, and a cast there and back
+        # leaves the fold of other weights.
+        self.folded = False
+        return super()._apply(fn, recurse)
+
     def update_params(self):
         w1 = self.conv[0].weight.data.clone().detach()
         b1 = self.conv[0].bias.data.clone().detach()
@@ -188,22 +195,29 @@ class Conv3XC(nn.Module):
             sk_w, [H_pixels_to_pad, H_pixels_to_pad, W_pixels_to_pad, W_pixels_to_pad]
         )
 
-        self.eval_conv.weight.data = (weight_concat + sk_w).contiguous()
+        channels_last = self.eval_conv.weight.is_contiguous(
+            memory_format=torch.channels_last
+        )
+        memory_format = torch.channels_last if channels_last else torch.contiguous_format
+        self.eval_conv.weight.data = (weight_concat + sk_w).contiguous(
+            memory_format=memory_format
+        )
         self.eval_conv.bias.data = (bias_concat + sk_b).contiguous()  # type: ignore
 
     def forward(self, x):
         if self.training:
-            self.folded_for = None
+            self.folded = False
             pad = 1
             x_pad = F.pad(x, (pad, pad, pad, pad), "constant", 0)
             out = self.conv(x_pad) + self.sk(x)
         else:
-            weight = self.eval_conv.weight
-            if self.folded_for != (weight.device, weight.dtype):
-                # Normal tensors, for a later call outside inference mode
-                with torch.inference_mode(False):
+            if not self.folded:
+                # In the mode its weights live in: a fold cannot read inference tensors
+                # outside inference mode, and normal weights stay normal tensors for a
+                # later call outside it.
+                with torch.inference_mode(self.eval_conv.weight.is_inference()):
                     self.update_params()
-                self.folded_for = (weight.device, weight.dtype)
+                self.folded = True
             out = self.eval_conv(x)
 
         if self.has_relu:
