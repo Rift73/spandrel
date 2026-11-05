@@ -82,12 +82,8 @@ class DySample(nn.Module):
             .type(x.dtype)
             .to(x.device, non_blocking=True)
         )
-        normalizer = torch.tensor(
-            [W, H],
-            dtype=x.dtype,
-            device=x.device,
-            pin_memory=False,  # pin_memory was originally True
-        ).view(1, 2, 1, 1, 1)
+        # W and H, which a trace (ONNX export) records as the graph's own
+        normalizer = torch._shape_as_tensor(offset)[[4, 3]].to(x).view(1, 2, 1, 1, 1)
         coords = 2 * (coords + offset) / normalizer - 1
 
         coords = (
