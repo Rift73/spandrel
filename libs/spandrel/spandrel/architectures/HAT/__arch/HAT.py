@@ -12,6 +12,17 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
 from ...__arch_helpers.attention import pad_heads, window_attention
+from ...__arch_helpers.inference import (
+    Derived,
+    add_into,
+    border_window_mask,
+    img2windows,
+    padded_rows,
+    shifted_window_attention,
+    shifted_window_mask,
+    traced,
+    windows2img,
+)
 from ...__arch_helpers.padding import pad_to_multiple
 
 
@@ -150,7 +161,7 @@ def window_reverse(windows, window_size, h, w):
     return x
 
 
-class WindowAttention(nn.Module):
+class WindowAttention(Derived):
     r"""Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
 
@@ -205,6 +216,26 @@ class WindowAttention(nn.Module):
         ).contiguous()  # nH, Wh*Ww, Wh*Ww
         return relative_position_bias.unsqueeze(0)
 
+    def cached_bias(self, rpi):
+        """relative_position_bias, computed once: its input is constant, so in inference it
+        changes only with the weights, the device or the type."""
+        return self.keep("bias", lambda: self.relative_position_bias(rpi))
+
+    def image_qkv(self, x):
+        """qkv of x (b, h, w, c), every token at once: (3, b, h, w, c'), its heads padded in
+        the weights without a pass over the output, and each head's own width."""
+        b, h, w, _ = x.shape
+        width = self.qkv.weight.shape[0] // (3 * self.num_heads)
+        padded = width + -width % 8
+        if padded == width or self.training or torch.is_grad_enabled():
+            qkv = pad_heads(self.qkv(x).reshape(b, h, w, 3, self.num_heads, -1))
+        else:
+            weight, bias = self.keep(
+                "qkv", lambda: padded_rows(self.qkv, self.num_heads, width, padded)
+            )
+            qkv = F.linear(x, weight, bias).reshape(b, h, w, 3, self.num_heads, padded)
+        return qkv.reshape(b, h, w, 3, self.num_heads * padded).permute(3, 0, 1, 2, 4), width
+
     def forward(self, x, rpi, mask=None):
         """
         Args:
@@ -240,7 +271,7 @@ class WindowAttention(nn.Module):
         return x
 
 
-class HAB(nn.Module):
+class HAB(Derived):
     r"""Hybrid Attention Block.
 
     Args:
@@ -319,7 +350,53 @@ class HAB(nn.Module):
             drop=drop,
         )
 
+    def conv_branch(self, x):
+        """conv_block on channels-last x."""
+        conv_0, activation, conv_1, channel = self.conv_block.cab
+        _, squeeze, relu, expand, sigmoid = channel.attention
+        x = self.run_conv("cab 1", conv_1, activation(self.run_conv("cab 0", conv_0, x)))
+        y = self.run_conv("attention 0", squeeze, x.mean((2, 3), keepdim=True))
+        y = sigmoid(self.run_conv("attention 1", expand, relu(y)))
+        return x * y if torch.is_grad_enabled() else x.mul_(y)
+
+    def window_branch(self, x, rpi_sa, attn_mask):
+        """The windows' attention on x (b, h, w, c), its projection included. Every token's
+        qkv and projection run on the image, and a pass splits and merges the windows."""
+        b, h, w, _ = x.shape
+        attn, size, shift = self.attn, self.window_size, self.shift_size
+        qkv, width = attn.image_qkv(x)
+        bias = attn.cached_bias(rpi_sa)
+        dropout = attn.attn_drop.p if self.training else 0.0
+        if shift > 0 and h > size and w > size:
+            y = shifted_window_attention(
+                qkv, h, w, size, size, shift, shift, attn.num_heads, bias, attn_mask, attn.scale, dropout, width
+            )
+        else:
+            if shift > 0:
+                qkv = torch.roll(qkv, shifts=(-shift, -shift), dims=(2, 3))
+            q, k, v = img2windows(qkv, size, size, attn.num_heads)
+            y = window_attention(
+                q, k, v, bias, attn_mask if shift > 0 else None, attn.scale, dropout
+            )
+            y = windows2img(y[..., :width], size, size, h, w)
+            if shift > 0:
+                y = torch.roll(y, shifts=(shift, shift), dims=(1, 2))
+        return attn.proj_drop(attn.proj(y))
+
     def forward(self, x, x_size, rpi_sa, attn_mask):
+        if traced():
+            return self.forward_traced(x, x_size, rpi_sa, attn_mask)
+        h, w = x_size
+        b, _, c = x.shape
+        shortcut = x
+        x = self.norm1(x).view(b, h, w, c)
+        conv_x = self.conv_branch(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).flatten(1, 2)
+        attn_x = self.drop_path(self.window_branch(x, rpi_sa, attn_mask)).flatten(1, 2)
+        scaled = conv_x * self.conv_scale if torch.is_grad_enabled() else conv_x.mul_(self.conv_scale)
+        x = add_into(add_into(shortcut, attn_x), scaled)
+        return add_into(x, self.drop_path(self.mlp(self.norm2(x))))
+
+    def forward_traced(self, x, x_size, rpi_sa, attn_mask):
         h, w = x_size
         b, _, c = x.shape
         # assert seq_len == h * w, "input feature has wrong size"
@@ -373,7 +450,7 @@ class HAB(nn.Module):
         return x
 
 
-class OCAB(nn.Module):
+class OCAB(Derived):
     # overlapping cross-attention block
 
     def __init__(
@@ -441,10 +518,13 @@ class OCAB(nn.Module):
 
         # Channels last throughout; heads as wide as qkv makes them (an export may pad
         # them), padded to a multiple of 8 for the fused attention kernels
-        qkv = self.qkv(x).view(b, h, w, 3, heads, -1)
-        width = qkv.shape[-1]
-        qkv = pad_heads(qkv)
-        d = qkv.shape[-1]
+        width = self.qkv.weight.shape[0] // (3 * heads)
+        d = width + -width % 8
+        if d == width or traced() or self.training or torch.is_grad_enabled():
+            qkv = pad_heads(self.qkv(x).view(b, h, w, 3, heads, -1))
+        else:
+            weight, bias = self.keep("qkv", lambda: padded_rows(self.qkv, heads, width, d))
+            qkv = F.linear(x, weight, bias).view(b, h, w, 3, heads, d)
         hd = heads * d
         qkv = qkv.reshape(b, h, w, 3, hd)
         nh, nw = h // ws, w // ws
@@ -480,7 +560,14 @@ class OCAB(nn.Module):
         k, v = kv_windows[0], kv_windows[1]
 
         x = window_attention(
-            q, k, v, self.relative_position_bias(rpi), None, self.scale
+            q,
+            k,
+            v,
+            self.relative_position_bias(rpi)
+            if traced()
+            else self.keep("bias", lambda: self.relative_position_bias(rpi)),
+            None,
+            self.scale,
         )
         if d != width:
             x = x[..., :width]
@@ -492,10 +579,11 @@ class OCAB(nn.Module):
             .reshape(b, h * w, heads * width)
         )
 
-        x = self.proj(x) + shortcut
-
-        x = x + self.mlp(self.norm2(x))
-        return x
+        if traced():
+            x = self.proj(x) + shortcut
+            return x + self.mlp(self.norm2(x))
+        x = add_into(shortcut, self.proj(x))
+        return add_into(x, self.mlp(self.norm2(x)))
 
 
 class AttenBlocks(nn.Module):
@@ -698,14 +786,10 @@ class RHAG(nn.Module):
         )
 
     def forward(self, x, x_size, params):
-        return (
-            self.patch_embed(
-                self.conv(
-                    self.patch_unembed(self.residual_group(x, x_size, params), x_size)
-                )
-            )
-            + x
+        y = self.patch_embed(
+            self.conv(self.patch_unembed(self.residual_group(x, x_size, params), x_size))
         )
+        return y + x if traced() else add_into(x, y)
 
 
 class PatchEmbed(nn.Module):
@@ -743,7 +827,9 @@ class PatchEmbed(nn.Module):
             self.norm = None
 
     def forward(self, x):
-        x = x.flatten(2).transpose(1, 2)  # b Ph*Pw c
+        # b Ph*Pw c; a permute, which runs the convolution before it channels last in place,
+        # in PyTorch and in TensorRT's plan
+        x = x.permute(0, 2, 3, 1).flatten(1, 2)
         if self.norm is not None:
             x = self.norm(x)
         return x
@@ -779,12 +865,10 @@ class PatchUnEmbed(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, x, x_size):
-        x = (
-            x.transpose(1, 2)
-            .contiguous()
-            .view(x.shape[0], self.embed_dim, x_size[0], x_size[1])
-        )  # b Ph*Pw c
-        return x
+        # b Ph*Pw c to channels last, seen as b c Ph Pw
+        return x.reshape(x.shape[0], x_size[0], x_size[1], self.embed_dim).permute(
+            0, 3, 1, 2
+        )
 
 
 class Upsample(nn.Sequential):
@@ -1050,6 +1134,29 @@ class HAT(nn.Module):
         relative_position_index = relative_coords.sum(-1)
         return relative_position_index
 
+    def _apply(self, fn, recurse=True):
+        self.window_masks = {}
+        return super()._apply(fn, recurse)
+
+    def inference_mask(self, x_size, dtype, device):
+        """The shifted blocks' mask for the windows that take one, the same for all of them,
+        kept for the last few sizes."""
+        h, w = x_size
+        key = (h, w, dtype, device)
+        masks = getattr(self, "window_masks", None)
+        if masks is None:
+            masks = self.window_masks = {}
+        mask = masks.get(key)
+        if mask is None:
+            size, shift = self.window_size, self.shift_size
+            make = border_window_mask if h > size and w > size else shifted_window_mask
+            mask = make(h, w, size, size, shift, shift, dtype, device)
+            if not (self.training or torch.is_grad_enabled()):
+                if len(masks) >= 4:
+                    masks.clear()
+                masks[key] = mask
+        return mask
+
     def calculate_mask(self, x_size, dtype):
         # calculate attention mask for SW-MSA
         h, w = x_size
@@ -1089,7 +1196,10 @@ class HAT(nn.Module):
 
         # Calculate attention mask and relative position index in advance to speed up inference.
         # The original code is very time-consuming for large window size.
-        attn_mask = self.calculate_mask(x_size, dtype=x.dtype).to(x.device)
+        if traced():
+            attn_mask = self.calculate_mask(x_size, dtype=x.dtype).to(x.device)
+        else:
+            attn_mask = self.inference_mask(x_size, x.dtype, x.device)
         params = {
             "attn_mask": attn_mask,
             "rpi_sa": self.relative_position_index_SA,
@@ -1114,6 +1224,8 @@ class HAT(nn.Module):
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
         x = self.check_image_size(x)
+        if not traced():
+            x = x.to(memory_format=torch.channels_last)
 
         if self.upsampler == "pixelshuffle":
             # for classical SR
@@ -1124,4 +1236,5 @@ class HAT(nn.Module):
 
         x = x / self.img_range + self.mean
 
-        return x[:, :, : H * self.upscale, : W * self.upscale]
+        x = x[:, :, : H * self.upscale, : W * self.upscale]
+        return x if traced() else x.contiguous()

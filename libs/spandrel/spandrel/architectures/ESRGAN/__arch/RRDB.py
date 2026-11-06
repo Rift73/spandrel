@@ -10,6 +10,7 @@ import torch.nn as nn
 from spandrel.util import store_hyperparameters
 
 from ...__arch_helpers import block as B
+from ...__arch_helpers.inference import traced
 from ...__arch_helpers.padding import pad_to_multiple
 
 
@@ -134,11 +135,17 @@ class RRDBNet(nn.Module):
         )
 
     def forward(self, x):
+        # cuDNN's convolutions take channels last faster and with half the memory, the same
+        # values; ROCm's dense-block kernels and exported graphs keep channels first
+        channels_last = x.is_cuda and torch.version.cuda is not None and not traced()
         if self.shuffle_factor:
             true_scale = self.scale // self.shuffle_factor
             _, _, h, w = x.size()
             x = pad_to_multiple(x, self.shuffle_factor, mode="reflect")
             x = torch.pixel_unshuffle(x, downscale_factor=self.shuffle_factor)
-            x = self.model(x)
-            return x[:, :, : h * true_scale, : w * true_scale]
-        return self.model(x)
+        if channels_last:
+            x = x.to(memory_format=torch.channels_last)
+        x = self.model(x)
+        if self.shuffle_factor:
+            x = x[:, :, : h * true_scale, : w * true_scale]
+        return x.contiguous() if channels_last else x

@@ -18,50 +18,17 @@ from ...__arch_helpers.attention import (
     pad_heads,
     window_attention,
 )
-
-
-def _traced():
-    """Whether this call is being traced: a traced graph keeps channels first and no caches."""
-    return torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()
-
-
-class _Derived(nn.Module):
-    """A module with tensors derived from its weights, kept for inference: moving or casting
-    the model, or loading weights, drops them, and training and tracing never see them."""
-
-    def __init__(self):
-        super().__init__()
-        self.derived = {}
-
-    def _apply(self, fn, recurse=True):
-        self.derived.clear()
-        return super()._apply(fn, recurse)
-
-    def _load_from_state_dict(self, *args, **kwargs):
-        self.derived.clear()
-        super()._load_from_state_dict(*args, **kwargs)
-
-    def keep(self, key, compute):
-        if self.training or torch.is_grad_enabled():
-            return compute()
-        kept = self.derived.get(key)
-        if kept is None:
-            kept = self.derived[key] = compute()
-        return kept
-
-    def run_conv(self, key, conv, x, norm=None):
-        """conv on channels-last x, then its batch norm, folded into it in inference, with
-        the weight in x's layout, which cuDNN would otherwise copy for every call."""
-        if self.training or torch.is_grad_enabled():
-            x = conv(x)
-            return x if norm is None else norm(x)
-        weight, bias = self.keep(key, lambda: _channels_last_conv(conv, norm))
-        return F.conv2d(x, weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
-
-
-def _sum(x, y):
-    """x + y in y's memory, y being a result nothing else reads; of two types, the wider's."""
-    return y.add_(x) if x.dtype == y.dtype and not torch.is_grad_enabled() else x + y
+from ...__arch_helpers.inference import Derived as _Derived
+from ...__arch_helpers.inference import add_into as _sum
+from ...__arch_helpers.inference import (
+    border_window_mask,
+    img2windows,
+    shifted_window_attention,
+    shifted_window_mask,
+    windows2img,
+)
+from ...__arch_helpers.inference import padded_rows as _padded_rows
+from ...__arch_helpers.inference import traced as _traced
 
 
 def _unit_length(x):
@@ -72,106 +39,6 @@ def _unit_length(x):
     length = torch.linalg.vector_norm(x, dim=2, keepdim=True, dtype=torch.float32)
     # FP16's smallest normal number: a head this small is all zeros in FP16 anyway
     return x / length.clamp_min(2.0**-14).half()
-
-
-def _padded_rows(linear, heads, width, padded):
-    """linear's weight and bias with zero rows after each head's width: its output heads are
-    padded with exact zeros, without a pass over the output."""
-
-    def pad(rows):
-        shape = (3, heads, width, *rows.shape[1:])
-        extra = (0, 0) * (rows.dim() - 1) + (0, padded - width)
-        return F.pad(rows.reshape(shape), extra).reshape(-1, *rows.shape[1:])
-
-    return pad(linear.weight), None if linear.bias is None else pad(linear.bias)
-
-
-def _channels_last_conv(conv, norm):
-    weight, bias = conv.weight, conv.bias
-    if norm is not None:
-        dtype = weight.dtype
-        # at least FP32, as batch norm computes
-        wide = torch.promote_types(dtype, torch.float32)
-        scale = norm.weight.to(wide) / (norm.running_var.to(wide) + norm.eps).sqrt()
-        offset = norm.bias.to(wide) - norm.running_mean.to(wide) * scale
-        bias = offset if bias is None else bias.to(wide) * scale + offset
-        weight = (weight.to(wide) * scale.view(-1, 1, 1, 1)).to(dtype)
-        bias = bias.to(dtype)
-    return weight.to(memory_format=torch.channels_last), bias
-
-
-def img2windows(img, H_sp, W_sp, num_heads):
-    """
-    Input: Images (S, B, H, W, C), channels last
-    Output: Window Partition (S, B', num_heads, N, C // num_heads)
-    """
-    S, B, H, W, C = img.shape
-    img_reshape = img.reshape(
-        S, B, H // H_sp, H_sp, W // W_sp, W_sp, num_heads, C // num_heads
-    )
-    img_perm = img_reshape.permute(0, 1, 2, 4, 6, 3, 5, 7).reshape(
-        S, -1, num_heads, H_sp * W_sp, C // num_heads
-    )
-    return img_perm
-
-
-def windows2img(img_splits_hw, H_sp, W_sp, H, W):
-    """
-    Input: Window Partition (B', num_heads, N, C // num_heads)
-    Output: Image (B, H, W, C)
-    """
-    _, num_heads, _, head_dim = img_splits_hw.shape
-    img = img_splits_hw.view(-1, H // H_sp, W // W_sp, num_heads, H_sp, W_sp, head_dim)
-    img = img.permute(0, 1, 4, 2, 5, 3, 6).reshape(-1, H, W, num_heads * head_dim)
-    return img
-
-
-def shifted_window_mask(H, W, split_h, split_w, shift_h, shift_w, dtype, device):
-    """Swin's attention mask for shifted windows (nW, N, N): 0 between tokens of the same
-    region, -100 across. Each axis has three regions, split at -split and -shift; the
-    regions come from index comparisons, so an exported graph needs no scatter and the
-    mask is built on the model's device."""
-
-    def regions(n, split, shift):
-        index = torch.arange(n, device=device)
-        past_split = (index >= n - split).to(torch.int32)
-        return past_split + (index >= n - shift).to(torch.int32)
-
-    img_mask = regions(H, split_h, shift_h)[:, None] * 3 + regions(W, split_w, shift_w)
-    mask_windows = (
-        img_mask.view(H // split_h, split_h, W // split_w, split_w)
-        .permute(0, 2, 1, 3)
-        .reshape(-1, split_h * split_w)
-    )
-    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-    return torch.zeros(attn_mask.shape, dtype=dtype, device=device).masked_fill(
-        attn_mask != 0, -100.0
-    )
-
-
-def border_window_mask(H, W, split_h, split_w, shift_h, shift_w, dtype, device):
-    """shifted_window_mask for the only windows it marks, those that wrap around: the right
-    column above the last row, then the last row. The others are plain windows."""
-
-    def regions(n, split, shift):
-        index = torch.arange(n, device=device)
-        past_split = (index >= n - split).to(torch.int32)
-        return past_split + (index >= n - shift).to(torch.int32)
-
-    img_mask = regions(H, split_h, shift_h)[:, None] * 3 + regions(W, split_w, shift_w)
-    inner_h, inner_w = H - split_h, W - split_w
-    right = img_mask[:inner_h, inner_w:].view(inner_h // split_h, split_h, 1, split_w)
-    bottom = img_mask[inner_h:].view(1, split_h, W // split_w, split_w)
-    mask_windows = torch.cat(
-        [
-            right.permute(0, 2, 1, 3).reshape(-1, split_h * split_w),
-            bottom.permute(0, 2, 1, 3).reshape(-1, split_h * split_w),
-        ]
-    )
-    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-    return torch.zeros(attn_mask.shape, dtype=dtype, device=device).masked_fill(
-        attn_mask != 0, -100.0
-    )
 
 
 class SpatialGate(_Derived):
@@ -405,57 +272,21 @@ class Spatial_Attention(_Derived):
         return x
 
     def forward_shifted(self, qkv, H, W, shift_h, shift_w, border_mask):
-        """The shifted windows of qkv (3, B, H, W, C), not rolled: the same result as rolling
-        by (-shift_h, -shift_w), forward with the full mask and rolling back. A window that
-        does not wrap around is a plain window at an offset, its mask all zero, so only the
-        right column and last row of windows take the mask and the wrapped tokens."""
-        S, B, _, _, C = qkv.shape
-        H_sp, W_sp = self.H_sp, self.W_sp
-        inner_h, inner_w = H - H_sp, W - W_sp
-        rows = (torch.arange(H, device=qkv.device) + shift_h) % H
-        cols = (torch.arange(W, device=qkv.device) + shift_w) % W
-        rows_inner, rows_last = rows[:inner_h, None], rows[inner_h:, None]
-        cols_last = cols[inner_w:]
-        bias = self.cached_bias() if self.position_bias else None
-        dropout = self.attn_drop.p if self.training else 0.0
-
-        windows = img2windows(
-            qkv[:, :, shift_h : shift_h + inner_h, shift_w : shift_w + inner_w],
-            H_sp,
-            W_sp,
+        """shifted_window_attention on these windows."""
+        return shifted_window_attention(
+            qkv,
+            H,
+            W,
+            self.H_sp,
+            self.W_sp,
+            shift_h,
+            shift_w,
             self.num_heads,
+            self.cached_bias() if self.position_bias else None,
+            border_mask,
+            self.scale,
+            self.attn_drop.p if self.training else 0.0,
         )
-        inner = windows2img(
-            window_attention(
-                windows[0], windows[1], windows[2], bias, None, self.scale, dropout
-            ),
-            H_sp,
-            W_sp,
-            inner_h,
-            inner_w,
-        )
-        # B, the right column's windows, then the last row's, for the mask's order
-        right = img2windows(qkv[:, :, rows_inner, cols_last], H_sp, W_sp, self.num_heads)
-        bottom = img2windows(qkv[:, :, rows_last, cols], H_sp, W_sp, self.num_heads)
-        n_right = right.shape[1] // B
-        windows = torch.cat(
-            [right.view(S, B, n_right, *right.shape[2:]), bottom.view(S, B, -1, *bottom.shape[2:])],
-            dim=2,
-        ).flatten(1, 2)
-        border = window_attention(
-            windows[0], windows[1], windows[2], bias, border_mask, self.scale, dropout
-        )
-        border = border.view(B, -1, *border.shape[1:])
-
-        x = qkv.new_empty((B, H, W, inner.shape[-1]))
-        x[:, shift_h : shift_h + inner_h, shift_w : shift_w + inner_w] = inner
-        x[:, rows_inner, cols_last] = windows2img(
-            border[:, :n_right].flatten(0, 1), H_sp, W_sp, inner_h, W_sp
-        )
-        x[:, rows_last, cols] = windows2img(
-            border[:, n_right:].flatten(0, 1), H_sp, W_sp, H_sp, W
-        )
-        return x
 
 
 def _dwconv(attention, x):

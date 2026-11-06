@@ -1202,6 +1202,68 @@ class RegionalChannelAttention(nn.Module):
             )
             return o * wy * wx
 
+    def _mix_from_cells(
+        self, q: Tensor, k: Tensor, v: Tensor, h: int, w: int
+    ) -> Tensor:
+        """mix's four classes from one product per 16x16 cell (spandrel): every class's
+        windows are 2x2 blocks of the same cells, so a window's product and lengths are
+        the sums of its cells', and q and k need one pass and a quarter of the products."""
+        b, c, height, width = q.shape
+        d = c // self.heads
+        rows, cols = height // 16, width // 16
+
+        def cells(t: Tensor) -> Tensor:
+            return (
+                t.reshape(b, self.heads, d, rows, 16, cols, 16)
+                .permute(0, 3, 5, 1, 2, 4, 6)
+                .reshape(b, rows, cols, self.heads, d, 256)
+            )
+
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            q_cells, k_cells = cells(q), cells(k)
+            gram = q_cells @ k_cells.transpose(-2, -1)
+            q_lengths = q_cells.square().sum(-1)
+            k_lengths = k_cells.square().sum(-1)
+            tau = self.theta.to(q.dtype).clamp(max=math.log(100)).exp()
+        result = None
+        for sy, sx in ((0, 0), (0, 16), (16, 0), (16, 16)):
+            first_row, first_col = (16 - sy) // 16, (16 - sx) // 16
+            ph, pw = h + sy + (-(h + sy) % 32), w + sx + (-(w + sx) % 32)
+            ny, nx = ph // 32, pw // 32
+
+            def block(t: Tensor) -> Tensor:
+                return (
+                    t[:, first_row : first_row + 2 * ny, first_col : first_col + 2 * nx]
+                    .reshape(b, ny, 2, nx, 2, *t.shape[3:])
+                    .sum((2, 4))
+                    .reshape(b, ny * nx, *t.shape[3:])
+                )
+
+            count, wy, wx = _inference_regional_geometry(
+                h, w, sy, sx, q.device, q.dtype
+            )
+            with torch.autocast(device_type=v.device.type, enabled=False):
+                q_norm = (block(q_lengths) + count * 1e-6).sqrt()
+                k_norm = (block(k_lengths) + count * 1e-6).sqrt()
+                cosine = block(gram) / (q_norm[..., :, None] * k_norm[..., None, :])
+                a = (cosine * tau[:, None, None]).softmax(-1)
+                windows = (
+                    v[:, :, 16 - sy : 16 - sy + ph, 16 - sx : 16 - sx + pw]
+                    .reshape(b, self.heads, d, ny, 32, nx, 32)
+                    .permute(0, 3, 5, 1, 2, 4, 6)
+                    .reshape(b, ny * nx, self.heads, d, 1024)
+                )
+                o = (
+                    (a.to(v.dtype) @ windows)
+                    .reshape(b, ny, nx, self.heads, d, 32, 32)
+                    .permute(0, 3, 4, 1, 5, 2, 6)
+                    .reshape(b, c, ph, pw)[:, :, sy : sy + h, sx : sx + w]
+                    .to(a.dtype)
+                )
+            out = o * wy * wx
+            result = out if result is None else result + out
+        return result
+
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """Blend four class outputs without an H*W*d*d matrix field."""
         check = self.core_checkpoint and self.training and torch.is_grad_enabled()
@@ -1211,6 +1273,8 @@ class RegionalChannelAttention(nn.Module):
         dtype = calculation_dtype(q.dtype)
         pad = (16, max(-w % 32, -(w + 16) % 32), 16, max(-h % 32, -(h + 16) % 32))
         q, k, v = F.pad(q.to(dtype), pad), F.pad(k.to(dtype), pad), F.pad(v, pad)
+        if _eager_inference(self):
+            return self._mix_from_cells(q, k, v, h, w)
         result = None
         for sy, sx in ((0, 0), (0, 16), (16, 0), (16, 16)):
             out = (

@@ -227,7 +227,9 @@ def test_regional_mix_matches_per_class_padding(shape, grad):
             + _regional_class(rca, q, k, v, 16, 0)
             + _regional_class(rca, q, k, v, 16, 16)
         )
-    torch.testing.assert_close(actual.detach(), expected, rtol=0, atol=0)
+    # inference sums the windows' products from their cells, which rounds its own way
+    atol = 0 if grad else 1e-5
+    torch.testing.assert_close(actual.detach(), expected, rtol=0, atol=atol)
 
 
 # A convolution's rounding depends on the layout of its input; layers run channels-last
