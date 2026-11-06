@@ -10,8 +10,8 @@ from ...__helpers.model_descriptor import (
     SizeRequirements,
     StateDict,
 )
-from ..__arch_helpers.fp32_last_group import FP32LayerNorm, keep_last_group_in_fp32
-from .__arch.HAT import HAT
+from ..__arch_helpers.fp32_last_group import FP32LayerNorm, keep_last_groups_in_fp32
+from .__arch.HAT import HAB, HAT, OCAB
 
 
 def _get_overlap_ratio(window_size: int, with_overlap: int) -> float:
@@ -226,9 +226,10 @@ class HATArch(Architecture[HAT]):
             output_channels=in_chans,
             size_requirements=SizeRequirements(minimum=16),
         )
-        # FP16: the last group's closing convolution writes far beyond 65504 in
-        # trained models; it, the group's residual sum and the final norm run in FP32
-        model.layers[-1].conv = keep_last_group_in_fp32(model.layers[-1].conv)
+        # FP16: trained models write far beyond 65504 in their last two groups; the
+        # closing convolutions, the last group's sums and norms and the final norm run
+        # in FP32
+        keep_last_groups_in_fp32(model.layers, (HAB, OCAB))
         model.norm = FP32LayerNorm(model.norm)
         return descriptor
 

@@ -10,8 +10,8 @@ from ...__helpers.model_descriptor import (
     SizeRequirements,
     StateDict,
 )
-from ..__arch_helpers.fp32_last_group import FP32LayerNorm, keep_last_group_in_fp32
-from .__arch.DAT import DAT
+from ..__arch_helpers.fp32_last_group import FP32LayerNorm, keep_last_groups_in_fp32
+from .__arch.DAT import DAT, DATB
 
 
 class DATArch(Architecture[DAT]):
@@ -178,9 +178,10 @@ class DATArch(Architecture[DAT]):
             output_channels=in_chans,
             size_requirements=SizeRequirements(minimum=16),
         )
-        # FP16: the last group's closing convolution writes far beyond 65504 in
-        # trained models; it, the group's residual sum and the final norm run in FP32
-        model.layers[-1].conv = keep_last_group_in_fp32(model.layers[-1].conv)
+        # FP16: trained models write far beyond 65504 in their last two groups; the
+        # closing convolutions, the last group's sums and norms and the final norm run
+        # in FP32
+        keep_last_groups_in_fp32(model.layers, (DATB,))
         model.norm = FP32LayerNorm(model.norm)
         return descriptor
 
