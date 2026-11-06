@@ -63,6 +63,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from functools import partial
+from importlib.util import find_spec
 from typing import Literal, Optional, Sequence, Tuple
 
 import torch
@@ -77,11 +78,8 @@ from einops import rearrange
 
 # Flex Attention — requires Triton (Linux). Only needed for attn_type='Flex'.
 try:
-    from torch.nn.attention.flex_attention import flex_attention
-
-    _FLEX_AVAILABLE = True
-except ImportError:
-    flex_attention = None
+    _FLEX_AVAILABLE = find_spec("torch.nn.attention.flex_attention") is not None
+except ImportError:  # a PyTorch without torch.nn.attention
     _FLEX_AVAILABLE = False
 
 # Backend-selection context manager for SDPA. Present on recent PyTorch.
@@ -1191,6 +1189,8 @@ class SST(ImageArchitecture):
                     "attn_type='Flex' requires torch.nn.attention.flex_attention "
                     "(Triton, Linux). It is unavailable in this environment."
                 )
+            from torch.nn.attention.flex_attention import flex_attention
+
             attn_func = torch.compile(flex_attention, dynamic=True)
         else:
             attn_func = None

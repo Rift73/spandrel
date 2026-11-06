@@ -31,9 +31,10 @@ import hashlib
 import math
 from collections import OrderedDict
 from collections.abc import Sequence
-from functools import partial
+from functools import cache, partial
+from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 from weakref import WeakValueDictionary
 
 import torch
@@ -44,6 +45,9 @@ from torch.utils.checkpoint import (
     checkpoint,
     create_selective_checkpoint_contexts,
 )
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 _NATIVE_FLEX_HOP = getattr(torch.ops.higher_order, "flex_attention", None)
 
@@ -200,15 +204,12 @@ except ImportError:
     _OCAB_FUSED_ATTENTION_AVAILABLE = False
 
 # Flex Attention (hybrid mode only — requires Triton, Linux)
+# Imported on first use (_compiled_flex_attention, create_block_mask's callers): the
+# module loads torch.fx's symbolic shapes (SymPy), and torch.compile Dynamo and Inductor,
+# about 3 s on every import of spandrel for a route only hybrid models take.
 try:
-    from torch.nn.attention.flex_attention import (
-        BlockMask,
-        create_block_mask,
-        flex_attention,
-    )
-
-    _FLEX_AVAILABLE = True
-except ImportError:
+    _FLEX_AVAILABLE = find_spec("torch.nn.attention.flex_attention") is not None
+except ImportError:  # a PyTorch without torch.nn.attention
     _FLEX_AVAILABLE = False
 
 try:
@@ -376,8 +377,11 @@ def _make_bias_score_mod(bias_flat: torch.Tensor, seq_len: int):
 # pre-fusion training arrangement: outer DRFT compilation may graph-break at
 # this reusable kernel instead of absorbing every shifted-boundary call into a
 # single monolithic graph.
-if _FLEX_AVAILABLE:
-    _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
+@cache
+def _compiled_flex_attention():
+    from torch.nn.attention.flex_attention import flex_attention
+
+    return torch.compile(flex_attention, dynamic=True)
 
 
 # OCAB instances own their immutable index buffers. Sharing must not keep a
@@ -1839,7 +1843,7 @@ class WindowAttentionRFB(nn.Module):
                 -1,
             )
             score_mod = _make_bias_score_mod(bias_flat, self._ws_sq)
-            out = _compiled_flex_attention(
+            out = _compiled_flex_attention()(
                 q,
                 k,
                 v,
@@ -4276,6 +4280,8 @@ class DRFT(nn.Module):
                     boundary_region_ids[win_idx, q_idx]
                     == boundary_region_ids[win_idx, kv_idx]
                 )
+
+            from torch.nn.attention.flex_attention import create_block_mask
 
             with torch.inference_mode(False):
                 self._block_mask_cache[mask_key] = create_block_mask(

@@ -65,23 +65,25 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import Literal, Optional
+from functools import cache
+from importlib.util import find_spec
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-# Flex Attention (hybrid mode only — requires Triton, Linux)
-try:
-    from torch.nn.attention.flex_attention import (
-        BlockMask,
-        create_block_mask,
-        flex_attention,
-    )
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
-    _FLEX_AVAILABLE = True
-except ImportError:
+# Flex Attention (hybrid mode only — requires Triton, Linux)
+# Imported on first use (_compiled_flex_attention, create_block_mask's callers): the
+# module loads torch.fx's symbolic shapes (SymPy), and torch.compile Dynamo and Inductor,
+# about 3 s on every import of spandrel for a route only hybrid models take.
+try:
+    _FLEX_AVAILABLE = find_spec("torch.nn.attention.flex_attention") is not None
+except ImportError:  # a PyTorch without torch.nn.attention
     _FLEX_AVAILABLE = False
 
 try:
@@ -200,8 +202,11 @@ def _make_bias_score_mod(bias_flat: torch.Tensor, seq_len: int):
 # Single compiled flex_attention handle shared by all WindowAttentionRFB instances.
 # Dynamo's code cache means all call sites reuse the same Triton kernel after the
 # first compilation, so per-instance compilation is redundant overhead.
-if _FLEX_AVAILABLE:
-    _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
+@cache
+def _compiled_flex_attention():
+    from torch.nn.attention.flex_attention import flex_attention
+
+    return torch.compile(flex_attention, dynamic=True)
 
 
 _SHARED_OCAB_INDEX_CACHE: dict[tuple[int, int, int, int, str, int], torch.Tensor] = {}
@@ -1246,7 +1251,7 @@ class WindowAttentionRFB(nn.Module):
                 -1,
             )
             score_mod = _make_bias_score_mod(bias_flat, self._ws_sq)
-            out = _compiled_flex_attention(
+            out = _compiled_flex_attention()(
                 q,
                 k,
                 v,
@@ -2547,6 +2552,8 @@ class DRFT(nn.Module):
                     boundary_region_ids[win_idx, q_idx]
                     == boundary_region_ids[win_idx, kv_idx]
                 )
+
+            from torch.nn.attention.flex_attention import create_block_mask
 
             self._block_mask_cache[mask_key] = create_block_mask(
                 mask_mod,
