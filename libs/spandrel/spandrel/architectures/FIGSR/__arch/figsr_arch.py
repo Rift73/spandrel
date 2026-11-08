@@ -152,6 +152,20 @@ class CustomIrfft2Wrap(nn.Module):
             return CustomIRFFT2.apply(x)
 
 
+def _norm_of_fp32(norm: RMSNorm, x: Tensor, dtype: torch.dtype) -> Tensor:
+    """norm(x.to(dtype)) for an FP32 x; in FP16, with the division in FP32. A Fourier
+    unit's spectrum and its inverse feed its norms: the spectrum's zero frequency grows with
+    the square root of the image's area, so the cast to FP16 turned it into infinity on a
+    1200x864 image and the norm's division into NaN."""
+    if dtype != torch.float16:
+        return norm(x.to(dtype))
+    # FP32: the FP16 eps and rms promote within the operation
+    length = torch.addcmul(norm.eps, x.norm(2, dim=1, keepdim=True), norm.rms)
+    return torch.addcmul(
+        norm.offset[:, None, None], x.div(length).half(), norm.scale[:, None, None]
+    )
+
+
 class FourierUnit(nn.Module):
     def __init__(self, in_channels: int = 48, out_channels: int = 48) -> None:
         super().__init__()
@@ -183,14 +197,14 @@ class FourierUnit(nn.Module):
         b, c, h, w = x.shape
         ffted = self.rfft2(x)
         ffted = ffted.permute(0, 4, 1, 2, 3).contiguous()
-        ffted = ffted.view(b, c * 2, h, -1).to(orig_dtype)
-        ffted = self.rn(ffted)
+        ffted = ffted.view(b, c * 2, h, -1)
+        ffted = _norm_of_fp32(self.rn, ffted, orig_dtype)
         ffted = self.fpe(ffted) + ffted
         ffted = self.fdc(ffted)
         ffted = self.gelu(ffted)
         ffted = ffted.view(b, c, 2, h, -1).permute(0, 1, 3, 4, 2).contiguous().float()
         out = self.irfft2(ffted)
-        out = self.post_norm(out.to(orig_dtype))
+        out = _norm_of_fp32(self.post_norm, out, orig_dtype)
         return out
 
 
