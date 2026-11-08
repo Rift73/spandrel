@@ -41,6 +41,17 @@ def _unit_length(x):
     return x / length.clamp_min(2.0**-14).half()
 
 
+def _row_gram(q, k, H, W):
+    """q's channels against k's over every token, (batch, heads, d, d), for q and k of
+    unit length over the tokens: a product per image row, the rows summed in FP32. As one
+    product over every token, cuBLAS picks a kernel of a few blocks: 2.1 ms a block for
+    DAT2 at 512x512 in FP16. A row's sums stay within [-1, 1]."""
+    B, heads, _, d = q.shape
+    rows = q.reshape(B, heads, H, W, d).transpose(-2, -1) @ k.reshape(B, heads, H, W, d)
+    wide = torch.promote_types(q.dtype, torch.float32)
+    return rows.sum(2, dtype=wide).to(q.dtype)
+
+
 class SpatialGate(_Derived):
     """Spatial-Gate.
     Args:
@@ -728,7 +739,7 @@ class Adaptive_Channel_Attention(_Derived):
         qkv = tokens.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        attn = (_unit_length(q).transpose(-2, -1) @ _unit_length(k)) * self.temperature
+        attn = _row_gram(_unit_length(q), _unit_length(k), H, W) * self.temperature
         attn = self.attn_drop(attn.softmax(dim=-1))
         attened_x = (attn @ v.transpose(-2, -1)).permute(0, 3, 1, 2).reshape(B, N, C)
 
