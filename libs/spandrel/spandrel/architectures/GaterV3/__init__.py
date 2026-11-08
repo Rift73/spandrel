@@ -140,4 +140,6 @@ class GaterV3Arch(Architecture[GateRV3]):
         )
 
 
-__all__ = ["GaterV3Arch", "GateRV3"]
+GaterV3 = GateRV3
+
+__all__ = ["GaterV3Arch", "GateRV3", "GaterV3"]
