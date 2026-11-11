@@ -1,6 +1,6 @@
 # Spandrel
 
-> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with eight more architectures: DRFT, DUAL, SST (with SST-Real), WSR, GaterV3, SMoSR, FIGSR and GFISRv2. On ROCm builds of PyTorch (Windows and Linux) it runs depthwise 3x3 convolutions and ESRGAN's dense blocks on HIP kernels adapted from [florentia-mysteria/spandrel-rocm](https://github.com/florentia-mysteria/spandrel-rocm) (MIT); see `spandrel.rocm`. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
+> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with nine more architectures: DRFT, DUAL, RDUAL, SST (with SST-Real), WSR, GaterV3, SMoSR, FIGSR and GFISRv2. On ROCm builds of PyTorch (Windows and Linux) it runs depthwise 3x3 convolutions and ESRGAN's dense blocks on HIP kernels adapted from [florentia-mysteria/spandrel-rocm](https://github.com/florentia-mysteria/spandrel-rocm) (MIT); see `spandrel.rocm`. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
 
 [![PyPI package](https://img.shields.io/badge/pip%20install-spandrel-brightgreen)](https://pypi.org/project/spandrel/)
 [![version number](https://img.shields.io/pypi/v/spandrel?color=green&label=version)](https://github.com/chaiNNer-org/spandrel/releases)
@@ -115,6 +115,7 @@ Spandrel currently supports a limited amount of network architectures. If the ar
 - [FDAT](https://github.com/stinkybread/FDAT) | [Models](https://github.com/the-database/traiNNer-redux/releases/download/pretrained-models/2x_DF2K_FDAT_M_500k_fp16.safetensors)
 - [AuraSR](https://github.com/fal-ai/aura-sr) | Models: [v1](https://huggingface.co/fal/AuraSR) | [v2](https://huggingface.co/fal/AuraSR-v2)
 - DRFT, DUAL and WSR (this fork)
+- RDUAL (this fork): a video model, DUAL Light with a temporal stage guided by a bundled [NeuFlow v2](https://github.com/neufieldrobotics/NeuFlow_v2) (Apache-2.0); `spandrel.architectures.RDUAL.run_clip` upscales a clip, and a single image is a clip of one frame
 - [SST](https://github.com/dslisleedh/SST) and SST-Real | [Models](https://github.com/dslisleedh/SST/tree/main/pretrained_models)
 - [FIGSR](https://github.com/enhancr/figsr)
 - [GFISRv2](https://github.com/umzi2/gfisrv2)

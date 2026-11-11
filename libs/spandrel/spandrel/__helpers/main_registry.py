@@ -19,6 +19,7 @@ from ..architectures import (
     IPT,
     PLKSR,
     RCAN,
+    RDUAL,
     RGT,
     SAFMN,
     SAFMNBCIE,
@@ -107,6 +108,8 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(FDAT.FDATArch()),
     ArchSupport.from_architecture(AuraSR.AuraSRArch()),
     ArchSupport.from_architecture(DRFT.DRFTArch()),
+    # Before DUAL: an RDUAL file holds all of a DUAL Light's weights as well.
+    ArchSupport.from_architecture(RDUAL.RDUALArch()),
     ArchSupport.from_architecture(DUAL.DUALArch()),
     ArchSupport.from_architecture(SST.SSTArch()),
     ArchSupport.from_architecture(SST.SSTRealArch()),

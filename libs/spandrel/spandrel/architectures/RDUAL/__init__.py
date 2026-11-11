@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+import torch
+from typing_extensions import override
+
+from spandrel.util import KeyCondition
+
+from ...__helpers.model_descriptor import (
+    Architecture,
+    ImageModelDescriptor,
+    SizeRequirements,
+    StateDict,
+)
+
+if TYPE_CHECKING:
+    from .__arch.rdual_arch import RDUAL
+
+logger = logging.getLogger("spandrel.rdual")
+
+
+def __getattr__(name: str) -> object:
+    # The architecture's module imports Triton and Flex attention and registers its
+    # kernels: it loads with the first RDUAL model, not with every import of spandrel.
+    if name == "RDUAL":
+        from .__arch.rdual_arch import RDUAL
+
+        return RDUAL
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _from_triton(error: BaseException) -> bool:
+    """Whether the error, or one it was raised from, comes from Triton itself."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__module__.partition(".")[0] == "triton":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _forward(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
+    cuda = frames.device.type == "cuda"
+    with torch.autocast("cuda", torch.bfloat16, enabled=cuda):
+        return model(frames.float()).float()
+
+
+def run_clip(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
+    """B,T,3,H,W frames in 0..1 to B,T,3,sH,sW in FP32.
+
+    On CUDA the trunk runs under BF16 autocast; the bundled flow switches autocast
+    off for itself. When the temporal stage's Triton kernels fail to compile (a
+    Triton too old for this Python, for example), the model switches to its PyTorch
+    temporal path for good and runs the clip again."""
+    try:
+        return _forward(model, frames)
+    except Exception as error:
+        if model.temporal.backend != "auto" or not _from_triton(error):
+            raise
+        logger.warning(
+            "RDUAL's Triton temporal kernels failed (%s: %s); using its PyTorch path",
+            type(error).__name__,
+            error,
+        )
+        model.temporal.backend = "reference"
+        return _forward(model, frames)
+
+
+def _call(model: RDUAL, image: torch.Tensor) -> torch.Tensor:
+    """One image is a clip of one frame: no neighbors, so no temporal reading."""
+    return run_clip(model, image[:, None])[:, 0]
+
+
+class RDUALArch(Architecture["RDUAL"]):
+    def __init__(self) -> None:
+        super().__init__(
+            id="RDUAL",
+            detect=KeyCondition.has_all(
+                "flow_loaded",
+                "temporal.query.weight",
+                "temporal.output.weight",
+                "groups.0.conv.experts",
+            ),
+        )
+
+    @override
+    def load(self, state_dict: StateDict) -> ImageModelDescriptor[RDUAL]:
+        from .__arch.rdual_arch import RDUAL
+
+        # The scale is only in the shapes of the reconstruction tail.
+        experts = int(state_dict["groups.0.conv.experts"].shape[0])
+        for scale in (2, 4, 1):
+            model = RDUAL(scale=scale, use_checkpoint=False, dynamic_experts=experts)
+            reference = model.state_dict()
+            if reference.keys() == state_dict.keys() and all(
+                reference[key].shape == state_dict[key].shape for key in reference
+            ):
+                break
+        else:
+            raise ValueError("RDUAL: the weights match no scale of 1, 2 or 4")
+        if not bool(state_dict["flow_loaded"]):
+            raise ValueError("RDUAL: these weights hold no optical flow weights")
+
+        descriptor = ImageModelDescriptor(
+            model,
+            state_dict,
+            architecture=self,
+            purpose="Restoration" if scale == 1 else "SR",
+            tags=["Light", f"{experts} experts", "PU2", "temporal"],
+            supports_half=False,
+            supports_bfloat16=False,
+            scale=scale,
+            input_channels=3,
+            output_channels=3,
+            size_requirements=SizeRequirements(minimum=16),
+            call_fn=_call,
+        )
+        # Fold the reparameterized convolutions once for inference, after the strict
+        # load above, in FP32 on the CPU before the loader moves the model.
+        model.float().eval()
+        model.prepare_for_export()
+        return descriptor
+
+
+__all__ = ["RDUALArch", "RDUAL", "run_clip"]
