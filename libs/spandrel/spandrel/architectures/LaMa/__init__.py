@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from typing_extensions import override
 
 from spandrel.util import KeyCondition, get_seq_len
@@ -8,10 +12,22 @@ from ...__helpers.model_descriptor import (
     SizeRequirements,
     StateDict,
 )
-from .__arch.LaMa import LaMa
+
+if TYPE_CHECKING:
+    from .__arch.LaMa import LaMa
 
 
-class LaMaArch(Architecture[LaMa]):
+def __getattr__(name: str) -> object:
+    # The architecture's module imports torchvision, which loads Dynamo and SymPy: it
+    # loads with the first LaMa model, not with every import of spandrel.
+    if name == "LaMa":
+        from .__arch.LaMa import LaMa
+
+        return LaMa
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+class LaMaArch(Architecture["LaMa"]):
     def __init__(self) -> None:
         super().__init__(
             id="LaMa",
@@ -23,6 +39,8 @@ class LaMaArch(Architecture[LaMa]):
 
     @override
     def load(self, state_dict: StateDict) -> MaskedImageModelDescriptor[LaMa]:
+        from .__arch.LaMa import LaMa
+
         state_dict = {
             k.replace("generator.model", "model.model"): v
             for k, v in state_dict.items()

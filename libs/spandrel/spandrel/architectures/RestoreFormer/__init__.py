@@ -1,5 +1,4 @@
 import torch
-from torchvision.transforms.functional import normalize as tv_normalize
 from typing_extensions import override
 
 from spandrel.util import KeyCondition, get_seq_len
@@ -81,6 +80,9 @@ class RestoreFormerArch(Architecture[RestoreFormer]):
             enable_mid=enable_mid,
             head_size=head_size,
         )
+
+        # torchvision loads Dynamo and SymPy: imported with the first RestoreFormer model.
+        from torchvision.transforms.functional import normalize as tv_normalize
 
         def call(model: RestoreFormer, x: torch.Tensor) -> torch.Tensor:
             x = tv_normalize(x, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
