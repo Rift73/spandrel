@@ -1,6 +1,6 @@
 # Spandrel
 
-> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with nine more architectures: DRFT, DUAL, RDUAL, SST (with SST-Real), WSR, GaterV3, SMoSR, FIGSR and GFISRv2. On ROCm builds of PyTorch (Windows and Linux) it runs depthwise 3x3 convolutions and ESRGAN's dense blocks on HIP kernels adapted from [florentia-mysteria/spandrel-rocm](https://github.com/florentia-mysteria/spandrel-rocm) (MIT); see `spandrel.rocm`. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
+> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with ten more architectures: DRFT, DUAL, RDUAL, SST (with SST-Real), WSR, GaterV3, SMoSR, FIGSR, GFISRv2 and HEART. On ROCm builds of PyTorch (Windows and Linux) it runs depthwise 3x3 convolutions and ESRGAN's dense blocks on HIP kernels adapted from [florentia-mysteria/spandrel-rocm](https://github.com/florentia-mysteria/spandrel-rocm) (MIT); see `spandrel.rocm`. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
 
 [![PyPI package](https://img.shields.io/badge/pip%20install-spandrel-brightgreen)](https://pypi.org/project/spandrel/)
 [![version number](https://img.shields.io/pypi/v/spandrel?color=green&label=version)](https://github.com/chaiNNer-org/spandrel/releases)
@@ -119,6 +119,7 @@ Spandrel currently supports a limited amount of network architectures. If the ar
 - [SST](https://github.com/dslisleedh/SST) and SST-Real | [Models](https://github.com/dslisleedh/SST/tree/main/pretrained_models)
 - [FIGSR](https://github.com/enhancr/figsr)
 - [GFISRv2](https://github.com/umzi2/gfisrv2)
+- [HEART](https://huggingface.co/Phips/HEART) | [Models](https://huggingface.co/Phips/HEART/tree/main/models)
 
 #### Face Restoration
 
