@@ -74,6 +74,22 @@ def test_strided_tokens_read_in_place():
     check(module, x.view(10, 100, 184))
 
 
+@needs_kernel
+def test_an_fp32_sum_with_fp16_weights_comes_back_in_fp16():
+    # HAT's and DAT's last group hands its norms an FP32 sum (fp32_last_group).
+    module = norm().cuda().half()
+    x = padded_tokens(1000, 180, 184, torch.float32) * 1000
+    with torch.no_grad():
+        assert padded_norm.usable(x, module)
+        out = module(x)
+    assert out.dtype == torch.float16
+    reference = layer_norm(
+        x[:, :180], (180,), module.weight.float(), module.bias.float(), 1e-5
+    )
+    torch.testing.assert_close(out[:, :180].float(), reference, atol=1e-2, rtol=1e-3)
+    assert torch.equal(out[:, 180:], torch.zeros_like(out[:, 180:]))
+
+
 def test_the_pytorch_path_computes_the_same_values():
     module = norm()
     x = pad(torch.randn(7, 180), (0, 4))
@@ -86,7 +102,7 @@ def test_the_pytorch_path_computes_the_same_values():
 
 
 def test_the_kernel_stays_off_on_rocm_builds(monkeypatch: pytest.MonkeyPatch):
-    module = norm()
+    module = norm().half()
     x = torch.empty(4, 184, dtype=torch.float16)
     monkeypatch.setattr(padded_norm, "PADDED_NORM", True)
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
@@ -97,15 +113,16 @@ def test_the_kernel_stays_off_on_rocm_builds(monkeypatch: pytest.MonkeyPatch):
         assert not padded_norm.usable(x, module)
 
 
-def test_fp32_and_gradients_keep_pytorchs_path(monkeypatch: pytest.MonkeyPatch):
-    module = norm()
+def test_fp32_weights_and_gradients_keep_pytorchs_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
     monkeypatch.setattr(padded_norm, "PADDED_NORM", True)
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
     monkeypatch.setattr(torch.version, "hip", None)
     with torch.no_grad():
-        assert not padded_norm.usable(torch.empty(4, 184), module)
+        assert not padded_norm.usable(torch.empty(4, 184), norm())
     assert not padded_norm.usable(
-        torch.empty(4, 184, dtype=torch.float16, requires_grad=True), module
+        torch.empty(4, 184, dtype=torch.float16, requires_grad=True), norm().half()
     )
 
 

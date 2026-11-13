@@ -86,11 +86,12 @@ def launch(
     block_rows: int = 16,
     num_warps: int = 4,
 ) -> torch.Tensor:
-    """The kernel's output, x's shape and type, for x (..., width) whose leading
-    dimensions view as rows (the last dimension contiguous) and weight, bias (real,)."""
+    """The kernel's output, x's shape in the weight's type, for x (..., width) whose
+    leading dimensions view as rows (the last dimension contiguous) and weight, bias
+    (real,)."""
     width, real = x.shape[-1], weight.shape[0]
     rows = x.view(-1, width)
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    out = torch.empty(x.shape, dtype=weight.dtype, device=x.device)
     count = rows.shape[0]
     with torch.cuda.device(x.device):
         _padded_layer_norm[(triton.cdiv(count, block_rows),)](
@@ -113,12 +114,15 @@ def launch(
 def usable(x: torch.Tensor, module: nn.Module) -> bool:
     """Whether the kernel may run module's normalization on x: plain eager inference
     (plain_inference) on an NVIDIA GPU (a ROCm build keeps the PyTorch path), FP16 or
-    BF16, the last dimension contiguous and the leading ones viewable as rows."""
+    BF16 weights, x in their type or FP32, the last dimension contiguous and the
+    leading ones viewable as rows."""
+    weight = module.get_parameter("weight")
     if not (
         PADDED_NORM
         and x.is_cuda
         and torch.version.hip is None
-        and x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype in (torch.float16, torch.bfloat16)
+        and x.dtype in (weight.dtype, torch.float32)
         and x.stride(-1) == 1
         and plain_inference(x, module)
     ):
@@ -132,10 +136,12 @@ def usable(x: torch.Tensor, module: nn.Module) -> bool:
 
 class PaddedLayerNorm(nn.Module):
     """A LayerNorm of `source`'s channels over the first of `padded` channels: statistics
-    of the real channels, their weight and bias, zeros on the rest. In plain eager CUDA
-    inference it runs the kernel; otherwise, and after a Triton failure (which switches
-    the kernel off for the process with one warning), F.layer_norm on the real channels
-    followed by the zero channels."""
+    of the real channels, their weight and bias, zeros on the rest, in FP32 and returned
+    in the weights' type. An FP32 input with FP16 weights is the FP32 sum of HAT's and
+    DAT's last group (fp32_last_group), whose norms hand the trunk back FP16 as this one
+    does. In plain eager CUDA inference it runs the kernel; otherwise, and after a Triton
+    failure (which switches the kernel off for the process with one warning),
+    F.layer_norm on the real channels followed by the zero channels."""
 
     def __init__(self, source: nn.LayerNorm, padded: int) -> None:
         super().__init__()
@@ -165,6 +171,10 @@ class PaddedLayerNorm(nn.Module):
                     error,
                 )
         normed = F.layer_norm(
-            x[..., : self.real], (self.real,), self.weight, self.bias, self.eps
+            x[..., : self.real].float(),
+            (self.real,),
+            self.weight.float(),
+            self.bias.float(),
+            self.eps,
         )
-        return F.pad(normed, (0, self.padded - self.real))
+        return F.pad(normed, (0, self.padded - self.real)).to(self.weight.dtype)
