@@ -133,7 +133,10 @@ class HEARTArch(Architecture[HEART]):
             scale=upscale,
             input_channels=in_chans,
             output_channels=in_chans,
-            size_requirements=SizeRequirements(),
+            # The forward pads to the window itself, choosing reflect or replicate by
+            # the input's size, a choice a trace freezes: an exported model takes no
+            # side smaller than a window.
+            size_requirements=SizeRequirements(minimum=window_size),
         )
 
 

@@ -213,3 +213,13 @@ def test_fused_iln_matches_iln(dtype: torch.dtype):
     tolerance = 1e-5 if dtype == torch.float32 else 1e-2
     torch.testing.assert_close(std, expected_std, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def test_exports_need_a_window():
+    # the forward's reflect-or-replicate choice is frozen by a trace, so a model is
+    # handed no side smaller than its window; called directly it takes any size
+    descriptor = HEARTArch().load(_small().state_dict())
+    assert descriptor.size_requirements.minimum == 32
+    with torch.no_grad():
+        assert descriptor(torch.rand(1, 3, 5, 40)).shape == (1, 3, 10, 80)
+        assert descriptor.model(torch.rand(1, 3, 5, 40)).shape == (1, 3, 10, 80)
