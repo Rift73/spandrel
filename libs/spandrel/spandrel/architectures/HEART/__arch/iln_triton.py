@@ -191,8 +191,7 @@ class PaddedILN(nn.Module):
     """i-LN of `source`'s channels over the first of `padded` channels: statistics of the
     real channels, their weight and bias, zeros on the rest; returns (x, std) as i-LN does.
     In plain eager CUDA inference the kernels run; otherwise the same values from
-    PyTorch's operations (one reduction over all channels, rescaled to the real count:
-    the zeros add nothing to the sums)."""
+    PyTorch's operations in FP32 over the real channels, returned in x's type."""
 
     def __init__(self, source: nn.Module, padded: int) -> None:
         super().__init__()
@@ -216,12 +215,16 @@ class PaddedILN(nn.Module):
         result = iln(self, x, self.real, self.eps)
         if result is not None:
             return result
+        # the statistics of the real channels and the normalization in FP32, as the
+        # kernels
         b = x.shape[0]
-        flat = x.reshape(b, -1)
-        scale = self.padded / self.real
-        var_all, mean_all = torch.var_mean(flat, dim=1, keepdim=True, correction=0)
-        mean = mean_all * scale
-        var = ((var_all + mean_all.square()) * scale - mean.square()).clamp_min(0)
+        wide = x.float()
+        var, mean = torch.var_mean(
+            wide[..., : self.real].reshape(b, -1), dim=1, keepdim=True, correction=0
+        )
         std = torch.sqrt(var + self.eps).reshape(b, 1, 1)
-        gain = self.weight / std
-        return torch.addcmul(self.bias - mean.reshape(b, 1, 1) * gain, x, gain), std
+        gain = self.weight.float() / std
+        out = torch.addcmul(
+            self.bias.float() - mean.reshape(b, 1, 1) * gain, wide, gain
+        )
+        return out.to(x.dtype), std.to(x.dtype)

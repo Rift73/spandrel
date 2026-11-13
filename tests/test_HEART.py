@@ -479,3 +479,73 @@ def test_heart_window_kernel_takes_more_windows_than_a_grid_axis_holds():
             qkv[:, :384].contiguous(), pos_q, pos_k, heads, window, 0, 0.35
         )
     assert torch.equal(whole[:, :384], top)
+
+
+def _norm_pair(real: int) -> heart_arch.iLN:
+    torch.manual_seed(0)
+    source = heart_arch.iLN(real)
+    with torch.no_grad():
+        source.weight.uniform_(0.5, 1.5)
+        source.bias.uniform_(-0.2, 0.2)
+    return source
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("real", "padded", "mean", "spread"),
+    [
+        (180, 184, 20.0, 1.0),
+        (180, 184, 1.0, 3.0),
+        (180, 180, 5.0, 1.0),
+        (24, 32, -7.0, 0.5),
+    ],
+)
+def test_padded_iln_in_half_precision(
+    dtype: torch.dtype, real: int, padded: int, mean: float, spread: float
+):
+    # a large mean against a small spread: the statistics must not cancel in half
+    # precision; the reference is i-LN in FP32 on the same rounded input
+    source = _norm_pair(real)
+    x = (torch.randn(2, 40 * 40, real) * spread + mean).to(dtype)
+    with torch.no_grad():
+        expected, expected_std = source(x.float())
+        norm = iln_triton.PaddedILN(source.to(dtype), padded).eval()
+        actual, std = norm(torch.nn.functional.pad(x, (0, padded - real)))
+    assert actual.dtype == std.dtype == dtype
+    step = 2**-7 if dtype == torch.bfloat16 else 2**-10
+    torch.testing.assert_close(std.float(), expected_std, rtol=step, atol=0)
+    # the output's own rounding, at the output's magnitude (a few units)
+    torch.testing.assert_close(
+        actual[..., :real].float(), expected, rtol=step, atol=4 * step
+    )
+    assert torch.equal(actual[..., real:], torch.zeros_like(actual[..., real:]))
+
+
+@_NEEDS_TRITON_GPU
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("b", "real", "padded", "mean"),
+    [(1, 180, 184, 20.0), (2, 180, 180, 1.0), (2, 24, 32, -7.0)],
+)
+def test_padded_iln_kernels_match_its_pytorch_form(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    b: int,
+    real: int,
+    padded: int,
+    mean: float,
+):
+    norm = iln_triton.PaddedILN(_norm_pair(real), padded).eval().cuda().to(dtype)
+    x = torch.randn(b, 50 * 41, real, device="cuda") + mean
+    x = torch.nn.functional.pad(x, (0, padded - real)).to(dtype)
+    with torch.no_grad():
+        actual, std = norm(x)
+        assert iln_triton.ILN_KERNEL
+        monkeypatch.setattr(iln_triton, "ILN_KERNEL", False)
+        expected, expected_std = norm(x)
+    step = 2**-7 if dtype == torch.bfloat16 else 2**-10
+    torch.testing.assert_close(std.float(), expected_std.float(), rtol=step, atol=0)
+    torch.testing.assert_close(
+        actual.float(), expected.float(), rtol=step, atol=4 * step
+    )
+    assert torch.equal(actual[..., real:], torch.zeros_like(actual[..., real:]))
