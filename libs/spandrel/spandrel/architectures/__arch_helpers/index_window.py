@@ -38,6 +38,9 @@ INDEX_WINDOW = AVAILABLE
 # Head widths up to this run in the kernel.
 MAX_HEAD_WIDTH = 128
 
+# The query and key tile of every launch: a window's tokens must be a multiple of it.
+TILE = 64
+
 if AVAILABLE:
 
     @triton.jit
@@ -164,13 +167,18 @@ def launch(
     shift: int,
     width: int,
     scale: float,
-    block_m: int = 64,
-    block_n: int = 64,
+    block_m: int = TILE,
+    block_n: int = TILE,
     num_warps: int = 4,
     num_stages: int = 2,
 ) -> torch.Tensor:
     """The output (B, H, W, heads * width) for qkv (B, H, W, 3, heads, head_stride)
     contiguous, H and W multiples of the window, and bias (heads, N, N) contiguous."""
+    if (window * window) % block_m or (window * window) % block_n:
+        # the kernel does not mask past a window's end
+        raise ValueError(
+            f"{window} x {window} windows are not whole {block_m}- and {block_n}-token tiles"
+        )
     b, h, w, _, heads, head_stride = qkv.shape
     windows_h, windows_w = h // window, w // window
     out = qkv.new_empty((b, h, w, heads * width))
@@ -214,10 +222,13 @@ _WEIGHTLESS = nn.Module().eval()
 def usable(qkv: torch.Tensor, bias: torch.Tensor, window: int) -> bool:
     """Whether the kernel may run: plain eager inference on an NVIDIA GPU, FP16 or BF16
     qkv and bias of one type, both contiguous, the bias one (heads, N, N) for all
-    windows, heads up to MAX_HEAD_WIDTH wide."""
+    windows, heads up to MAX_HEAD_WIDTH wide, and windows of a whole number of the
+    kernel's 64-token tiles (16 x 16 and 8 x 8, not 12 x 12): it does not mask tokens
+    past a window's end."""
     heads, n_tokens = qkv.shape[4], window * window
     return (
         INDEX_WINDOW
+        and n_tokens % TILE == 0
         and qkv.is_cuda
         and torch.version.hip is None
         and qkv.dtype in (torch.float16, torch.bfloat16)
