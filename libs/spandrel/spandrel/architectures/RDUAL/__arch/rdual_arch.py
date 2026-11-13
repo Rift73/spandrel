@@ -384,6 +384,21 @@ def _inference_na_coordinates(height: int, width: int, device: torch.device) -> 
         return _na_coordinates(height, width, device)
 
 
+def na_kernel_usable(device: torch.device, dtype: torch.dtype, dim: int) -> bool:
+    """Whether the context layers' Triton kernel may run on features of that
+    device and dtype with heads of dim channels: Triton
+    and NA_TRITON on, an NVIDIA GPU (a ROCm build of PyTorch keeps the PyTorch
+    path, as DUAL's kernel does), BF16 operands and heads of 32."""
+    return (
+        NA_TRITON
+        and _HAS_DIRECT_ATTENTION
+        and device.type == "cuda"
+        and torch.version.hip is None
+        and dtype == torch.bfloat16
+        and dim == 32
+    )
+
+
 # Tiles per neighborhood-attention chunk in eager inference. Training, compiled
 # and export paths keep four, which their Flex block masks are built for.
 NA_INFERENCE_CHUNK = 64
@@ -763,14 +778,7 @@ class _SpatialAttention(nn.Module):
             and not torch.compiler.is_compiling()
             and not torch.onnx.is_in_onnx_export()
         )
-        if (
-            eager_inference
-            and NA_TRITON
-            and _HAS_DIRECT_ATTENTION
-            and x.is_cuda
-            and qkv.dtype == torch.bfloat16
-            and dim == 32
-        ):
+        if eager_inference and na_kernel_usable(x.device, qkv.dtype, dim):
             u = self.window + 15
             yy, xx = torch.meshgrid(
                 torch.arange(u, device=x.device),

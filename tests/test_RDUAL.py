@@ -233,6 +233,16 @@ def test_tiled_windows_carry_one_state_per_tile(size):
             )
 
 
+def test_the_attention_kernel_stays_off_on_rocm_builds(monkeypatch):
+    cuda = torch.device("cuda")
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    monkeypatch.setattr(rdual_arch, "_HAS_DIRECT_ATTENTION", True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    assert rdual_arch.na_kernel_usable(cuda, torch.bfloat16, 32)
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    assert not rdual_arch.na_kernel_usable(cuda, torch.bfloat16, 32)
+
+
 @pytest.mark.parametrize("keep", [0, 4])
 def test_a_window_keeps_one_to_all_of_its_frames(keep):
     with pytest.raises(ValueError, match="keep must be"):
