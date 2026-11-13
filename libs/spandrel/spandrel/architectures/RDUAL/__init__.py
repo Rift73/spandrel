@@ -165,7 +165,14 @@ class RDUALArch(Architecture["RDUAL"]):
         # The scale is only in the shapes of the reconstruction tail.
         experts = int(state_dict["groups.0.conv.experts"].shape[0])
         for scale in (2, 4, 1):
-            model = RDUAL(scale=scale, use_checkpoint=False, dynamic_experts=experts)
+            # every RDUAL runs its local layers and its retrieval as neighborhoods
+            model = RDUAL(
+                scale=scale,
+                use_checkpoint=False,
+                dynamic_experts=experts,
+                local_na=True,
+                retrieval_na=True,
+            )
             reference = model.state_dict()
             if reference.keys() == state_dict.keys() and all(
                 reference[key].shape == state_dict[key].shape for key in reference

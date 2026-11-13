@@ -1,4 +1,5 @@
 import importlib
+import math
 import os
 import subprocess
 import sys
@@ -358,3 +359,93 @@ def test_direct_attention_takes_more_windows_than_a_grid_axis_holds():
             for i in (0, half)
         ]
     assert torch.equal(whole, torch.cat(parts))
+
+
+def test_every_rdual_loads_with_local_and_retrieval_na():
+    model = RDUALArch().load(_model(scale=2).state_dict()).model
+    assert model.local_na and model.retrieval_na
+    layers = [
+        a.local_na
+        for a in model.modules()
+        if isinstance(a, rdual_arch.SpatialAttention) and not a.context
+    ]
+    assert layers and all(layers)
+
+
+def _starts(length: int, keys: int, size: int, stride: int) -> torch.Tensor:
+    return (torch.arange(length) // stride - size // 2).clamp(0, keys - size)
+
+
+# above the window on one or both axes, partial 8x8 query tiles, batch 2
+@pytest.mark.parametrize("shape", [(17, 30), (40, 9)])
+def test_local_na_matches_dense_reference(shape):
+    """Dense FP64 attention in which every query sees only its own clamped 16x16
+    neighborhood, with the dense RPB of the query-minus-key offset."""
+    torch.manual_seed(0)
+    attention = rdual_arch.SpatialAttention(64, 2, 16, shifted=True, context=False)
+    attention = attention.double().eval()
+    assert attention.relative_bias is not None
+    attention.relative_bias.data.normal_(0, 0.5)
+    attention.local_na = True
+    x = torch.randn(2, 64, *shape, dtype=torch.float64)
+    height, width = shape
+    kh, kw = min(height, 16), min(width, 16)
+    yy, xx = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+    y, z = yy.flatten(), xx.flatten()
+    sy, sz = _starts(height, height, kh, 1)[y], _starts(width, width, kw, 1)[z]
+    inside = (y >= sy[:, None]) & (y < sy[:, None] + kh)
+    inside &= (z >= sz[:, None]) & (z < sz[:, None] + kw)
+    dy = (y[:, None] - y + 15).clamp(0, 30)
+    dz = (z[:, None] - z + 15).clamp(0, 30)
+    bias = attention.relative_bias[dy * 31 + dz].permute(2, 0, 1)
+    with torch.no_grad():
+        actual = attention.pre_gate_core(x)
+        qkv = attention.qkv(x.flatten(2).transpose(1, 2)).reshape(2, -1, 3, 2, 32)
+        query, key, value = qkv.permute(2, 0, 3, 1, 4)
+        logits = query @ key.transpose(-1, -2) * 32**-0.5 + bias
+        weights = logits.masked_fill(~inside, -math.inf).softmax(-1)
+        expected = (weights @ value).transpose(-1, -2).reshape(x.shape)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("coarse", [(49, 30), (30, 52)])
+def test_retrieval_na_matches_dense_reference(coarse):
+    """Fine query (y, x) attends the 48x48 coarse keys around (y // 2, x // 2),
+    clamped inside the coarse grid."""
+    torch.manual_seed(0)
+    ch, cw = coarse
+    q = torch.randn(2, 64, 2 * ch, 2 * cw, dtype=torch.float64)
+    k, v = (torch.randn(2, 64, ch, cw, dtype=torch.float64) for _ in range(2))
+    log_tau = torch.randn(2, dtype=torch.float64) * 0.3
+    packed = rdual_arch.pack_qk(q, k, na=True)
+    assert isinstance(packed[0], rdual_arch.NAGeometry)
+    actual = rdual_arch.attend_packed(packed, v, log_tau)
+    kh, kw = min(48, ch), min(48, cw)
+    yy, xx = torch.meshgrid(torch.arange(2 * ch), torch.arange(2 * cw), indexing="ij")
+    ky, kx = torch.meshgrid(torch.arange(ch), torch.arange(cw), indexing="ij")
+    ky, kx = ky.flatten(), kx.flatten()
+    sy = _starts(2 * ch, ch, kh, 2)[yy.flatten()]
+    sz = _starts(2 * cw, cw, kw, 2)[xx.flatten()]
+    inside = (ky >= sy[:, None]) & (ky < sy[:, None] + kh)
+    inside &= (kx >= sz[:, None]) & (kx < sz[:, None] + kw)
+    tau = log_tau.exp().clamp(0.1, 10)[None, :, None, None]
+    query, key, value = (t.reshape(2, 2, 32, -1).transpose(-1, -2) for t in (q, k, v))
+    scale = math.log(kh * kw) / (math.log(1024) * math.sqrt(32))
+    logits = (query * tau @ key.transpose(-1, -2) * scale).masked_fill(
+        ~inside, -math.inf
+    )
+    expected = (logits.softmax(-1) @ value).transpose(-1, -2).reshape(q.shape)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-10)
+
+
+def test_retrieval_na_keeps_the_blocks_up_to_48():
+    q = torch.randn(1, 64, 96, 90)
+    k = torch.randn(1, 64, 48, 45)
+    packed = rdual_arch.pack_qk(q, k, na=True)
+    assert not isinstance(packed[0], rdual_arch.NAGeometry)
+    v = torch.randn(1, 64, 48, 45)
+    log_tau = torch.zeros(2)
+    assert torch.equal(
+        rdual_arch.attend_packed(packed, v, log_tau),
+        rdual_arch.attend_packed(rdual_arch.pack_qk(q, k), v, log_tau),
+    )
