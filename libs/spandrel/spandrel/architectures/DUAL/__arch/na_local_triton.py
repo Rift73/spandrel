@@ -189,7 +189,8 @@ if AVAILABLE:
         kx0 = tl.minimum(
             tl.maximum(tl.minimum(ox, width - 1) // 2 - half, 0), kwidth - cols
         )
-        d = tl.arange(0, 32)
+        # 64-bit: a channel's plane offset d * plane passes 2^31 on large maps
+        d = tl.arange(0, 32).to(tl.int64)
         n = tl.arange(0, block_n)
         pix = qy * width + qx
         tau = tl.load(tau_ptr + head)

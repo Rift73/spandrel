@@ -144,6 +144,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F  # noqa: N812
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from spandrel.architectures.DUAL.__arch import na_local_triton
 from spandrel.util import store_hyperparameters
 from torch.utils.checkpoint import (
     CheckpointPolicy,
@@ -400,8 +401,9 @@ def _inference_na_coordinates(height: int, width: int, device: torch.device) -> 
 
 
 def na_kernel_usable(device: torch.device, dtype: torch.dtype, dim: int) -> bool:
-    """Whether the context layers' Triton kernel may run on features of that
-    device and dtype with heads of dim channels: Triton
+    """Whether the Triton neighborhood kernels (the context layers', and DUAL's
+    local and retrieval ones) may run on features of that device and dtype with
+    heads of dim channels: Triton
     and NA_TRITON on, an NVIDIA GPU (a ROCm build of PyTorch keeps the PyTorch
     path, as DUAL's kernel does), BF16 operands and heads of 32."""
     return (
@@ -957,17 +959,37 @@ class _SpatialAttention(nn.Module):
         """Per-query window neighborhoods with dense RPB, batched in 8x8 tiles.
 
         Each tile reads a (window+7)^2 key union; a per-class float mask adds the
-        layer's own bias inside each query's neighborhood and -inf outside.
+        layer's own bias inside each query's neighborhood and -inf outside. Eager
+        inference where na_kernel_usable() holds runs DUAL's local NA kernel on
+        qkv as the projection writes it, the bias rounded to its type as here.
         """
         if self.relative_bias is None:
             raise ValueError("local_na requires the dense relative position bias")
         batch, channels, height, width = x.shape
         heads, dim, tile, window = self.heads, channels // self.heads, 8, self.window
+        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+        qkv = self.qkv(tokens)
+        eager_inference = (
+            not self.training
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not torch.onnx.is_in_onnx_export()
+        )
+        if eager_inference and na_kernel_usable(x.device, qkv.dtype, dim):
+            table = (
+                self.relative_bias.to(calculation_dtype(qkv.dtype))
+                .to(qkv.dtype)
+                .t()
+                .contiguous()
+            )
+            out = na_local_triton.local_na(
+                qkv.contiguous(), table, height, width, window
+            )
+            return out.permute(0, 3, 1, 2)
         geometry = na_geometry(
             (height, width), (height, width), window, tile, 1, x.device
         )
-        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
-        qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
+        qkv = qkv.reshape(batch, height * width, 3, heads, dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         query = query * (dim**-0.5)
         dtype = query.dtype
@@ -1197,6 +1219,21 @@ def attend_packed(packed: tuple, v: Tensor, log_tau: Tensor) -> Tensor:
         query, key = classes
         images, channels, height, width = batch
         heads = channels // 32
+        if (
+            not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not torch.onnx.is_in_onnx_export()
+            and na_kernel_usable(v.device, v.dtype, 32)
+            and query.dtype == key.dtype == v.dtype
+        ):
+            # Eager inference: DUAL's retrieval NA kernel reads the BCHW
+            # projections that pack_qk viewed.
+            q = query.transpose(1, 2).reshape(images, channels, height, width)
+            k = key.transpose(1, 2).reshape(images, channels, *v.shape[-2:])
+            tau = log_tau.exp().clamp(0.1, 10).to(q.dtype)
+            return na_local_triton.retrieval_na(
+                q.contiguous(), k.contiguous(), v.contiguous(), tau.contiguous()
+            )
         value = v.reshape(query.shape[0], 32, -1).transpose(1, 2)
         tau = log_tau.exp().clamp(0.1, 10).to(query.dtype).repeat(images)
         query = query * tau[:, None, None]
@@ -1951,7 +1988,8 @@ if _HAS_DIRECT_ATTENTION:
         blocks = tl.cdiv(query_tokens, BLOCK_M)
         query_block = tl.program_id(0) % blocks
         batch_head = tl.program_id(0) // blocks
-        batch = batch_head // num_heads
+        # 64-bit: window index times the window's stride passes 2^31 past 65,535
+        batch = (batch_head // num_heads).to(tl.int64)
         head = batch_head - batch * num_heads
 
         query_index = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -2971,7 +3009,9 @@ if _HAS_DIRECT_ATTENTION:
         py, px = tile // nx * TILE + m // TILE, tile % nx * TILE + m % TILE
         pos = py * W + px
         qm = (py < H) & (px < W)
-        q = tl.load(Q + (bh * H * W + pos[:, None]) * 32 + d[None, :], qm[:, None], 0)
+        # 64-bit: plane offsets times 32 channels pass 2^31 on large maps
+        plane = bh.to(tl.int64) * H * W
+        q = tl.load(Q + (plane + pos[:, None]) * 32 + d[None, :], qm[:, None], 0)
         nk = tl.load(NK + head * 32 + d)
         null_score = tl.sum(q.to(tl.float32) * nk[None, :].to(tl.float32), 1) * (
             32**-0.5
@@ -2991,7 +3031,7 @@ if _HAS_DIRECT_ATTENTION:
             keypos = ky * W + kx
             nm = n < S * UY * UX
             allowed = tl.load(Valid + b * S + slot, nm, 0) != 0
-            index = ((b * S + slot) * 4 + head) * H * W + keypos
+            index = ((b * S + slot) * 4 + head).to(tl.int64) * H * W + keypos
             k = tl.load(K + index[:, None] * 32 + d[None, :], nm[:, None], 0)
             v = tl.load(V + index[:, None] * 32 + d[None, :], nm[:, None], 0)
             support = (
@@ -3026,10 +3066,8 @@ if _HAS_DIRECT_ATTENTION:
             denom = denom * alpha + tl.sum(p, 1)
             maximum = new_max
         out = acc / denom[:, None]
-        tl.store(
-            Output + (bh * H * W + pos[:, None]) * 32 + d[None, :], out, qm[:, None]
-        )
-        tl.store(LSE + bh * H * W + pos, maximum + tl.log(denom), qm)
+        tl.store(Output + (plane + pos[:, None]) * 32 + d[None, :], out, qm[:, None])
+        tl.store(LSE + plane + pos, maximum + tl.log(denom), qm)
 
     @triton.jit
     def _temporal_backward_kernel(
@@ -3310,7 +3348,8 @@ if _HAS_DIRECT_ATTENTION:
         S3: tl.constexpr,
         BLOCK: tl.constexpr,
     ) -> None:
-        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        # 64-bit: the flat element index passes 2^31 on large maps
+        i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         ok = i < 2 * N * 128 * H * W
         d = i % 32
         p = i // 32 % (H * W)
@@ -5686,8 +5725,10 @@ class RDUAL(nn.Module):
 # Eager-inference neighborhood attention as one Triton kernel (chaiNNer-C's DualNA
 # kernel for TensorRT): the operator of _na_core, its RFB factors as two tables in
 # the union-local frame of 16 x 16 query tiles. Used when Triton is available, for
-# BF16 CUDA features with 32-channel heads; otherwise the SDPA chunks run.
-# spandrel's Triton fallback switches it off when a Triton kernel fails to compile.
+# BF16 CUDA features with 32-channel heads; otherwise the SDPA chunks run. The
+# local and retrieval neighborhoods use DUAL's kernels (na_local_triton) under the
+# same switch. spandrel's Triton fallback switches it off when a Triton kernel fails
+# to compile.
 NA_TRITON = True
 
 if _HAS_DIRECT_ATTENTION:
@@ -5733,7 +5774,8 @@ if _HAS_DIRECT_ATTENTION:
         r = tl.arange(0, 16)
         dv = tl.arange(0, 32)
         n = tl.arange(0, block_n)
-        pix = qy * width + qx
+        # 64-bit: pixel times 3C passes 2^31 on large maps
+        pix = qy.to(tl.int64) * width + qx
         q0 = tl.load(
             qkv_ptr + pix[:, None] * (3 * channels) + head * 32 + d[None, :],
             d[None, :] < 32,
@@ -5764,7 +5806,7 @@ if _HAS_DIRECT_ATTENTION:
             # The union's row stride stays M + 15; columns past its width are not loaded.
             # Keys outside the loaded union fail every query's neighborhood test below.
             inside = (ns < rows * u) & (ns % u < uw)
-            kp = ky * width + kx
+            kp = ky.to(tl.int64) * width + kx
             bi = (ky - by) * u + kx - bx
             k0 = tl.load(
                 qkv_ptr

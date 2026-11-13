@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from spandrel import MAIN_REGISTRY, ImageModelDescriptor
+from spandrel.architectures.DUAL.__arch import na_local_triton
 from spandrel.architectures.DUAL.__arch.dual_arch import dual_light
 from spandrel.architectures.RDUAL import RDUAL, RDUALArch, run_clip, run_window
 from spandrel.architectures.RDUAL.__arch import rdual_arch
@@ -449,3 +450,105 @@ def test_retrieval_na_keeps_the_blocks_up_to_48():
         rdual_arch.attend_packed(packed, v, log_tau),
         rdual_arch.attend_packed(rdual_arch.pack_qk(q, k), v, log_tau),
     )
+
+
+needs_kernel = pytest.mark.skipif(
+    not (
+        rdual_arch.HAS_DIRECT_ATTENTION
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the kernels run on NVIDIA GPUs with Triton",
+)
+
+
+def _counted(monkeypatch, name):
+    calls = []
+    launch = getattr(na_local_triton, name)
+
+    def counted(*args):
+        calls.append(args)
+        return launch(*args)
+
+    monkeypatch.setattr(na_local_triton, name, counted)
+    return calls
+
+
+def _local_attention(channels):
+    attention = rdual_arch.SpatialAttention(
+        channels, channels // 32, 16, shifted=False, context=False
+    )
+    assert attention.relative_bias is not None
+    attention.relative_bias.data.normal_(0, 0.5)
+    attention.local_na = True
+    return attention.cuda().eval().bfloat16()
+
+
+# RDUAL's BF16: batch 2, non-square, partial 8x8 query tiles, above the window on
+# one or both axes
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "shape"),
+    [(2, 128, (40, 37)), (1, 128, (17, 200)), (1, 64, (96, 9))],
+)
+def test_local_na_kernel_matches_the_pytorch_form(monkeypatch, batch, channels, shape):
+    torch.manual_seed(0)
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    attention = _local_attention(channels)
+    x = torch.randn(batch, channels, *shape, device="cuda").bfloat16()
+    calls = _counted(monkeypatch, "local_na")
+    with torch.no_grad():
+        actual = attention.pre_gate_core(x)
+        assert len(calls) == 1
+        monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+        expected = attention.pre_gate_core(x)
+    assert len(calls) == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2e-2)
+
+
+@needs_kernel
+def test_local_na_kernel_stays_off_up_to_the_window_and_outside_inference(
+    monkeypatch,
+):
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    attention = _local_attention(64)
+    calls = _counted(monkeypatch, "local_na")
+    with torch.no_grad():
+        attention.pre_gate_core(torch.randn(1, 64, 16, 12, device="cuda").bfloat16())
+        attention.float().pre_gate_core(torch.randn(1, 64, 17, 17, device="cuda"))
+    attention.bfloat16().pre_gate_core(
+        torch.randn(1, 64, 17, 17, device="cuda").bfloat16()
+    )
+    assert not calls
+
+
+# coarse grids above 48 on one or both axes, odd fine sizes, batch 2; 48 x 45 keeps
+# the blocks
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "fine", "coarse", "kernel"),
+    [
+        (2, (100, 98), (50, 49), True),
+        (1, (30, 104), (15, 52), True),
+        (1, (97, 40), (49, 20), True),
+        (1, (96, 90), (48, 45), False),
+    ],
+)
+def test_retrieval_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, fine, coarse, kernel
+):
+    torch.manual_seed(0)
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    q = torch.randn(batch, 128, *fine, device="cuda").bfloat16()
+    k, v = (torch.randn(batch, 128, *coarse, device="cuda").bfloat16() for _ in "kv")
+    log_tau = torch.randn(4, device="cuda") * 0.3
+    calls = _counted(monkeypatch, "retrieval_na")
+    with torch.no_grad():
+        actual = rdual_arch.attend_packed(rdual_arch.pack_qk(q, k, na=True), v, log_tau)
+        assert len(calls) == int(kernel)
+        monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+        expected = rdual_arch.attend_packed(
+            rdual_arch.pack_qk(q, k, na=True), v, log_tau
+        )
+    assert len(calls) == int(kernel)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2e-2)
