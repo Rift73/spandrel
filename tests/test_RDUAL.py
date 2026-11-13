@@ -115,57 +115,59 @@ def test_a_carried_state_changes_the_window_against_a_cold_start():
 
 
 def test_on_demand_flow_lookups_match_the_volume(monkeypatch):
-    torch.manual_seed(0)
-    feature0, feature1 = torch.randn(2, 2, 16, 6, 9).unbind(0)
-    grid = rdual_arch._neuflow_coords_grid(2, 6, 9, torch.device("cpu"))
-    # Targets inside, across and past the borders (zero padding).
-    flow = torch.randn(2, 2, 6, 9) * 4
-    volume = rdual_arch._neuflow_lookup(
-        rdual_arch._neuflow_correlation(feature0, feature1), grid, flow
-    )
-    # A chunk smaller than one row of queries splits the lookups.
-    monkeypatch.setattr(rdual_arch, "_LOOKUP_CHUNK_BYTES", 81 * 16 * 4 * 5)
-    on_demand = rdual_arch._neuflow_lookup_features(feature0, feature1, grid, flow)
-    torch.testing.assert_close(on_demand, volume, rtol=1e-5, atol=1e-5)
+    model = _temporal_model()
+    frames = torch.rand(1, 3, 3, 48, 72)
+    # Chunks smaller than one row of 1/8-scale queries split the lookups.
+    monkeypatch.setattr(rdual_arch, "_LOOKUP_CHUNK_BYTES", 81 * 128 * 4 * 5)
+    with torch.inference_mode():
+        volume = model.guidance(frames)
+        on_demand = model.guidance(frames, flow_volume=False)
+    torch.testing.assert_close(on_demand, volume, rtol=1e-4, atol=1e-4)
 
 
 def test_window_memory_modes(monkeypatch):
     model = _temporal_model()
     frames = torch.rand(1, 6, 3, 32, 40)
-    called = []
-    real = rdual_arch._neuflow_lookup_features
-    monkeypatch.setattr(
-        rdual_arch,
-        "_neuflow_lookup_features",
-        lambda *a: called.append(1) or real(*a),
-    )
+    volumes = []
+    real = rdual_arch.NeuFlowV2.forward
+
+    def forward(self, img0, img1, volume=True):
+        volumes.append(volume)
+        return real(self, img0, img1, volume)
+
+    monkeypatch.setattr(rdual_arch.NeuFlowV2, "forward", forward)
     with torch.inference_mode():
         _, state = run_window(model, frames[:, :3], 2)
         past = (state, frames[:, 1])
         default, default_state = run_window(model, frames[:, 2:], 3, past)
-        assert not called
+        assert volumes and all(volumes)
+        volumes.clear()
         recomputed, recomputed_state = run_window(
             model, frames[:, 2:], 3, past, hold_encodes=False
         )
         on_demand, _ = run_window(model, frames[:, 2:], 3, past, flow_volume=False)
-    assert called
+    assert False in volumes
     # Encoding a frame again repeats the same operations on the same input.
     assert torch.equal(recomputed, default)
     assert torch.equal(recomputed_state, default_state)
     torch.testing.assert_close(on_demand, default, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("size", [(5, 9), (37, 50), (64, 40)])
+@pytest.mark.parametrize("size", [(5, 9), (37, 50), (64, 42)])
 def test_the_last_stage_in_bands_is_the_whole_frame_stage(monkeypatch, size):
+    # Without gradients the deployed tail runs in bands; with them, on the whole
+    # frame. Two rows of t2 per band, so bands meet inside the frame and at its edges.
     model = RDUAL(scale=2, use_checkpoint=False).eval()
+    model.get_buffer("flow_loaded").fill_(True)
     model.prepare_for_export()
-    t2 = torch.randn(1, 64, *size)
-    # Three rows of t2 per band, so bands meet inside the frame and at its edges.
-    monkeypatch.setattr(rdual_arch, "_TAIL_BAND_BYTES", 256 * size[1] * 4 * 3)
+    monkeypatch.setattr(rdual_arch, "_TAIL_BAND_BYTES", 256 * size[1] * 4 * 2)
+    frames = torch.rand(1, 2, 3, *size)
+    guidance = torch.zeros(1, 1, 2, 2, (size[0] + 3) // 4 * 2, (size[1] + 3) // 4 * 2)
     with torch.no_grad():
-        whole = model.tail[4:](t2)
-        banded = model._tail_bands(t2)
-    torch.testing.assert_close(banded, whole)
+        banded = model(frames, guidance)
+    with torch.enable_grad():
+        whole = model(frames, guidance)
+    torch.testing.assert_close(banded, whole.detach())
 
 
 def test_a_tile_that_covers_the_frame_is_the_untiled_window():
@@ -180,10 +182,10 @@ def test_a_tile_that_covers_the_frame_is_the_untiled_window():
 
 def test_tile_starts_sit_on_the_grid_and_the_last_tile_ends_at_the_frame():
     for length, tile, overlap in ((837, 452, 64), (1488, 776, 64), (1080, 400, 32)):
-        spans = rdual_arch._tile_axis(length, tile, overlap)
+        spans = rdual_arch.tile_axis(length, tile, overlap)
         padded = (length + 3) // 4 * 4
         assert len({size for _, size in spans}) == 1
-        assert all(start % rdual_arch._TILE_GRID == 0 for start, _ in spans)
+        assert all(start % rdual_arch.TILE_GRID == 0 for start, _ in spans)
         assert spans[0][0] == 0 and spans[-1][0] + spans[-1][1] == padded
         assert spans[0][1] >= tile // 4 * 4
         assert all(
@@ -197,7 +199,9 @@ def test_tiled_windows_carry_one_state_per_tile(size):
     model = _temporal_model()
     frames = torch.rand(1, 6, 3, *size)
     tile, overlap = (24, 20), 8
-    rows, cols = rdual_arch._tile_grid(size, tile, overlap)
+    grid = rdual_arch.tile_grid(size, tile, overlap)
+    assert grid is not None
+    rows, cols = grid
     assert len(rows) > 1 and len(cols) > 1
     assert len({span[1] for span in rows}) == len({span[1] for span in cols}) == 1
     with torch.inference_mode():
@@ -205,7 +209,9 @@ def test_tiled_windows_carry_one_state_per_tile(size):
         assert first.shape == (1, 2, 3, size[0] * 2, size[1] * 2)
         assert state.shape[0] == len(rows) * len(cols)
         past = (state, frames[:, 1])
-        carried, _ = run_window(model, frames[:, 2:], 3, past, tile=tile, overlap=overlap)
+        carried, _ = run_window(
+            model, frames[:, 2:], 3, past, tile=tile, overlap=overlap
+        )
         cold, _ = run_window(model, frames[:, 2:], 3, tile=tile, overlap=overlap)
         assert carried.shape == cold.shape == (1, 3, 3, size[0] * 2, size[1] * 2)
         assert (carried - cold).abs().amax() > 1e-3
@@ -217,7 +223,14 @@ def test_tiled_windows_carry_one_state_per_tile(size):
             run_window(model, frames[:, 2:], 3, past, tile=(16, 16), overlap=4)
         _, untiled_state = run_window(model, frames[:, :3], 2)
         with pytest.raises(ValueError, match="tile"):
-            run_window(model, frames[:, 2:], 3, (untiled_state, frames[:, 1]), tile=tile, overlap=overlap)
+            run_window(
+                model,
+                frames[:, 2:],
+                3,
+                (untiled_state, frames[:, 1]),
+                tile=tile,
+                overlap=overlap,
+            )
 
 
 @pytest.mark.parametrize("keep", [0, 4])
