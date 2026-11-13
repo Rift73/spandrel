@@ -5,10 +5,10 @@ The windows of HAT, DAT and DRFT that need no mask (plain windows, the interior 
 of shifted blocks, DRFT's unmasked path, whose bias is already inside q and k) attend
 here in one pass: an online FP32 softmax over tiles of keys, the scores and their
 exponentials kept in registers, never written. The relative position bias, when given,
-is read inside the kernel from its compact table, (2 Wh - 1) (2 Ww - 1) entries per head,
-at the index the architectures' relative_position_index holds for that query and key:
-(qy - ky + Wh - 1) (2 Ww - 1) + qx - kx + Ww - 1. Neither a (N, M) bias nor a score
-matrix exists in memory.
+is the (heads, N, M) tensor the architectures already keep, one for every window (768 KiB
+for HAT-L's 6 heads of 16 x 16 windows in FP16, so it stays in the GPU's cache): read
+there, it took 1.46 ms per HAT-L 1024 input's windows against 1.91 ms for the same values
+looked up from the compact (2 Wh - 1) (2 Ww - 1) table by position, on an RTX 5090.
 
 PyTorch's flash backend, which takes no bias, is missing from its Windows builds; there
 these windows ran on the memory-efficient kernel with the bias as a float mask.
@@ -48,7 +48,7 @@ if AVAILABLE:
         q_ptr,
         k_ptr,
         v_ptr,
-        table_ptr,
+        bias_ptr,
         out_ptr,
         sq_w,
         sq_h,
@@ -65,8 +65,6 @@ if AVAILABLE:
         d_qk: tl.int32,
         d_v: tl.int32,
         scale: tl.float32,
-        window_w: tl.constexpr,
-        table_size: tl.constexpr,
         has_bias: tl.constexpr,
         block_m: tl.constexpr,
         block_n: tl.constexpr,
@@ -75,8 +73,8 @@ if AVAILABLE:
     ):
         """One program: block_m queries of one window and head against all its keys.
         q (W, heads, N, d_qk), k (W, heads, M, d_qk), v (W, heads, M, d_v) with the
-        last dimension contiguous; out (W, heads, N, d_v) contiguous; table
-        (heads, table_size) contiguous, in any float type."""
+        last dimension contiguous; out (W, heads, N, d_v) and bias (heads, N, M)
+        contiguous."""
         operand = out_ptr.dtype.element_ty
         qb, wh = tl.program_id(0), tl.program_id(1)
         window, head = wh // heads, wh % heads
@@ -90,12 +88,7 @@ if AVAILABLE:
         )
         # Scores in base 2: exp2 is the hardware's exponential.
         qk_scale = scale * 1.4426950408889634
-        # Query and key codes whose difference is the relative position index: the
-        # query's carries the table's centre, the rest is (qy - ky) (2 Ww - 1) + qx - kx.
-        stride: tl.constexpr = 2 * window_w - 1
-        centre: tl.constexpr = (table_size - 1) // 2
-        q_code = (m // window_w) * stride + m % window_w + centre
-        row = table_ptr + head * table_size
+        bias_rows = bias_ptr + (head * n_queries + m[:, None]) * n_keys
         maximum = tl.full((block_m,), -float("inf"), tl.float32)
         denominator = tl.full((block_m,), 0, tl.float32)
         acc = tl.full((block_m, block_dv), 0, tl.float32)
@@ -116,10 +109,10 @@ if AVAILABLE:
             )
             score = tl.dot(q, k) * qk_scale
             if has_bias:
-                k_code = (n // window_w) * stride + n % window_w
-                index = q_code[:, None] - k_code[None, :]
                 bias = tl.load(
-                    row + index, (m[:, None] < n_queries) & inside[None, :], 0
+                    bias_rows + n[None, :],
+                    (m[:, None] < n_queries) & inside[None, :],
+                    0,
                 )
                 score += bias.to(tl.float32) * 1.4426950408889634
             score = tl.where(inside[None, :], score, -float("inf"))
@@ -145,17 +138,16 @@ def launch(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    bias: torch.Tensor | None,
     scale: float,
-    table: torch.Tensor | None,
-    window_w: int,
     block_m: int = 64,
     block_n: int = 64,
     num_warps: int = 4,
     num_stages: int = 2,
 ) -> torch.Tensor:
     """The kernel's output (W, heads, N, d_v) for q (W, heads, N, d_qk) and k, v
-    (W, heads, M, d), any strides with the last dimension contiguous; table
-    (heads, (2 Wh - 1) (2 Ww - 1)) contiguous, or None for no bias."""
+    (W, heads, M, d), any strides with the last dimension contiguous; bias (heads, N, M)
+    contiguous, or None."""
     windows, heads, n_queries, d_qk = q.shape
     n_keys, d_v = k.shape[2], v.shape[3]
     out = q.new_empty((windows, heads, n_queries, d_v))
@@ -165,7 +157,7 @@ def launch(
             q,
             k,
             v,
-            q if table is None else table,
+            q if bias is None else bias,
             out,
             *q.stride()[:3],
             *k.stride()[:3],
@@ -176,9 +168,7 @@ def launch(
             d_qk,
             d_v,
             scale,
-            window_w=window_w,
-            table_size=1 if table is None else table.shape[1],
-            has_bias=table is not None,
+            has_bias=bias is not None,
             block_m=block_m,
             block_n=block_n,
             block_dqk=_block(d_qk),
@@ -189,23 +179,38 @@ def launch(
     return out
 
 
+# plain_inference's module: the attention has no weights of its own, and q requires a
+# gradient whenever a weight before it does.
+_WEIGHTLESS = nn.Module().eval()
+
+
 def usable(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, module: nn.Module
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor | None
 ) -> bool:
-    """Whether the kernel may run module's window attention on q, k and v: plain eager
-    inference (plain_inference) on an NVIDIA GPU (a ROCm build keeps the PyTorch path),
-    FP16 or BF16 operands of one type, heads up to MAX_HEAD_WIDTH wide, the last
-    dimension contiguous."""
+    """Whether the kernel may run this attention: plain eager inference
+    (plain_inference: no tracing, export, compilation, autocast, dispatch mode or
+    gradient) on an NVIDIA GPU (a ROCm build keeps the PyTorch path), FP16 or BF16
+    operands of one type, heads up to MAX_HEAD_WIDTH wide with the last dimension
+    contiguous, and a bias, if any, one (heads, N, M) for all windows, contiguous."""
+    heads, n_queries = q.shape[1], q.shape[2]
     return (
         FLASH_WINDOW
         and q.is_cuda
         and torch.version.hip is None
         and q.dtype in (torch.float16, torch.bfloat16)
-        and k.dtype == q.dtype
-        and v.dtype == q.dtype
+        and k.dtype == v.dtype == q.dtype
         and max(q.shape[-1], v.shape[-1]) <= MAX_HEAD_WIDTH
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
-        and plain_inference(q, module)
+        and (
+            bias is None
+            or (
+                bias.dtype == q.dtype
+                and bias.is_contiguous()
+                and bias.shape[-3:] == (heads, n_queries, k.shape[2])
+                and bias.numel() == heads * n_queries * k.shape[2]
+            )
+        )
+        and plain_inference(q, _WEIGHTLESS)
     )
 
 
@@ -213,10 +218,8 @@ def flash_window_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    bias: torch.Tensor | None,
     scale: float,
-    module: nn.Module,
-    table: torch.Tensor | None = None,
-    window_w: int = 1,
 ) -> torch.Tensor | None:
     """softmax(q @ k^T * scale + bias) @ v from the kernel, or None when the caller's
     PyTorch path must run: the kernel may not run (usable), or it failed in Triton,
@@ -224,13 +227,12 @@ def flash_window_attention(
     are raised.
 
     q is (W, heads, N, d_qk), k and v (W, heads, M, d_qk / d_v); no head padding is
-    needed. table, for a bias, is the per-head compact table (heads, (2 Wh - 1)
-    (2 Ww - 1)), contiguous, of windows Wh x Ww = N = M tokens, Ww = window_w."""
+    needed. bias, (heads, N, M) or (1, heads, N, M), is the same for every window."""
     global FLASH_WINDOW
-    if not usable(q, k, v, module):
+    if not usable(q, k, v, bias):
         return None
     try:
-        return launch(q, k, v, scale, table, window_w)
+        return launch(q, k, v, bias, scale)
     except Exception as error:
         if not from_triton(error):
             raise

@@ -46,6 +46,8 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
+from ...__arch_helpers.flash_window import flash_window_attention
+
 if TYPE_CHECKING:
     from torch.nn.attention.flex_attention import BlockMask
 
@@ -1872,18 +1874,23 @@ class WindowAttentionRFB(nn.Module):
 
             q_aug = torch.cat([q * self.content_scale, bq], dim=-1)
             k_aug = torch.cat([k, bk], dim=-1)
-            v_aug = F.pad(v, (0, self.rank))
-            out = _scaled_dot_product_attention_export_safe(
-                q_aug,
-                k_aug,
-                v_aug,
-                attn_mask=None,
-                dropout_p=self.attn_drop_p,
-                scale=1.0,
-                training=self.training,
-                use_export_safe_math=use_export_safe_math,
-            )
-            out = out[..., : self.head_dim]
+            # spandrel: eager inference runs it in flash_window's kernel when it can,
+            # which takes v as it is; scaled_dot_product_attention's fused kernels
+            # want v as wide as q and k.
+            out = None
+            if not use_export_safe_math and not (self.training and self.attn_drop_p):
+                out = flash_window_attention(q_aug, k_aug, v, None, 1.0)
+            if out is None:
+                out = _scaled_dot_product_attention_export_safe(
+                    q_aug,
+                    k_aug,
+                    F.pad(v, (0, self.rank)),
+                    attn_mask=None,
+                    dropout_p=self.attn_drop_p,
+                    scale=1.0,
+                    training=self.training,
+                    use_export_safe_math=use_export_safe_math,
+                )[..., : self.head_dim]
 
         out = out.transpose(1, 2).reshape(b_windows, n_tokens, c)
         out = self.proj(out)

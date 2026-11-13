@@ -7,6 +7,8 @@ from contextvars import ContextVar
 import torch
 from torch.nn import functional as F
 
+from .flash_window import flash_window_attention
+
 _migraphx_export: ContextVar[bool] = ContextVar("migraphx_export", default=False)
 
 
@@ -62,7 +64,9 @@ def window_attention(
     (pad_heads); bias is (1, heads, N, M) and mask (nW, N, M), the same for every image.
 
     Runs use scaled_dot_product_attention (cuDNN or memory-efficient attention), which
-    takes bias and mask summed into one attn_mask. An ONNX export keeps the operations
+    takes bias and mask summed into one attn_mask. Windows without a mask (plain ones,
+    and the interior of shifted blocks) run in flash_window's kernel instead when it can
+    (eager FP16 or BF16 inference on an NVIDIA GPU with Triton). An ONNX export keeps the operations
     apart: TensorRT fuses them into its own attention kernel and adds bias and mask
     there, where their sum, (B*nW, heads, N, M), is a tensor as large as the attention
     matrix to write and read in every shifted block.
@@ -87,6 +91,10 @@ def window_attention(
             attn = attn.view(-1, nw, *attn.shape[1:]) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, *attn.shape[2:])
         return attn.softmax(dim=-1) @ v
+    if mask is None and dropout_p == 0.0:
+        out = flash_window_attention(q, k, v, bias, scale)
+        if out is not None:
+            return out
     if mask is not None:
         nw = mask.shape[0]
         mask = mask.unsqueeze(1)
