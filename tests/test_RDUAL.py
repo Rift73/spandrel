@@ -522,6 +522,40 @@ def test_local_na_kernel_stays_off_up_to_the_window_and_outside_inference(
     assert not calls
 
 
+# torch.jit.trace records the PyTorch form: a kernel launch would leave the traced
+# graph reading an output buffer it never fills
+@needs_kernel
+def test_traced_calls_take_the_pytorch_form(monkeypatch):
+    torch.manual_seed(0)
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    # the traced function closes over the weights: frozen, they become constants
+    attention = _local_attention(64).requires_grad_(False)
+    x = torch.randn(1, 64, 20, 18, device="cuda").bfloat16()
+    q = torch.randn(1, 128, 100, 98, device="cuda").bfloat16()
+    k, v = (torch.randn(1, 128, 50, 49, device="cuda").bfloat16() for _ in "kv")
+    log_tau = torch.randn(4, device="cuda") * 0.3
+
+    def local_na(x):
+        return attention.pre_gate_core(x)
+
+    def retrieval(q, k, v):
+        return rdual_arch.attend_packed(rdual_arch.pack_qk(q, k, na=True), v, log_tau)
+
+    local, retrieved = (
+        _counted(monkeypatch, "local_na"),
+        _counted(monkeypatch, "retrieval_na"),
+    )
+    with torch.no_grad():
+        traced_local = torch.jit.trace(local_na, x, check_trace=False)
+        traced_retrieval = torch.jit.trace(retrieval, (q, k, v), check_trace=False)
+        assert isinstance(traced_local, torch.jit.ScriptFunction)
+        assert isinstance(traced_retrieval, torch.jit.ScriptFunction)
+        assert not local and not retrieved
+        monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+        assert torch.equal(traced_local(x), attention.pre_gate_core(x))
+        assert torch.equal(traced_retrieval(q, k, v), retrieval(q, k, v))
+
+
 # coarse grids above 48 on one or both axes, odd fine sizes, batch 2; 48 x 45 keeps
 # the blocks
 @needs_kernel

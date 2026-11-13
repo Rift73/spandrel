@@ -892,6 +892,7 @@ class _SpatialAttention(nn.Module):
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
             and not torch.onnx.is_in_onnx_export()
+            and not torch.jit.is_tracing()
         )
         if eager_inference and na_kernel_usable(x.device, qkv.dtype, dim):
             u = self.window + 15
@@ -974,6 +975,7 @@ class _SpatialAttention(nn.Module):
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
             and not torch.onnx.is_in_onnx_export()
+            and not torch.jit.is_tracing()
         )
         if eager_inference and na_kernel_usable(x.device, qkv.dtype, dim):
             table = (
@@ -1223,6 +1225,7 @@ def attend_packed(packed: tuple, v: Tensor, log_tau: Tensor) -> Tensor:
             not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
             and not torch.onnx.is_in_onnx_export()
+            and not torch.jit.is_tracing()
             and na_kernel_usable(v.device, v.dtype, 32)
             and query.dtype == key.dtype == v.dtype
         ):
@@ -3367,10 +3370,13 @@ if _HAS_DIRECT_ATTENTION:
         wx = x - x0
         wy = y - y0
         base = b * S0 + (kv * 128 + head * 32 + d) * S1
-        a = tl.load(X + base + y0 * S2 + x0 * S3, ok, 0).to(tl.float32)
-        c = tl.load(X + base + y1 * S2 + x0 * S3, ok, 0).to(tl.float32)
-        e = tl.load(X + base + y1 * S2 + x1 * S3, ok, 0).to(tl.float32)
-        z = tl.load(X + base + y0 * S2 + x1 * S3, ok, 0).to(tl.float32)
+        # 64-bit row and column offsets: a channels-last row is 256 * W elements
+        r0, r1 = y0.to(tl.int64) * S2, y1.to(tl.int64) * S2
+        c0, c1 = x0.to(tl.int64) * S3, x1.to(tl.int64) * S3
+        a = tl.load(X + base + r0 + c0, ok, 0).to(tl.float32)
+        c = tl.load(X + base + r1 + c0, ok, 0).to(tl.float32)
+        e = tl.load(X + base + r1 + c1, ok, 0).to(tl.float32)
+        z = tl.load(X + base + r0 + c1, ok, 0).to(tl.float32)
         value = (
             a * ((1 - wx) * (1 - wy))
             + z * (wx * (1 - wy))
