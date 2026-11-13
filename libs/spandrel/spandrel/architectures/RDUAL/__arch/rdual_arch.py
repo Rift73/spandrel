@@ -1173,7 +1173,10 @@ class RegionalChannelAttention(nn.Module):
         yc = (y0 + 32).clamp(max=h) - y0.clamp(min=0)
         xc = (x0 + 32).clamp(max=w) - x0.clamp(min=0)
         count = (yc[:, None] * xc[None, :]).reshape(1, ny * nx, 1, 1)
-        a = self.channel_attention(windows(q), windows(k), count)
+        # Converted as they are cut, so the low-precision windows are not held
+        # beside their FP32 copies (channel_attention's conversion is then exact).
+        dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+        a = self.channel_attention(windows(q).to(dtype), windows(k).to(dtype), count)
         # Preserve the probability cast before the low-precision value product.
         # Keep matmul dtype explicit even under a surrounding autocast context.
         with torch.autocast(device_type=v.device.type, enabled=False):
@@ -4461,6 +4464,8 @@ class RDUAL(nn.Module):
         lr = self.xr.project(o * self.xr.gate(u).sigmoid())[:, :, :height, :width]
         hr = self.xr.hr(unpack_children(o))[:, :, : 2 * height, : 2 * width]
         h = h + lr
+        # Dead from here; the groups below are the step's largest working set.
+        del u, q, o, lr
         for group in self.groups[2:]:
             h = group(h)
         return h, hr, packed
@@ -4655,20 +4660,26 @@ class RDUAL(nn.Module):
         carried from frame count-1.
         """
         n = frames.shape[1]
-        prefix = [self._prefix(self._pad(frames[:, t])) for t in range(n)]
+        # Each frame is encoded when a sweep first reads it and released after
+        # its last reader: frames past count only by their reverse step.
+        prefix: dict[int, tuple[Tensor, ...]] = {}
         future: dict[int, Tensor] = {}
         state = None
         # Frame 0's reverse state would have no reader: frame t uses frame t+1's.
         for t in reversed(range(1, n)):
-            _, _, fine, h, key = prefix[t]
+            prefix[t] = self._prefix(self._pad(frames[:, t]))
+            _, _, fine, h, key = prefix[t] if t < count else prefix.pop(t)
             if state is not None:
                 h = self._fuse(h, [state], [edge[:, t]], [guidance[:, t, 1]], [_FUTURE])
             state = self._trunk(h, fine, key)[0]
             future[t] = state
+            del fine, h, key
         outputs = []
         state, first_flow, first_valid = (None, None, None) if past is None else past
         for t in range(count):
-            shifted, stem, fine, h, key = prefix[t]
+            if t not in prefix:
+                prefix[t] = self._prefix(self._pad(frames[:, t]))
+            shifted, stem, fine, h, key = prefix.pop(t)
             states, valid, flow, slots = [], [], [], []
             if state is not None:
                 states.append(state)
@@ -4676,7 +4687,7 @@ class RDUAL(nn.Module):
                 flow.append(guidance[:, t - 1, 0] if t else first_flow)
                 slots.append(_PAST)
             if t + 1 < n:
-                states.append(future[t + 1])
+                states.append(future.pop(t + 1))
                 valid.append(edge[:, t])
                 flow.append(guidance[:, t, 1])
                 slots.append(_FUTURE)
