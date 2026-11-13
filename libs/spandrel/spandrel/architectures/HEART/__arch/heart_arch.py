@@ -404,6 +404,8 @@ class RIBWindowAttention(nn.Module):
             d**-0.5,
         )
         if out is not None:
+            # qkv is three times the output: gone before the projection allocates its own
+            del qkv
             return F.linear(out, self.to_out.weight.flatten(1), self.to_out.bias)
         q, k, v = (
             qkv[..., i * c : (i + 1) * c][:, rows, cols].view(
