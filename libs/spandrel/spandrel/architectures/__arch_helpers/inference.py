@@ -7,6 +7,8 @@ no caches, and so do models on ROCm, whose depthwise kernels take channels first
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -207,3 +209,77 @@ def shifted_window_attention(
     )
     x[:, rows_last, cols] = windows2img(border[:, n_right:].flatten(0, 1), H_sp, W_sp, H_sp, W)
     return x
+
+
+def tail_scale_and_halo(tail: nn.Module) -> tuple[int, int] | None:
+    """(scale, halo) of a high-resolution tail that banded_tail can run: its leaves are
+    stride-1 convolutions padded to their kernel's half (each needs that many neighbouring
+    rows at its own resolution), nearest upsamplings and pixel shuffles by whole factors
+    (rows map to factor rows), and pointwise activations. The halo is in rows of the tail's
+    input: ceil(padding / scale so far) per convolution. None for any other leaf."""
+    scale, halo = 1, 0
+    for m in tail.modules():
+        if next(m.children(), None) is not None:
+            continue
+        if isinstance(m, nn.Conv2d):
+            kh = m.kernel_size[0]
+            if (
+                m.stride != (1, 1)
+                or m.dilation != (1, 1)
+                or not isinstance(m.padding, tuple)
+                or m.padding[0] != kh // 2
+                or kh % 2 == 0
+                or m.padding_mode != "zeros"
+            ):
+                return None
+            halo += -(-m.padding[0] // scale)
+        elif isinstance(m, nn.Upsample):
+            factor = m.scale_factor
+            if m.mode != "nearest" or not isinstance(factor, (int, float)) or factor != int(factor):
+                return None
+            scale *= int(factor)
+        elif isinstance(m, nn.PixelShuffle):
+            scale *= m.upscale_factor
+        elif not isinstance(m, (nn.LeakyReLU, nn.ReLU, nn.PReLU, nn.SiLU, nn.GELU, nn.Identity)):
+            return None
+    return scale, halo
+
+
+def banded_tail(
+    tail: Callable[[torch.Tensor], torch.Tensor],
+    x: torch.Tensor,
+    scale: int,
+    halo: int,
+    rows: int,
+) -> torch.Tensor:
+    """tail(x) for a tail that upscales x (B, C, H, W) by `scale` with `halo` rows of
+    context per side (tail_scale_and_halo), computed on bands of `rows` rows of x and written
+    into one output: the same values as the whole pass (each band sees every row its output
+    rows depend on; at the image's edges the convolutions pad as they do there), while only
+    one band's high-resolution activations exist at a time. One band is the whole pass."""
+    h = x.shape[2]
+    if h <= rows:
+        return tail(x)
+    out = None
+    for start in range(0, h, rows):
+        end = min(h, start + rows)
+        lo, hi = max(0, start - halo), min(h, end + halo)
+        y = tail(x[:, :, lo:hi])
+        if out is None:
+            layout = (
+                torch.channels_last
+                if y.dim() == 4 and y.is_contiguous(memory_format=torch.channels_last)
+                else torch.contiguous_format
+            )
+            out = torch.empty(
+                (*y.shape[:2], h * scale, y.shape[3]),
+                dtype=y.dtype,
+                device=y.device,
+                memory_format=layout,
+            )
+        out[:, :, start * scale : end * scale] = y[
+            :, :, (start - lo) * scale : (end - lo) * scale
+        ]
+        del y
+    assert out is not None
+    return out

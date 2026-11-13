@@ -7,11 +7,22 @@ import math
 import torch
 import torch.nn as nn
 
+from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
 
 from ...__arch_helpers import block as B
-from ...__arch_helpers.inference import traced
+from ...__arch_helpers.inference import banded_tail, tail_scale_and_halo, traced
 from ...__arch_helpers.padding import pad_to_multiple
+
+# The high-resolution tail (upsampling, HRconv, conv_last) runs in bands of a BAND_DIVISOR-th
+# of the trunk's rows, at least MIN_BAND_ROWS; a trunk of WHOLE_TAIL_ROWS rows or fewer runs it
+# whole, where bands only add launches. Its two 64-channel tensors at the output's size set
+# the peak otherwise. A 4x model at 1920x1080 in FP16 on an RTX 5090: 7.97 -> 2.28 GiB
+# allocated (4.0 -> 1.15 KiB per input pixel), 13.45 -> 3.56 GiB reserved, in the same time;
+# bands of a fourth reserved 7.60 GiB, of a sixteenth the same as an eighth.
+BAND_DIVISOR = 8
+MIN_BAND_ROWS = 32
+WHOLE_TAIL_ROWS = 256
 
 
 @store_hyperparameters()
@@ -145,7 +156,28 @@ class RRDBNet(nn.Module):
             x = torch.pixel_unshuffle(x, downscale_factor=self.shuffle_factor)
         if channels_last:
             x = x.to(memory_format=torch.channels_last)
-        x = self.model(x)
+        plan = self.tail_plan(x)
+        if plan is None:
+            x = self.model(x)
+        else:
+            x = self.model[1](self.model[0](x))
+            trunk_rows = x.shape[2]
+            rows = (
+                trunk_rows
+                if trunk_rows <= WHOLE_TAIL_ROWS
+                # an 8x tail's band holds four times a 4x one's pixels per row
+                else max(MIN_BAND_ROWS, trunk_rows // (BAND_DIVISOR * max(1, plan[0] // 4) ** 2))
+            )
+            x = banded_tail(self.model[2:], x, *plan, rows=rows)
         if self.shuffle_factor:
             x = x[:, :, : h * true_scale, : w * true_scale]
         return x.contiguous() if channels_last else x
+
+    def tail_plan(self, x: torch.Tensor) -> tuple[int, int] | None:
+        """(scale, halo) for banding the high-resolution tail in plain eager inference on an
+        NVIDIA GPU (any precision); None for the whole pass: tracing, export, training,
+        ROCm, the CPU, a tail of no upscaling, or one tail_scale_and_halo cannot band."""
+        if not (x.is_cuda and torch.version.hip is None and plain_inference(x, self)):
+            return None
+        plan = tail_scale_and_halo(self.model[2:])
+        return plan if plan is not None and plan[0] > 1 else None
