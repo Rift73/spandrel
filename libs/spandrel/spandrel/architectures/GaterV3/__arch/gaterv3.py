@@ -9,7 +9,10 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
 
+from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
+
+from ...__arch_helpers.inference import banded_tail, tail_scale_and_halo, traced
 
 # The upsampler code below (DySample to UniUpsampleV3) is resselt's gaterv3.3.
 # gaterv3.2 (the GitHub repo, traiNNer-redux) has UniUpsample, MetaUpsample
@@ -804,6 +807,15 @@ class Block(nn.Module):
             return self.gated(x)
 
 
+# spandrel: the high-resolution tail runs in bands of trunk rows above this many rows, each
+# band a divisor's share of them but at least MIN_BAND_ROWS. Its tail is light (32 channels
+# in, 48 inside), so up to 512 rows the whole pass is faster: 8 bands of a 512x512 image
+# took 4 % longer on an RTX 5090.
+BAND_DIVISOR = 8
+MIN_BAND_ROWS = 32
+WHOLE_TAIL_ROWS = 512
+
+
 @store_hyperparameters()
 class GateRV3(nn.Module):
     hyperparameters = {}
@@ -927,5 +939,33 @@ class GateRV3(nn.Module):
         for index in range(len_block):
             x = self.decode[index](x, shorts[index])
 
-        x = self.dim_to_in(x + sisr) + self.gamma * self.short_to_dim(inp)
+        x = x + sisr
+        del sisr
+        plan = self.tail_plan(x)
+        if plan is None:
+            x = self.dim_to_in(x)
+        else:
+            trunk_rows = x.shape[2]
+            rows = (
+                trunk_rows
+                if trunk_rows <= WHOLE_TAIL_ROWS
+                # an 8x tail's band holds four times a 4x one's pixels per row
+                else max(
+                    MIN_BAND_ROWS,
+                    trunk_rows // (BAND_DIVISOR * max(1, plan[0] // 4) ** 2),
+                )
+            )
+            x = banded_tail(self.dim_to_in, x, *plan, rows=rows)
+        x = x + self.gamma * self.short_to_dim(inp)
         return x[:, :, : H * self.scale, : W * self.scale]
+
+    def tail_plan(self, x: Tensor) -> tuple[int, int] | None:
+        """spandrel: (scale, halo) for banding the upsampler in plain eager inference on an
+        NVIDIA GPU (any precision); None for the whole pass: tracing, export, training,
+        ROCm, the CPU, no upscaling, or an upsampler tail_scale_and_halo cannot band."""
+        if not (x.is_cuda and torch.version.hip is None and plain_inference(x, self)):
+            return None
+        if traced():
+            return None
+        plan = tail_scale_and_halo(self.dim_to_in)
+        return plan if plan is not None and plan[0] > 1 else None

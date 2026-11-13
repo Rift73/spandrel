@@ -246,3 +246,54 @@ def test_three_levels_need_a_multiple_of_eight():
     model = GateRV3(enc_blocks=(1, 1, 1), dec_blocks=(1, 1, 1))
     descriptor = MAIN_REGISTRY.load(model.state_dict())
     assert descriptor.size_requirements.multiple_of == 8
+
+
+def forced_bands(monkeypatch: pytest.MonkeyPatch, rows: int) -> None:
+    """The banded tail on the CPU, in bands of `rows` trunk rows."""
+    from spandrel.architectures.__arch_helpers.inference import tail_scale_and_halo
+    from spandrel.architectures.GaterV3.__arch import gaterv3
+
+    monkeypatch.setattr(
+        gaterv3.GateRV3,
+        "tail_plan",
+        lambda self, _x: tail_scale_and_halo(self.dim_to_in),
+    )
+    monkeypatch.setattr(gaterv3, "WHOLE_TAIL_ROWS", 0)
+    monkeypatch.setattr(gaterv3, "MIN_BAND_ROWS", rows)
+    monkeypatch.setattr(gaterv3, "BAND_DIVISOR", 10**6)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"scale": 2}, {"scale": 3}, {"scale": 4}, {"upsample": "pixelshuffledirect"}],
+    ids=str,
+)
+def test_the_banded_tail_computes_the_whole_pass(monkeypatch, kwargs):
+    from spandrel.architectures.GaterV3.__arch import gaterv3
+
+    torch.manual_seed(0)
+    model = GateRV3(
+        enc_blocks=(1, 1, 1), dec_blocks=(1, 1, 1), num_latent=1, **kwargs
+    ).eval()
+    calls: list[int] = []
+    banded_tail = gaterv3.banded_tail
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return banded_tail(*args, **kw)
+
+    image = torch.rand(1, 3, 24, 40)
+    with torch.no_grad():
+        whole = model(image)
+        forced_bands(monkeypatch, rows=3)
+        monkeypatch.setattr(gaterv3, "banded_tail", counted)
+        banded = model(image)
+    assert calls
+    torch.testing.assert_close(banded, whole, atol=1e-5, rtol=0)
+
+
+def test_on_the_cpu_and_in_a_trace_the_tail_runs_whole():
+    model = GateRV3(enc_blocks=(1, 1, 1), dec_blocks=(1, 1, 1), num_latent=1).eval()
+    image = torch.rand(1, 3, 24, 40)
+    with torch.no_grad():
+        assert model.tail_plan(image) is None
