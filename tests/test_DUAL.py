@@ -472,9 +472,7 @@ def _local_attention(channels, window):
     return attention.cuda().eval().half()
 
 
-# batch 2, non-square, partial 8x8 query tiles, above the window on one or both
-# axes, and a 2,080 x 2,080 map: 67,600 query tiles, past the 65,535 programs a
-# second grid axis holds
+# batch 2, non-square, partial 8x8 query tiles, above the window on one or both axes
 @needs_kernel
 @pytest.mark.parametrize(
     ("batch", "channels", "window", "shape"),
@@ -483,7 +481,6 @@ def _local_attention(channels, window):
         (1, 128, 16, (17, 200)),
         (1, 64, 16, (96, 9)),
         (2, 64, 8, (25, 13)),
-        (1, 32, 16, (2080, 2080)),
     ],
 )
 def test_local_na_kernel_matches_the_pytorch_form(
@@ -523,8 +520,7 @@ def _retrieval_operands(batch, channels, fine, coarse):
     return q, k, v, log_tau
 
 
-# coarse grids above 48 on one or both axes, odd fine sizes, batch 2, and a
-# 2,100 x 2,100 query map: 69,169 query tiles, past a second grid axis
+# coarse grids above 48 on one or both axes, odd fine sizes, batch 2
 @needs_kernel
 @pytest.mark.parametrize(
     ("batch", "channels", "fine", "coarse"),
@@ -532,7 +528,6 @@ def _retrieval_operands(batch, channels, fine, coarse):
         (2, 128, (100, 98), (50, 49)),
         (1, 64, (120, 60), (60, 30)),
         (2, 64, (97, 41), (49, 21)),
-        (1, 32, (2100, 2100), (1050, 1050)),
     ],
 )
 def test_retrieval_na_kernel_matches_the_pytorch_form(
@@ -557,6 +552,70 @@ def test_retrieval_na_kernel_stays_off_up_to_48(monkeypatch):
     with torch.no_grad():
         dual_arch.attend_packed(dual_arch.pack_qk(q, k, na=True), v, log_tau)
     assert not calls
+
+
+# 2,056 x 2,056 queries are 66,049 tiles of 8x8, past the 65,535 programs a second
+# grid axis holds; one head keeps the tensors as small as that grid allows. The
+# queries checked are the last tile's (the programs past 65,535) and the corners.
+_GRID_SIDE = 2056
+
+
+def _grid_queries():
+    last = torch.arange(_GRID_SIDE - 8, _GRID_SIDE)
+    ys = torch.cat([last.repeat_interleave(8), torch.tensor([0, 0, 1031, 2055])])
+    xs = torch.cat([last.repeat(8), torch.tensor([0, 2055, 517, 0])])
+    return ys.cuda(), xs.cuda()
+
+
+def _neighborhoods(ys, xs, side, size):
+    """Row-major key positions of each query's clamped size x size neighborhood."""
+    offsets = torch.arange(size, device=ys.device)
+    starts = [(t - size // 2).clamp(0, side - size) for t in (ys, xs)]
+    ky = (starts[0][:, None] + offsets).repeat_interleave(size, 1)
+    kx = (starts[1][:, None] + offsets).repeat(1, size)
+    return ky, kx
+
+
+@needs_kernel
+def test_local_na_kernel_covers_more_tiles_than_a_grid_axis_holds():
+    torch.manual_seed(0)
+    side, window = _GRID_SIDE, 16
+    qkv = torch.randn(1, side * side, 96, device="cuda").half()
+    table = (torch.randn(1, (2 * window - 1) ** 2, device="cuda") * 0.5).half()
+    with torch.no_grad():
+        out = na_local_triton.local_na(qkv, table, side, side, window)
+    ys, xs = _grid_queries()
+    ky, kx = _neighborhoods(ys, xs, side, window)
+    tokens = qkv[0].float()
+    q = (tokens[ys * side + xs, :32] * 32**-0.5).half().float()
+    keys = tokens[ky * side + kx]
+    dy, dx = ys[:, None] - ky + window - 1, xs[:, None] - kx + window - 1
+    bias = table[0].float()[dy * (2 * window - 1) + dx]
+    logits = (keys[..., 32:64] @ q[:, :, None])[..., 0] + bias
+    expected = (logits.softmax(-1)[..., None] * keys[..., 64:]).sum(1)
+    torch.testing.assert_close(out[0, ys, xs].float(), expected, rtol=0, atol=2e-3)
+
+
+@needs_kernel
+def test_retrieval_na_kernel_covers_more_tiles_than_a_grid_axis_holds():
+    torch.manual_seed(0)
+    side, coarse, window = _GRID_SIDE, _GRID_SIDE // 2, 48
+    q = torch.randn(1, 32, side, side, device="cuda").half()
+    k = torch.randn(1, 32, coarse, coarse, device="cuda").half()
+    v = torch.randn(1, 32, coarse, coarse, device="cuda").half()
+    tau = torch.tensor([1.5], device="cuda").half()
+    with torch.no_grad():
+        out = na_local_triton.retrieval_na(q, k, v, tau)
+    ys, xs = _grid_queries()
+    ky, kx = _neighborhoods(ys // 2, xs // 2, coarse, window)
+    query = (q[0, :, ys, xs].float().t() * tau.float()).half().float()
+    keys, values = (t[0, :, ky, kx].float().permute(1, 2, 0) for t in (k, v))
+    scale = math.log(window * window) / (math.log(1024) * math.sqrt(32))
+    logits = (keys @ query[:, :, None])[..., 0] * scale
+    expected = (logits.softmax(-1)[..., None] * values).sum(1)
+    torch.testing.assert_close(
+        out[0, :, ys, xs].float().t(), expected, rtol=0, atol=2e-3
+    )
 
 
 class _TritonError(Exception):
