@@ -278,15 +278,14 @@ class RIBWindowAttention(nn.Module):
         pad_w = (self.window_size[1] - w % self.window_size[1]) % self.window_size[1]
         return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
 
-    def _flash_cat_attn(
-        self,
+    @staticmethod
+    def _cat_position(
         q: torch.Tensor,
         k: torch.Tensor,
-        v: torch.Tensor,
         pos_q: torch.Tensor,
         pos_k: torch.Tensor,
-    ) -> torch.Tensor:
-        # q, k, v: (Bwin, N, heads, D); pos_q, pos_k: (Bwin, heads, N, R)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # q, k: (Bwin, N, heads, D); pos_q, pos_k: (Bwin, heads, N, R)
         d = q.shape[-1]
         pos_q = pos_q.transpose(1, 2)  # (Bwin, N, heads, R)
         pos_k = pos_k.transpose(1, 2)
@@ -294,8 +293,14 @@ class RIBWindowAttention(nn.Module):
 
         q = q * (d**-0.5)
         pos_q = pos_q * (r**-0.5)
-        q_cat = torch.cat([q, pos_q], dim=-1)
-        k_cat = torch.cat([k, pos_k], dim=-1)
+        return torch.cat([q, pos_q], dim=-1), torch.cat([k, pos_k], dim=-1)
+
+    def _flash_cat_attn(
+        self, q_cat: torch.Tensor, k_cat: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        # q_cat, k_cat: (Bwin, N, heads, D + R); v: (Bwin, N, heads, D)
+        d = v.shape[-1]
+        r = q_cat.shape[-1] - d
 
         # spandrel: eager inference runs it in flash_window's kernel when it can,
         # which takes q, k and v as they are; scaled_dot_product_attention's fused
@@ -346,15 +351,20 @@ class RIBWindowAttention(nn.Module):
         )
 
         qkv = self.to_qkv(x)
-        qkv = rearrange(
-            qkv,
-            "b (qkv heads c) (h wh) (w ww) -> qkv (b h w) (wh ww) heads c",
-            heads=self.num_heads,
-            wh=self.window_size[0],
-            ww=self.window_size[1],
-            qkv=3,
-        )
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (Bwin, N, heads, D)
+        del x
+        # spandrel: q, k and v in tensors of their own, so that q's and k's memory
+        # is freed once their position features are attached
+        q, k, v = (
+            rearrange(
+                part,
+                "b (heads c) (h wh) (w ww) -> (b h w) (wh ww) heads c",
+                heads=self.num_heads,
+                wh=self.window_size[0],
+                ww=self.window_size[1],
+            )
+            for part in qkv.chunk(3, dim=1)
+        )  # (Bwin, N, heads, D)
+        del qkv
 
         # RIB position features (fp32 for fp16-inference stability)
         intermediate = F.relu(
@@ -374,7 +384,10 @@ class RIBWindowAttention(nn.Module):
         )  # (Bwin, heads, N, R)
         k_pos = k_pos.to(k.dtype).unsqueeze(0).expand(bwin, -1, -1, -1)
 
-        out = self._flash_cat_attn(q, k, v, q_pos, k_pos)  # (Bwin, N, heads, D)
+        q_cat, k_cat = self._cat_position(q, k, q_pos, k_pos)
+        del q, k
+        out = self._flash_cat_attn(q_cat, k_cat, v)  # (Bwin, N, heads, D)
+        del q_cat, k_cat, v
 
         out = rearrange(
             out,

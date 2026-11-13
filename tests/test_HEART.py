@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 import torch
+from einops import rearrange
 from torch import nn
 
 from spandrel import MAIN_REGISTRY
@@ -285,3 +286,63 @@ def test_tail_plan_bands_only_eager_nvidia_inference(monkeypatch: pytest.MonkeyP
         assert _small(upscale=1).eval().tail_plan(x) is None
         monkeypatch.setattr(torch.version, "hip", "7.0")
         assert _small(upscale=4).eval().tail_plan(x) is None
+
+
+def _attention_before_early_freeing(attn, x: torch.Tensor) -> torch.Tensor:
+    """RIBWindowAttention as published: one rearrange of q, k and v together, kept to the
+    end."""
+    _, _, h, w = x.shape
+    ws = attn.window_size[0]
+    s = ws // 2 if attn.shift else 0
+    if s:
+        x = torch.nn.functional.pad(x, (s, s, s, s), mode="reflect")
+    hd, wd = x.shape[2] // ws, x.shape[3] // ws
+    qkv = rearrange(
+        attn.to_qkv(x),
+        "b (qkv heads c) (h wh) (w ww) -> qkv (b h w) (wh ww) heads c",
+        heads=attn.num_heads,
+        wh=ws,
+        ww=ws,
+        qkv=3,
+    )
+    q, k, v = qkv[0], qkv[1], qkv[2]
+    hidden = torch.relu(attn.rib_coords @ attn.to_hidden + attn.hidden_b)
+    q_pos = torch.einsum("nd,hdr->hnr", hidden, attn.to_q).expand(
+        q.shape[0], -1, -1, -1
+    )
+    k_pos = torch.einsum("nd,hdr->hnr", hidden, attn.to_k).expand(
+        q.shape[0], -1, -1, -1
+    )
+    d, r = q.shape[-1], q_pos.shape[-1]
+    q_cat = torch.cat([q * d**-0.5, q_pos.transpose(1, 2) * r**-0.5], -1)
+    k_cat = torch.cat([k, k_pos.transpose(1, 2)], -1)
+    pad = -q_cat.shape[-1] % 8
+    out = torch.nn.functional.scaled_dot_product_attention(
+        torch.nn.functional.pad(q_cat, (0, pad)).transpose(1, 2),
+        torch.nn.functional.pad(k_cat, (0, pad)).transpose(1, 2),
+        torch.nn.functional.pad(v, (0, r + pad)).transpose(1, 2),
+        scale=1.0,
+    ).transpose(1, 2)[..., :d]
+    out = rearrange(
+        out,
+        "(b h w) (wh ww) heads c -> b (heads c) (h wh) (w ww)",
+        h=hd,
+        w=wd,
+        wh=ws,
+        ww=ws,
+    )
+    return attn.to_out(out[:, :, s : s + h, s : s + w])
+
+
+@pytest.mark.parametrize("shift", [False, True])
+def test_early_freeing_keeps_the_attentions_output(shift: bool):
+    torch.manual_seed(0)
+    attn = heart_arch.RIBWindowAttention(
+        dim=24, window_size=32, num_heads=2, shift=shift
+    )
+    for p in attn.parameters():
+        nn.init.normal_(p, 0, 0.1)
+    attn.eval()
+    x = torch.rand(1, 24, 64, 96)
+    with torch.no_grad():
+        assert torch.equal(attn(x), _attention_before_early_freeing(attn, x))
