@@ -333,7 +333,7 @@ def test_the_export_names_are_the_architecture_modules_own():
 
 @pytest.mark.skipif(
     not (
-        rdual_arch._HAS_DIRECT_ATTENTION
+        hasattr(rdual_arch, "direct_attention")
         and torch.cuda.is_available()
         and torch.version.hip is None
     ),
