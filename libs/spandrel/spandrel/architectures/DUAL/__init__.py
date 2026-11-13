@@ -197,6 +197,10 @@ class DUALArch(Architecture[DUAL]):
             # wherever it is defined (RFB bias and dot attention), legacy
             # non-overlapping windows otherwise.
             context_na=c_pos_bias == "rfb" and qk == "dot",
+            # the local layers' neighborhoods need dot attention (their dense bias is
+            # every DUAL's); the retrieval's need nothing
+            local_na=qk == "dot",
+            retrieval_na=True,
             g_window=g_window,
             c_pos_bias=c_pos_bias,
             rfb_rank=rfb_rank,

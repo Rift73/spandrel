@@ -552,6 +552,100 @@ def _na_triton_usable(module: nn.Module, x: Tensor, dim: int) -> bool:
     )
 
 
+# Attention elements per SDPA call before tiled local/retrieval NA splits tiles.
+_NA_ELEMENT_CAP = 2**27
+
+
+@dataclass
+class NAGeometry:
+    """Tiled neighborhood indices; tiles of one class share one mask.
+
+    Tile (ty, tx) holds row-major query slots, clamped to the last position, and
+    reads a fixed key union. ``inside`` marks each slot's own neighborhood per
+    class; ``offset_y``/``offset_x`` give query minus key in unit-stride units.
+    """
+
+    window: tuple[int, int]
+    tiles: tuple[int, int]
+    queries: Tensor
+    keys: Tensor
+    tile_class: Tensor
+    inside: Tensor
+    offset_y: Tensor
+    offset_x: Tensor
+
+
+@lru_cache(maxsize=32)
+def na_geometry(
+    query_shape: tuple[int, int],
+    key_shape: tuple[int, int],
+    window: int,
+    tile: int,
+    stride: int,
+    device: torch.device,
+) -> NAGeometry:
+    """Query i attends keys clamp(i // stride - K // 2, 0, L - K) + [0, K).
+
+    K = min(window, L) per axis for L keys. Integer geometry only: the cached
+    tensors never hold weights and are read by index operations alone.
+    """
+    axes = []
+    for length, keys in zip(query_shape, key_shape, strict=True):
+        size = min(window, keys)
+        queries = [
+            [min(t + j, length - 1) for j in range(tile)]
+            for t in range(0, length, tile)
+        ]
+        starts = [
+            [min(max(q // stride - size // 2, 0), keys - size) for q in row]
+            for row in queries
+        ]
+        union = min(keys, size + max(s[-1] - s[0] for s in starts))
+        origins = [min(s[0], keys - union) for s in starts]
+        classes: dict[tuple, int] = {}
+        tile_class = [
+            classes.setdefault(
+                (tuple(v - o for v in s), tuple(q - stride * o for q in row)),
+                len(classes),
+            )
+            for row, s, o in zip(queries, starts, origins, strict=True)
+        ]
+        axes.append((size, union, queries, origins, tile_class, tuple(classes)))
+    with torch.inference_mode(False):
+        tensors = []
+        for size, union, queries, origins, tile_class, classes in axes:
+            positions = torch.arange(union, device=device)
+            start = torch.tensor([c[0] for c in classes], device=device)[..., None]
+            relative = torch.tensor([c[1] for c in classes], device=device)
+            tensors.append(
+                (
+                    torch.tensor(queries, device=device),
+                    torch.tensor(origins, device=device)[:, None] + positions,
+                    torch.tensor(tile_class, device=device),
+                    (positions >= start) & (positions < start + size),
+                    relative[..., None] - positions,
+                )
+            )
+        (qy, ky, cy, iy, oy), (qx, kx, cx, ix, ox) = tensors
+        classes_y, classes_x = iy.shape[0], ix.shape[0]
+        return NAGeometry(
+            (axes[0][0], axes[1][0]),
+            (qy.shape[0], qx.shape[0]),
+            (qy[:, None, :, None] * query_shape[1] + qx[None, :, None, :]).reshape(
+                -1, tile * tile
+            ),
+            (ky[:, None, :, None] * key_shape[1] + kx[None, :, None, :]).reshape(
+                qy.shape[0] * qx.shape[0], -1
+            ),
+            (cy[:, None] * classes_x + cx[None, :]).reshape(-1),
+            (iy[:, None, :, None, :, None] & ix[None, :, None, :, None, :]).reshape(
+                classes_y * classes_x, tile * tile, -1
+            ),
+            oy,
+            ox,
+        )
+
+
 class _SpatialAttention(_WindowAttention):
     """Original projections with optional per-query context neighborhoods."""
 
@@ -586,6 +680,8 @@ class _SpatialAttention(_WindowAttention):
         if context_na and (pos_bias != "rfb" or self.logit_scale is not None):
             raise ValueError("context_na requires RFB bias and dot-product attention")
         self.context_na = context_na
+        # DUAL enables this on its dense-RPB local layers; see _local_na_core.
+        self.local_na = False
         self.direct_fallback_reason: str | None = None
 
     @property
@@ -907,12 +1003,78 @@ class _SpatialAttention(_WindowAttention):
         # features, and low-precision rounding depends on the path.
         return output[:, :height, :width].permute(0, 3, 1, 2).contiguous()
 
+    def _local_na_core(self, x: Tensor) -> Tensor:
+        """Per-query window neighborhoods with dense RPB, batched in 8x8 tiles.
+
+        Each tile reads a (window+7)^2 key union; a per-class float mask adds the
+        layer's own bias inside each query's neighborhood and -inf outside.
+        """
+        if self.pos_bias != "rpb" or self.logit_scale is not None:
+            raise ValueError("local_na requires RPB bias and dot-product attention")
+        batch, channels, height, width = x.shape
+        heads, dim, tile, window = self.heads, channels // self.heads, 8, self.window
+        geometry = na_geometry(
+            (height, width), (height, width), window, tile, 1, x.device
+        )
+        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+        qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        query = query * (dim**-0.5)
+        dtype = query.dtype
+        span = 2 * window - 1
+        index = (
+            (geometry.offset_y + window - 1)[:, None, :, None, :, None] * span
+            + (geometry.offset_x + window - 1)[None, :, None, :, None, :]
+        ).reshape(geometry.inside.shape)
+        index = index.where(geometry.inside, 0)
+        bias = (
+            self.relative_bias.to(calculation_dtype(dtype))[index]
+            .permute(0, 3, 1, 2)
+            .masked_fill(~geometry.inside[:, None], float("-inf"))
+            .to(dtype)
+        )
+        count, keys = geometry.queries.shape[1], geometry.keys.shape[1]
+        step = max(1, _NA_ELEMENT_CAP // (batch * heads * count * keys))
+
+        def gather(t: Tensor, index: Tensor) -> Tensor:
+            return (
+                t.index_select(2, index.reshape(-1))
+                .reshape(batch, heads, index.shape[0], index.shape[1], dim)
+                .transpose(1, 2)
+                .reshape(batch, index.shape[0] * heads, index.shape[1], dim)
+            )
+
+        outputs = []
+        for first in range(0, geometry.queries.shape[0], step):
+            queries = geometry.queries[first : first + step]
+            keys_index = geometry.keys[first : first + step]
+            mask = bias.index_select(0, geometry.tile_class[first : first + step])
+            outputs.append(
+                F.scaled_dot_product_attention(
+                    gather(query, queries),
+                    gather(key, keys_index),
+                    gather(value, keys_index),
+                    attn_mask=mask.reshape(1, -1, count, keys),
+                    dropout_p=0.0,
+                    scale=1.0,
+                )
+            )
+        ty, tx = geometry.tiles
+        return (
+            torch.cat(outputs, 1)
+            .reshape(batch, ty, tx, heads, tile, tile, dim)
+            .permute(0, 3, 6, 1, 4, 2, 5)
+            .reshape(batch, channels, ty * tile, tx * tile)[:, :, :height, :width]
+        )
+
     def pre_gate_core(self, x: Tensor) -> Tensor:
         if x.ndim != 4 or x.shape[1] != self.channels or min(x.shape[2:]) < 1:
             raise ValueError("expected nonempty BCHW input with matching channels")
         batch, channels, height, width = x.shape
         if self.context_na and (height > self.window or width > self.window):
             return self._na_core(x)
+        if self.local_na and (height > self.window or width > self.window):
+            return self._local_na_core(x)
         wh, ww = min(height, self.window), min(width, self.window)
         if (
             self.window_mode == "anchored"
@@ -1098,7 +1260,19 @@ def unpack_grandchildren(x: Tensor) -> Tensor:
     return F.pixel_shuffle(raw.reshape(b, c, h, w), 4)
 
 
-def pack_qk(q: Tensor, k: Tensor) -> tuple:
+def pack_qk(q: Tensor, k: Tensor, *, na: bool = False) -> tuple:
+    """Pair 96px query blocks with half-resolution keys, batching equal shapes.
+
+    With na=True and a coarse grid above 48 on either axis, each fine query
+    instead keeps its own 48x48 coarse-key neighborhood (8x8 query tiles).
+    """
+    if na and max(k.shape[-2:]) > 48:
+        batch, heads = q.shape[0], q.shape[1] // 32
+        geometry = na_geometry(
+            tuple(q.shape[-2:]), tuple(k.shape[-2:]), 48, 8, 2, q.device
+        )
+        query, key = (t.reshape(batch * heads, 32, -1).transpose(1, 2) for t in (q, k))
+        return geometry, (query, key), q.shape
     layout = block_layout(*q.shape[-2:], 96)
     classes = []
     for _, items in grouped_layout(layout):
@@ -1116,6 +1290,45 @@ def pack_qk(q: Tensor, k: Tensor) -> tuple:
 
 def attend_packed(packed: tuple, v: Tensor, log_tau: Tensor) -> Tensor:
     layout, classes, batch = packed
+    if isinstance(layout, NAGeometry):
+        query, key = classes
+        images, channels, height, width = batch
+        heads = channels // 32
+        value = v.reshape(query.shape[0], 32, -1).transpose(1, 2)
+        tau = log_tau.exp().clamp(0.1, 10).to(query.dtype).repeat(images)
+        query = query * tau[:, None, None]
+        count, keys = layout.queries.shape[1], layout.keys.shape[1]
+        step = max(1, _NA_ELEMENT_CAP // (query.shape[0] * count * keys))
+        scale = math.log(layout.window[0] * layout.window[1]) / (
+            math.log(1024) * math.sqrt(32)
+        )
+
+        def gather(t: Tensor, index: Tensor) -> Tensor:
+            return t.index_select(1, index.reshape(-1)).reshape(
+                t.shape[0], index.shape[0], index.shape[1], 32
+            )
+
+        outputs = []
+        for first in range(0, layout.queries.shape[0], step):
+            keys_index = layout.keys[first : first + step]
+            classes_index = layout.tile_class[first : first + step]
+            mask = layout.inside.index_select(0, classes_index)
+            outputs.append(
+                F.scaled_dot_product_attention(
+                    gather(query, layout.queries[first : first + step]),
+                    gather(key, keys_index),
+                    gather(value, keys_index),
+                    attn_mask=mask[None],
+                    scale=scale,
+                )
+            )
+        ty, tx = layout.tiles
+        return (
+            torch.cat(outputs, 1)
+            .reshape(images, heads, ty, tx, 8, 8, 32)
+            .permute(0, 1, 6, 2, 4, 3, 5)
+            .reshape(images, channels, ty * 8, tx * 8)[:, :, :height, :width]
+        )
     outputs = [None] * len(layout)
     for items, qq, kk in classes:
         vs = [pack_block(v, tuple(t // 2 for t in block)) for _, block in items]
@@ -1797,6 +2010,8 @@ class DUAL(nn.Module):
         c_windows: tuple[int, int] = (32, 64),
         context_na: bool | None = None,
         context_overlap: bool | None = None,
+        local_na: bool = True,
+        retrieval_na: bool = True,
         g_window: int = 16,
         norm: Literal["token"] = "token",
         c_pos_bias: str = "rfb",
@@ -1814,6 +2029,11 @@ class DUAL(nn.Module):
         if type(pixel_unshuffle) is not bool:
             raise ValueError("pixel_unshuffle must be a bool")
         context_na = _resolve_context_na(context_na, context_overlap, default=True)
+        for name, value in (("local_na", local_na), ("retrieval_na", retrieval_na)):
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be a bool")
+        if local_na and qk != "dot":
+            raise ValueError("local_na requires qk='dot'; disable local_na for cosine")
         if scale not in (1, 2, 4) or norm != "token":
             raise ValueError("DUAL requires scale 1/2/4 and token normalization")
         if not isinstance(embed_dim, int) or embed_dim < 32 or embed_dim % 32:
@@ -1862,6 +2082,8 @@ class DUAL(nn.Module):
         self.compile_g_attention_impl = compile_g_attention_impl
         self.scale = scale
         self.context_na = context_na
+        self.local_na = local_na
+        self.retrieval_na = retrieval_na
         self.unshuffle = pixel_unshuffle
         self.internal_scale = scale * (2 if pixel_unshuffle else 1)
         self.selected_original_indices = selected
@@ -1908,6 +2130,8 @@ class DUAL(nn.Module):
         self.xr = CrossScaleRetrieval(channels, include_hr=self.internal_scale >= 2)
         self.xg = SecondOctaveTransfer(channels) if self.internal_scale >= 4 else None
         for group in self.groups:
+            for index in (0, 1, 3, 4):
+                group.layers[index].attention.local_na = local_na
             for index in (2, 5):
                 group.layers[index] = DualContextLayer(
                     group.layers[index], core_checkpoint=dual_core_checkpoint
@@ -1991,7 +2215,7 @@ class DUAL(nn.Module):
         u = self.xr.norm_u(pad_even(h))
         q = self.xr.query(torch.cat((self.xr.norm_f(pad_even(fine)), u), 1))
         k = self.xr.key(self.xr.norm_f(coarse))
-        packed = pack_qk(q, k)
+        packed = pack_qk(q, k, na=self.retrieval_na)
         o = attend_packed(packed, pack_children(self.xr.value(u)), self.xr.log_tau)
         lr = self.xr.project(o * self.xr.gate(u).sigmoid())[:, :, :height, :width]
         hr = (
@@ -2041,6 +2265,7 @@ class DUAL(nn.Module):
         for layer in self.modules():
             if (
                 isinstance(layer, _SpatialAttention)
+                and not layer.local_na
                 and layer.pos_bias == "rpb"
                 and layer.window_mode == "anchored"
                 and layer.window in (16, 32)

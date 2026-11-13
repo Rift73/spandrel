@@ -42,7 +42,7 @@ def test_load():
         lambda: _small(c_pos_bias="rib", rfb_rank=8, context_na=False),
         lambda: _small(c_pos_bias="none", context_na=False),
         lambda: _small(rfb_rank=8),
-        lambda: _small(qk="cosine", context_na=False),
+        lambda: _small(qk="cosine", context_na=False, local_na=False),
         lambda: _small(g_window=8),
         lambda: _small(dynamic_experts=2),
         lambda: DUAL(embed_dim=32, depths=(2, 4), layer_indices=((0, 1), (2, 3, 4, 5))),
@@ -58,7 +58,7 @@ def test_load():
         ({}, True),
         ({"c_pos_bias": "rib", "context_na": False}, False),
         ({"c_pos_bias": "none", "context_na": False}, False),
-        ({"qk": "cosine", "context_na": False}, False),
+        ({"qk": "cosine", "context_na": False, "local_na": False}, False),
     ],
 )
 def test_context_na(kwargs, expected):
@@ -309,3 +309,134 @@ def test_half_survives_a_last_group_beyond_fp16(groups):
 def test_size_requirements():
     assert_size_requirements(DUALArch().load(_small(scale=2).state_dict()))
     assert_size_requirements(DUALArch().load(_small(pixel_unshuffle=True).state_dict()))
+
+
+def _local_na_reference(attention, x):
+    """Dense FP64 attention in which every query sees only its own clamped
+    window x window neighborhood, with the dense RPB of the query-minus-key offset."""
+    batch, channels, height, width = x.shape
+    heads, dim, window = attention.heads, channels // attention.heads, attention.window
+    kh, kw = min(height, window), min(width, window)
+    yy, xx = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+    y, z = yy.flatten(), xx.flatten()
+    sy = (y - kh // 2).clamp(0, height - kh)
+    sz = (z - kw // 2).clamp(0, width - kw)
+    inside = (
+        (y >= sy[:, None])
+        & (y < sy[:, None] + kh)
+        & (z >= sz[:, None])
+        & (z < sz[:, None] + kw)
+    )
+    span = 2 * window - 1
+    dy = (y[:, None] - y + window - 1).clamp(0, span - 1)
+    dz = (z[:, None] - z + window - 1).clamp(0, span - 1)
+    bias = attention.relative_bias[dy * span + dz].permute(2, 0, 1)
+    tokens = x.flatten(2).transpose(1, 2)
+    qkv = attention.qkv(tokens).reshape(batch, -1, 3, heads, dim)
+    query, key, value = qkv.permute(2, 0, 3, 1, 4)
+    logits = query @ key.transpose(-1, -2) * dim**-0.5 + bias
+    weights = logits.masked_fill(~inside, -math.inf).softmax(-1)
+    return (weights @ value).transpose(-1, -2).reshape(batch, channels, height, width)
+
+
+# above the window on one or both axes, odd sizes, partial 8x8 query tiles, batch 2
+@pytest.mark.parametrize("grad", [False, True])
+@pytest.mark.parametrize(
+    ("window", "shape"), [(16, (17, 30)), (16, (40, 9)), (6, (13, 21)), (8, (25, 25))]
+)
+def test_local_na_matches_dense_reference(window, shape, grad):
+    torch.manual_seed(0)
+    attention = _SpatialAttention(8, 2, window, pos_bias="rpb").double().eval()
+    assert attention.relative_bias is not None
+    attention.relative_bias.data.normal_(0, 0.5)
+    attention.local_na = True
+    x = torch.randn(2, 8, *shape, dtype=torch.float64)
+    with torch.set_grad_enabled(grad):
+        actual = attention.pre_gate_core(x)
+    with torch.no_grad():
+        expected = _local_na_reference(attention, x)
+    torch.testing.assert_close(actual.detach(), expected, rtol=0, atol=1e-10)
+
+
+def test_local_na_keeps_the_window_path_up_to_the_window():
+    torch.manual_seed(0)
+    attention = _SpatialAttention(8, 2, 16, pos_bias="rpb").eval()
+    x = torch.randn(1, 8, 16, 12)
+    with torch.no_grad():
+        expected = attention.pre_gate_core(x)
+        attention.local_na = True
+        assert torch.equal(attention.pre_gate_core(x), expected)
+
+
+def _retrieval_reference(q, k, v, log_tau, window=48):
+    """Dense FP64 retrieval: fine query (y, x) attends the window x window coarse keys
+    around (y // 2, x // 2), clamped inside the coarse grid."""
+    batch, channels, height, width = q.shape
+    heads = channels // 32
+    kh_, kw_ = k.shape[-2:]
+    kh, kw = min(window, kh_), min(window, kw_)
+    yy, xx = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+    y, z = yy.flatten(), xx.flatten()
+    ky, kx = torch.meshgrid(torch.arange(kh_), torch.arange(kw_), indexing="ij")
+    ky, kx = ky.flatten(), kx.flatten()
+    sy = (y // 2 - kh // 2).clamp(0, kh_ - kh)
+    sz = (z // 2 - kw // 2).clamp(0, kw_ - kw)
+    inside = (
+        (ky >= sy[:, None])
+        & (ky < sy[:, None] + kh)
+        & (kx >= sz[:, None])
+        & (kx < sz[:, None] + kw)
+    )
+    tau = log_tau.exp().clamp(0.1, 10)
+    query = q.reshape(batch, heads, 32, -1).transpose(-1, -2) * tau[None, :, None, None]
+    key = k.reshape(batch, heads, 32, -1).transpose(-1, -2)
+    value = v.reshape(batch, heads, 32, -1).transpose(-1, -2)
+    scale = math.log(kh * kw) / (math.log(1024) * math.sqrt(32))
+    logits = (query @ key.transpose(-1, -2) * scale).masked_fill(~inside, -math.inf)
+    out = logits.softmax(-1) @ value
+    return out.transpose(-1, -2).reshape(batch, channels, height, width)
+
+
+@pytest.mark.parametrize("coarse", [(49, 30), (30, 52), (50, 50)])
+def test_retrieval_na_matches_dense_reference(coarse):
+    torch.manual_seed(0)
+    ch, cw = coarse
+    q = torch.randn(2, 64, 2 * ch, 2 * cw, dtype=torch.float64)
+    k = torch.randn(2, 64, ch, cw, dtype=torch.float64)
+    v = torch.randn(2, 64, ch, cw, dtype=torch.float64)
+    log_tau = torch.randn(2, dtype=torch.float64) * 0.3
+    packed = dual_arch.pack_qk(q, k, na=True)
+    assert isinstance(packed[0], dual_arch.NAGeometry)
+    actual = dual_arch.attend_packed(packed, v, log_tau)
+    expected = _retrieval_reference(q, k, v, log_tau)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-10)
+
+
+def test_retrieval_na_keeps_the_blocks_up_to_48():
+    q = torch.randn(1, 64, 96, 90)
+    k = torch.randn(1, 64, 48, 45)
+    blocks = dual_arch.pack_qk(q, k)
+    packed = dual_arch.pack_qk(q, k, na=True)
+    assert not isinstance(packed[0], dual_arch.NAGeometry)
+    v = torch.randn(1, 64 * 4, 48, 45)
+    log_tau = torch.zeros(2)
+    assert torch.equal(
+        dual_arch.attend_packed(packed, v, log_tau),
+        dual_arch.attend_packed(blocks, v, log_tau),
+    )
+
+
+def test_every_dot_dual_loads_with_local_and_retrieval_na():
+    cosine = _small(qk="cosine", context_na=False, local_na=False)
+    for source, local in ((dual_light(2), True), (cosine, False)):
+        model = DUALArch().load(source.state_dict()).model
+        assert model.local_na is local
+        assert model.retrieval_na
+        layers = [
+            a.local_na
+            for a in model.modules()
+            if isinstance(a, _SpatialAttention) and a.pos_bias == "rpb"
+        ]
+        assert layers and all(layer is local for layer in layers)
+    with pytest.raises(ValueError, match="local_na requires"):
+        _small(qk="cosine", context_na=False)
