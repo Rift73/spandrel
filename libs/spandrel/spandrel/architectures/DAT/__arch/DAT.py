@@ -742,7 +742,9 @@ class Adaptive_Channel_Attention(_Derived):
 
         attn = _row_gram(_unit_length(q), _unit_length(k), H, W) * self.temperature
         attn = self.attn_drop(attn.softmax(dim=-1))
-        attened_x = (attn @ v.transpose(-2, -1)).permute(0, 3, 1, 2).reshape(B, N, C)
+        # (attn @ v^T)^T in token order: as a view of the channel-major product, the adds
+        # below would read it transposed, at a cost that grows faster than the image
+        attened_x = (v @ attn.transpose(-2, -1)).transpose(1, 2).reshape(B, N, C)
 
         # channels last from here: the convolutions read and write the tokens where they are
         conv_x = _dwconv(self, tokens[:, :, 2].reshape(B, H, W, C).permute(0, 3, 1, 2))

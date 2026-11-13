@@ -230,6 +230,18 @@ def test_half_channel_attention_normalizes_in_fp32():
     assert all(node.inputsAt(0).node().kind() == "aten::to" for node in norms)
 
 
+def test_channel_attention_in_token_order_matches_the_traced_form():
+    # The run computes the attention's output as v @ attn^T, in token order; the traced
+    # form (exports, ROCm) as attn @ v^T, transposed: the same values
+    torch.manual_seed(0)
+    attention = Adaptive_Channel_Attention(dim=24, num_heads=2).eval()
+    x = torch.rand(2, 8 * 12, 24)
+    with torch.no_grad():
+        run = attention(x, 8, 12)
+        traced = attention.forward_traced(x, 8, 12)
+    torch.testing.assert_close(run, traced, rtol=0, atol=1e-6)
+
+
 @pytest.mark.parametrize("migraphx", [False, True])
 def test_export_operations_match_the_run(migraphx):
     # Spatial, channel and shifted spatial attention: the export's explicit operations,
