@@ -75,6 +75,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from ...__arch_helpers.flash_window import flash_window_attention
+from ...__arch_helpers.padded_norm import KernelLayerNorm
 
 if TYPE_CHECKING:
     from torch.nn.attention.flex_attention import BlockMask
@@ -1363,7 +1364,7 @@ class ACTBlock(nn.Module):
         ), "shift_size must be in [0, window_size)"
 
         # Normalization: iLN returns (normalized_output, std), LayerNorm returns tensor
-        self.norm1 = iLN(dim) if use_iln else nn.LayerNorm(dim)
+        self.norm1 = iLN(dim) if use_iln else KernelLayerNorm(dim)
 
         # Window Attention with rank-factored bias
         self.attn = WindowAttentionRFB(
@@ -1394,7 +1395,7 @@ class ACTBlock(nn.Module):
         # Drop path for stochastic depth
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        self.norm2 = iLN(dim) if use_iln else nn.LayerNorm(dim)
+        self.norm2 = iLN(dim) if use_iln else KernelLayerNorm(dim)
         self.ffn = ConvSwiGLUFFN(dim=dim, expansion_factor=mlp_ratio, drop=drop)
 
     def forward(
@@ -1556,7 +1557,7 @@ class OCAB(nn.Module):
         self.scale = head_dim**-0.5
 
         # Normalization: iLN returns (normalized_output, std), LayerNorm returns tensor
-        self.norm1 = iLN(dim) if use_iln else nn.LayerNorm(dim)
+        self.norm1 = iLN(dim) if use_iln else KernelLayerNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.unfold = nn.Unfold(
             kernel_size=(self.overlap_win_size, self.overlap_win_size),
@@ -1576,7 +1577,7 @@ class OCAB(nn.Module):
         self.ls_attn = LayerScale(dim, init_value=layer_scale_init)
         self.ls_ffn = LayerScale(dim, init_value=layer_scale_init)
 
-        self.norm2 = iLN(dim) if use_iln else nn.LayerNorm(dim)
+        self.norm2 = iLN(dim) if use_iln else KernelLayerNorm(dim)
         self.ffn = ConvSwiGLUFFN(dim=dim, expansion_factor=mlp_ratio)
 
     @property
@@ -2226,7 +2227,7 @@ class DRFT(nn.Module):
         # Final norm selection:
         # iLN path: AffineTransform (no re-normalization after iLN stages)
         # Standard path: LayerNorm
-        self.norm = AffineTransform(embed_dim) if use_iln else nn.LayerNorm(embed_dim)
+        self.norm = AffineTransform(embed_dim) if use_iln else KernelLayerNorm(embed_dim)
 
         # Feature fusion before upsampling
         self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)

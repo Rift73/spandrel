@@ -23,6 +23,7 @@ from ...__arch_helpers.inference import (
     traced,
     windows2img,
 )
+from ...__arch_helpers.padded_norm import KernelLayerNorm
 from ...__arch_helpers.padding import pad_to_multiple
 
 
@@ -969,6 +970,10 @@ class HAT(nn.Module):
         num_feat=64,
     ):
         super().__init__()
+        # spandrel: the trunk's LayerNorms run spandrel's kernel in eager CUDA inference
+        # (KernelLayerNorm: nn.LayerNorm's parameters, keys and exports)
+        if norm_layer is nn.LayerNorm:
+            norm_layer = KernelLayerNorm
 
         self.window_size = window_size
         self.shift_size = window_size // 2

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 from torch import nn
@@ -166,3 +168,81 @@ def test_the_source_must_be_affine_and_narrower():
         padded_norm.PaddedLayerNorm(nn.LayerNorm(180, elementwise_affine=False), 184)
     with pytest.raises(ValueError, match="affine"):
         padded_norm.PaddedLayerNorm(nn.LayerNorm(180), 176)
+
+
+def kernel_norm(width: int = 180) -> padded_norm.KernelLayerNorm:
+    torch.manual_seed(0)
+    module = padded_norm.KernelLayerNorm(width)
+    nn.init.normal_(module.weight, 1, 0.2)
+    nn.init.normal_(module.bias, 0, 0.2)
+    return module.eval()
+
+
+@needs_kernel
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("width", [180, 192, 144])
+def test_the_unpadded_kernel_matches_layer_norm(width: int, dtype: torch.dtype):
+    module = kernel_norm(width).cuda().to(dtype)
+    x = (torch.randn(3, 1001, width, device="cuda") * 3 + 0.5).to(dtype)
+    launches: list[int] = []
+    launch = padded_norm.launch
+
+    def counted(*args: Any, **kwargs: Any) -> torch.Tensor:
+        launches.append(1)
+        return launch(*args, **kwargs)
+
+    with torch.no_grad():
+        padded_norm.launch = counted
+        try:
+            out = module(x)
+        finally:
+            padded_norm.launch = launch
+        expected = nn.LayerNorm.forward(module, x)
+    reference = layer_norm(
+        x.float(), (width,), module.weight.float(), module.bias.float(), 1e-5
+    )
+    assert launches and out.dtype == dtype and out.shape == x.shape
+    kernel_error = (out.float() - reference).abs().max().item()
+    torch_error = (expected.float() - reference).abs().max().item()
+    assert kernel_error <= 2 * torch_error + 1e-3, (kernel_error, torch_error)
+
+
+def test_the_unpadded_norm_is_a_layer_norm_with_its_keys():
+    module = kernel_norm()
+    assert isinstance(module, nn.LayerNorm)
+    assert set(module.state_dict()) == {"weight", "bias"}
+    x = torch.randn(5, 180)
+    with torch.no_grad():
+        torch.testing.assert_close(module(x), nn.LayerNorm.forward(module, x))
+
+
+def test_the_unpadded_norm_takes_pytorchs_path_where_the_kernel_may_not_run(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def launch(*_: object) -> torch.Tensor:
+        raise AssertionError("the kernel ran")
+
+    monkeypatch.setattr(padded_norm, "launch", launch)
+    module = kernel_norm()
+    with torch.no_grad():
+        module(torch.randn(5, 180))  # the CPU; FP32
+    monkeypatch.setattr(padded_norm, "usable", lambda *_: True)
+    # An input in another type than the weights: nn.LayerNorm's own error, not the kernel.
+    with torch.no_grad(), pytest.raises(RuntimeError, match="dtype"):
+        module.half()(torch.randn(5, 180))
+
+
+def test_a_triton_failure_switches_the_unpadded_norm_to_pytorch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def launch(*_: object) -> torch.Tensor:
+        raise RuntimeError("kernel launch") from _TritonError("ast.Num")
+
+    monkeypatch.setattr(padded_norm, "PADDED_NORM", True)
+    monkeypatch.setattr(padded_norm, "usable", lambda *_: True)
+    monkeypatch.setattr(padded_norm, "launch", launch)
+    module = kernel_norm()
+    x = torch.randn(5, 180)
+    with torch.no_grad():
+        torch.testing.assert_close(module(x), nn.LayerNorm.forward(module, x))
+    assert not padded_norm.PADDED_NORM

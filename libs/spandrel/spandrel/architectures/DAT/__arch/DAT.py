@@ -29,6 +29,7 @@ from ...__arch_helpers.inference import (
 )
 from ...__arch_helpers.inference import padded_rows as _padded_rows
 from ...__arch_helpers.inference import traced as _traced
+from ...__arch_helpers.padded_norm import KernelLayerNorm
 
 
 def _unit_length(x):
@@ -60,7 +61,7 @@ class SpatialGate(_Derived):
 
     def __init__(self, dim):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
+        self.norm = KernelLayerNorm(dim)
         self.conv = nn.Conv2d(
             dim, dim, kernel_size=3, stride=1, padding=1, groups=dim
         )  # DW Conv
@@ -1093,6 +1094,10 @@ class DAT(nn.Module):
         upsampler="pixelshuffle",
     ):
         super().__init__()
+        # spandrel: the trunk's LayerNorms run spandrel's kernel in eager CUDA inference
+        # (KernelLayerNorm: nn.LayerNorm's parameters, keys and exports)
+        if norm_layer is nn.LayerNorm:
+            norm_layer = KernelLayerNorm
 
         num_in_ch = in_chans
         num_out_ch = in_chans
