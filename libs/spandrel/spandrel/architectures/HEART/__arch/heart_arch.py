@@ -383,13 +383,15 @@ class RIBWindowAttention(nn.Module):
         window, as (B, H, W, C). The projections are linear maps on the tokens; one
         gather pads (shifted windows) and partitions each of q, k and v, and one
         gathers the windows back and crops."""
-        b, h, w, c = x.shape
+        b, h, w, _ = x.shape
         ws = self.window_size[0]
         s = ws // 2 if self.shift else 0
         hd, wd = (h + 2 * s) // ws, (w + 2 * s) // ws
         rows = _reflect_index(h, s, x.device).view(hd, 1, ws, 1)
         cols = _reflect_index(w, s, x.device).view(1, wd, 1, ws)
         qkv = F.linear(x, self.to_qkv.weight.flatten(1), self.to_qkv.bias)
+        # the attention's width, which a copy with a wider trunk keeps
+        c = qkv.shape[-1] // 3
         pos_q, pos_k = self._positions(1, qkv.dtype)
         d, r = c // self.num_heads, pos_q.shape[-1]
         out = heart_window_attention(

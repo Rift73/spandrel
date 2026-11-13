@@ -16,7 +16,7 @@ from spandrel.architectures.DRCT import DRCT
 from spandrel.architectures.DRFT import DRFT
 from spandrel.architectures.HAT import HAT
 from spandrel.architectures.HEART import HEART, HEARTArch
-from spandrel.architectures.HEART.__arch import heart_arch
+from spandrel.architectures.HEART.__arch import heart_arch, iln_triton
 from spandrel.architectures.HEART.__arch import window_triton as heart_window
 from spandrel.architectures.SST.__arch import sst_arch
 from spandrel.architectures.Swin2SR import Swin2SR
@@ -432,3 +432,23 @@ def test_the_heart_window_kernel_stays_off_on_the_cpu():
     qkv = torch.rand(1, 32, 32, 72).half()
     with torch.no_grad():
         assert not heart_window.usable(qkv, 32)
+
+
+@pytest.mark.parametrize(("real", "padded"), [(24, 32), (180, 184), (24, 24)])
+def test_padded_iln_counts_the_real_channels(real: int, padded: int):
+    # the CPU computes the kernels' values with PyTorch's operations
+    torch.manual_seed(0)
+    source = heart_arch.iLN(real)
+    with torch.no_grad():
+        source.weight.uniform_(0.5, 1.5)
+        source.bias.uniform_(-0.2, 0.2)
+    norm = iln_triton.PaddedILN(source, padded).eval()
+    x = torch.randn(2, 37 * 45, real) * 3 + 1
+    with torch.no_grad():
+        expected, expected_std = source(x)
+        actual, std = norm(torch.nn.functional.pad(x, (0, padded - real)))
+    torch.testing.assert_close(std, expected_std, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual[..., :real], expected, rtol=1e-4, atol=1e-4)
+    assert torch.equal(actual[..., real:], torch.zeros_like(actual[..., real:]))
+    with pytest.raises(ValueError):
+        iln_triton.PaddedILN(source, real - 1)
