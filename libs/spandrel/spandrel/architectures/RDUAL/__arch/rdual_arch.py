@@ -4027,6 +4027,8 @@ class NeuFlowV2(nn.Module):
                 corrs, context_s16, iter_context, flow, grids["radius_s16"]
             )
             flow = flow + delta_flow
+        # The 1/16 volume is read by the iteration above only.
+        del corr_s16, corrs
 
         flow = F.interpolate(flow, scale_factor=2, mode="nearest") * 2
         features_s16 = F.interpolate(features_s16, scale_factor=2, mode="nearest")
