@@ -481,6 +481,7 @@ def _local_attention(channels, window):
         (1, 128, 16, (17, 200)),
         (1, 64, 16, (96, 9)),
         (2, 64, 8, (25, 13)),
+        (1, 64, 16, (5, 40)),
     ],
 )
 def test_local_na_kernel_matches_the_pytorch_form(
@@ -509,6 +510,13 @@ def test_local_na_kernel_stays_off_up_to_the_window_and_outside_inference(
         attention.pre_gate_core(torch.randn(1, 64, 16, 16, device="cuda").half())
         attention.float().pre_gate_core(torch.randn(1, 64, 17, 17, device="cuda"))
     attention.half().pre_gate_core(torch.randn(1, 64, 17, 17, device="cuda").half())
+    with torch.no_grad():
+        attention.bfloat16().pre_gate_core(
+            torch.randn(1, 64, 17, 17, device="cuda").bfloat16()
+        )
+        attention.half()
+        with torch.autocast("cuda", torch.float16):
+            attention.pre_gate_core(torch.randn(1, 64, 17, 17, device="cuda").half())
     assert not calls
 
 
@@ -528,6 +536,8 @@ def _retrieval_operands(batch, channels, fine, coarse):
         (2, 128, (100, 98), (50, 49)),
         (1, 64, (120, 60), (60, 30)),
         (2, 64, (97, 41), (49, 21)),
+        (1, 64, (2, 120), (1, 60)),
+        (2, 64, (6, 99), (3, 50)),
     ],
 )
 def test_retrieval_na_kernel_matches_the_pytorch_form(
@@ -551,6 +561,25 @@ def test_retrieval_na_kernel_stays_off_up_to_48(monkeypatch):
     calls = _counted(monkeypatch, "retrieval_na")
     with torch.no_grad():
         dual_arch.attend_packed(dual_arch.pack_qk(q, k, na=True), v, log_tau)
+    assert not calls
+
+
+@needs_kernel
+def test_retrieval_na_kernel_stays_off_outside_fp16_cuda_inference(monkeypatch):
+    q, k, v, log_tau = _retrieval_operands(1, 64, (100, 98), (50, 49))
+    calls = _counted(monkeypatch, "retrieval_na")
+
+    def attend(*operands):
+        q, k, v, log_tau = operands
+        return dual_arch.attend_packed(dual_arch.pack_qk(q, k, na=True), v, log_tau)
+
+    with torch.no_grad():
+        for dtype in (torch.float32, torch.bfloat16):
+            attend(*(t.to(dtype) for t in (q, k, v, log_tau)))
+        attend(*(t.float().cpu() for t in (q, k, v, log_tau)))
+        with torch.autocast("cuda", torch.float16):
+            attend(q, k, v, log_tau)
+    attend(q, k, v, log_tau)
     assert not calls
 
 
@@ -616,6 +645,32 @@ def test_retrieval_na_kernel_covers_more_tiles_than_a_grid_axis_holds():
     torch.testing.assert_close(
         out[0, :, ys, xs].float().t(), expected, rtol=0, atol=2e-3
     )
+
+
+# a 4x model on a 104 px input: local layers above 16 positions and a 52-wide coarse
+# grid run both kernels, the retrieval once and again in the second-octave transfer
+@needs_kernel
+def test_a_4x_forward_with_the_kernels_matches_the_pytorch_form(monkeypatch):
+    torch.manual_seed(0)
+    model = _small(scale=4).cuda().eval()
+    x = torch.rand(1, 3, 104, 96, device="cuda")
+    local, retrieval = (
+        _counted(monkeypatch, "local_na"),
+        _counted(monkeypatch, "retrieval_na"),
+    )
+    with torch.no_grad():
+        reference = model(x)
+        model.half()
+        assert not local and not retrieval
+        actual = model(x.half()).float()
+        assert local and len(retrieval) == 2
+        monkeypatch.setattr(dual_arch, "LOCAL_NA_TRITON", False)
+        monkeypatch.setattr(dual_arch, "RETRIEVAL_NA_TRITON", False)
+        expected = model(x.half()).float()
+    assert actual.shape == (1, 3, 416, 384)
+    kernel_error = (actual - reference).square().mean().sqrt()
+    pytorch_error = (expected - reference).square().mean().sqrt()
+    assert kernel_error <= pytorch_error * 1.1 + 1e-6
 
 
 class _TritonError(Exception):

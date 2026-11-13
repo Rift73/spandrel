@@ -66,7 +66,8 @@ if AVAILABLE:
         d = tl.arange(0, 32)
         r = tl.arange(0, 16)
         n = tl.arange(0, block_n)
-        pix = qy * width + qx
+        # 64-bit element offsets: an image's qkv may pass 2^31 elements
+        pix = qy.to(tl.int64) * width + qx
         q = tl.load(qkv_ptr + pix[:, None] * (3 * channels) + head * 32 + d[None, :])
         q = (q.to(tl.float32) * 0.1767766952966369).to(operand)
         bqi = (qy - by) * u + (qx - bx)
@@ -86,7 +87,7 @@ if AVAILABLE:
             # The union's row stride stays M + 15; columns past its width are not
             # loaded, and keys outside it fail every query's neighborhood test.
             inside = (ns < rows * u) & (ns % u < uw)
-            kp = ky * width + kx
+            kp = ky.to(tl.int64) * width + kx
             bi = (ky - by) * u + kx - bx
             k = tl.load(
                 qkv_ptr
