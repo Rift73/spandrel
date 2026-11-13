@@ -17,6 +17,7 @@ from spandrel.architectures.DRFT import DRFT
 from spandrel.architectures.HAT import HAT
 from spandrel.architectures.HEART import HEART, HEARTArch
 from spandrel.architectures.HEART.__arch import heart_arch
+from spandrel.architectures.HEART.__arch import window_triton as heart_window
 from spandrel.architectures.SST.__arch import sst_arch
 from spandrel.architectures.Swin2SR import Swin2SR
 from spandrel.architectures.SwinIR import SwinIR
@@ -402,3 +403,32 @@ def test_token_layout_stays_off_where_the_original_layout_runs(
     assert not heart_arch.token_layout(x, model)
     with torch.no_grad():
         assert not heart_arch.token_layout(x, model.train())
+
+
+@pytest.mark.skipif(
+    not (
+        heart_window.AVAILABLE
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the kernel runs on NVIDIA GPUs with Triton",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("h", "w"), [(70, 45), (32, 32), (20, 100)])
+def test_heart_window_kernel_matches_the_gathered_windows(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, w: int
+):
+    torch.manual_seed(0)
+    model = _small(depths=(3, 2)).eval().cuda().to(dtype)
+    image = torch.rand(1, 3, h, w, device="cuda", dtype=dtype)
+    with torch.no_grad():
+        actual = model(image)
+        monkeypatch.setattr(heart_window, "HEART_WINDOW", False)
+        expected = model(image)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0.02)
+
+
+def test_the_heart_window_kernel_stays_off_on_the_cpu():
+    qkv = torch.rand(1, 32, 32, 72).half()
+    with torch.no_grad():
+        assert not heart_window.usable(qkv, 32)

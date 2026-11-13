@@ -32,6 +32,7 @@ from ...__arch_helpers.inference import (
     tail_scale_and_halo,
     traced,
 )
+from .window_triton import heart_window_attention
 
 # spandrel: the high-resolution tail (conv_before_upsample, upsample, conv_last) runs in
 # bands of a BAND_DIVISOR-th of the padded trunk's rows, at least MIN_BAND_ROWS, as ESRGAN's
@@ -389,6 +390,19 @@ class RIBWindowAttention(nn.Module):
         rows = _reflect_index(h, s, x.device).view(hd, 1, ws, 1)
         cols = _reflect_index(w, s, x.device).view(1, wd, 1, ws)
         qkv = F.linear(x, self.to_qkv.weight.flatten(1), self.to_qkv.bias)
+        pos_q, pos_k = self._positions(1, qkv.dtype)
+        d, r = c // self.num_heads, pos_q.shape[-1]
+        out = heart_window_attention(
+            qkv,
+            (pos_q[0] * r**-0.5).contiguous(),
+            pos_k[0].contiguous(),
+            self.num_heads,
+            ws,
+            s,
+            d**-0.5,
+        )
+        if out is not None:
+            return F.linear(out, self.to_out.weight.flatten(1), self.to_out.bias)
         q, k, v = (
             qkv[..., i * c : (i + 1) * c][:, rows, cols].view(
                 b * hd * wd, ws * ws, self.num_heads, -1
