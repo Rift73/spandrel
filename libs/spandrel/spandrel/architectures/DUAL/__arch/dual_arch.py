@@ -25,8 +25,9 @@ for context_na, NOT a way to select the retired overlap-add implementation.
 Routing is NOT stored in weights; inference/export must select it explicitly.
 Local G16 attention and the regional channel-attention mixer are unchanged.
 NA requires the default RFB positional bias and dot-product attention. Its
-differentiable SDPA path supports training; the separate optimized TensorRT
-NA plugin is inference-only and is not used by this architecture.
+differentiable SDPA path supports training. spandrel: eager CUDA inference
+runs NA as one Triton kernel (na_triton.py, chaiNNer-C's TensorRT plugin
+kernel) when Triton imports, and the SDPA path otherwise.
 
 Dependencies: PyTorch. (spandrel: the traiNNer registration and the optional
 Triton direct attention of the original file are not bundled; see below.) No
@@ -41,6 +42,7 @@ cd50b9a8e761d59f66130151ea55ff721b148d64eeab6ac9e945debe45c98ca7.
 
 from __future__ import annotations
 
+import logging
 import math
 import warnings
 from copy import deepcopy
@@ -53,7 +55,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
+
+from . import na_triton
+
+logger = logging.getLogger("spandrel.dual")
 
 __all__ = ["DUAL", "dual_light", "dual_xs", "dual_s", "dual_m", "dual_l", "dual_xl"]
 
@@ -521,6 +528,41 @@ def _eager_inference(module: nn.Module) -> bool:
 # call of _na_inference covers: its query, key and value copies scale with it.
 NA_INFERENCE_MASK_ELEMENTS = 2**27
 
+# spandrel: eager CUDA inference runs the neighborhood attention as one Triton kernel
+# (na_triton.py) when Triton imports; a kernel that fails to compile or launch turns
+# this off for the rest of the process, and the PyTorch path below runs instead.
+NA_TRITON = na_triton.AVAILABLE
+
+
+def _na_triton_usable(module: nn.Module, x: Tensor, dim: int) -> bool:
+    """Whether the Triton NA kernel may run this layer: plain eager inference (no
+    tracing, export, compile, gradients, autocast or dispatch mode) on an NVIDIA GPU,
+    FP16 features, heads of 32 and a window of 32 or 64. BF16 keeps the PyTorch path:
+    on a 2x DUAL Light the kernel's image differs from it by RMS 0.0013 in BF16, and
+    by RMS 0.00016 in FP16."""
+    return (
+        NA_TRITON
+        and x.is_cuda
+        and torch.version.hip is None
+        and x.dtype == torch.float16
+        and dim == 32
+        and module.window in (32, 64)
+        and _eager_inference(module)
+        and plain_inference(x, module)
+    )
+
+
+def _from_triton(error: BaseException) -> bool:
+    """Whether the error, or one it was raised from, comes from Triton itself."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__module__.partition(".")[0] == "triton":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 class _SpatialAttention(_WindowAttention):
     """Original projections with optional per-query context neighborhoods."""
@@ -629,7 +671,12 @@ class _SpatialAttention(_WindowAttention):
         tile, chunk_size = 16, 4
         heads, dim = self.heads, channels // self.heads
         tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
-        qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
+        qkv = self.qkv(tokens)
+        if _na_triton_usable(self, x, dim):
+            attended = self._na_triton(qkv, height, width)
+            if attended is not None:
+                return attended
+        qkv = qkv.reshape(batch, height * width, 3, heads, dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         query = query * dim**-0.5
         if _eager_inference(self):
@@ -716,6 +763,40 @@ class _SpatialAttention(_WindowAttention):
                 th, tw = min(tile, height - y), min(tile, width - z)
                 output[:, :, y : y + th, z : z + tw] = attended[:, j, :, :th, :tw]
         return output
+
+    def _na_triton(self, qkv: Tensor, height: int, width: int) -> Tensor | None:
+        """spandrel: _na_inference's result from the Triton kernel, reading qkv
+        (B, H*W, 3C) as the projection wrote it; None when the kernel failed, which
+        switches NA_TRITON off for good."""
+        global NA_TRITON
+        u = self.window + 15
+        # The factor tables over the (M+15)^2 union-local key frame; their values at
+        # a coordinate are those _na_inference computes there.
+        grid = _inference_na_coordinates(u, u, qkv.device)
+        query_factors, key_factors = self.factored_bias.factors(grid, qkv.dtype)
+        try:
+            out = na_triton.na_attention(
+                qkv.contiguous(),
+                query_factors.contiguous(),
+                key_factors.contiguous(),
+                height,
+                width,
+                self.window,
+            )
+        except Exception as error:
+            if not _from_triton(error):
+                raise
+            NA_TRITON = False
+            logger.warning(
+                "DUAL's Triton neighborhood attention failed (%s: %s); using its"
+                " PyTorch path",
+                type(error).__name__,
+                error,
+            )
+            return None
+        # BCHW memory as _na_inference returns it: the projection's matmul takes
+        # another path on channels-last features, and its rounding follows the path.
+        return out.permute(0, 3, 1, 2).contiguous()
 
     def _na_inference(
         self, query: Tensor, key: Tensor, value: Tensor, height: int, width: int

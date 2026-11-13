@@ -528,6 +528,11 @@ class OCAB(Derived):
         hd = heads * d
         qkv = qkv.reshape(b, h, w, 3, hd)
         nh, nw = h // ws, w // ws
+        # The key and value windows below are copies, each a few times the size of the
+        # trunk; every one is released once the next is made, and the last after the
+        # attention, so none is held through the projection and the MLP, where the
+        # block's memory peaks otherwise.
+        del x
 
         # query windows: nw*b, nH, ws*ws, d
         q = (
@@ -545,19 +550,25 @@ class OCAB(Derived):
         g = math.gcd(ws, ows)
         s, n = ws // g, ows // g
         kv = F.pad(qkv[:, :, :, 1:], (0, 0, 0, 0, p, p, p, p))
+        del qkv
         blocks = kv.reshape(b, (h + 2 * p) // g, g, (w + 2 * p) // g, g, 2 * hd)
+        del kv
         rows = torch.stack(
             [blocks[:, i : (i - n + 1 or None) : s] for i in range(n)], dim=2
         ).reshape(b * nh, ows, (w + 2 * p) // g, g, 2 * hd)
+        del blocks
         windows = torch.stack(
             [rows[:, :, j : (j - n + 1 or None) : s] for j in range(n)], dim=3
         )
+        del rows
         kv_windows = (
             windows.reshape(b * nh, ows, nw, ows, 2, heads, d)
             .permute(4, 0, 2, 5, 1, 3, 6)
             .reshape(2, -1, heads, ows * ows, d)
         )  # 2, nw*b, nH, ow*ow, d
+        del windows
         k, v = kv_windows[0], kv_windows[1]
+        del kv_windows
 
         x = window_attention(
             q,
@@ -569,6 +580,7 @@ class OCAB(Derived):
             None,
             self.scale,
         )
+        del q, k, v
         if d != width:
             x = x[..., :width]
 
