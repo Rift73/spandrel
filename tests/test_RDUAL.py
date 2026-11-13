@@ -9,6 +9,7 @@ import torch
 from spandrel import MAIN_REGISTRY, ImageModelDescriptor
 from spandrel.architectures.DUAL.__arch.dual_arch import dual_light
 from spandrel.architectures.RDUAL import RDUAL, RDUALArch, run_clip, run_window
+from spandrel.architectures.RDUAL.__arch import rdual_arch
 
 from .util import assert_loads_correctly, skip_if_unchanged
 
@@ -125,9 +126,10 @@ class _TritonError(Exception):
 _TritonError.__module__ = "triton.compiler.errors"
 
 
-def test_a_triton_failure_switches_to_the_pytorch_temporal_path(monkeypatch):
+def test_a_triton_failure_switches_to_the_pytorch_paths(monkeypatch):
     model = _model(scale=2)
     calls: list[str] = []
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
 
     def forward(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
         calls.append(model.temporal.backend)
@@ -140,6 +142,7 @@ def test_a_triton_failure_switches_to_the_pytorch_temporal_path(monkeypatch):
     assert run_clip(model, frames) is frames
     assert calls == ["auto", "reference"]
     assert model.temporal.backend == "reference"
+    assert not rdual_arch.NA_TRITON
 
 
 def test_other_failures_are_raised(monkeypatch):

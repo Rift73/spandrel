@@ -64,20 +64,24 @@ def _window(
 
 
 def _falling_back(model: RDUAL, run: Callable[[], T]) -> T:
-    """run(), and when the temporal stage's Triton kernels fail to compile (a Triton
-    too old for this Python, for example), run() again on the model's PyTorch
-    temporal path, which it then keeps for good."""
+    """run(), and when the Triton kernels of the temporal stage or of the
+    neighborhood attention fail to compile (a Triton too old for this Python, for
+    example), run() again on the PyTorch paths, which are then kept for good."""
+    from .__arch import rdual_arch
+
     try:
         return run()
     except Exception as error:
-        if model.temporal.backend != "auto" or not _from_triton(error):
+        triton = model.temporal.backend == "auto" or rdual_arch.NA_TRITON
+        if not triton or not _from_triton(error):
             raise
         logger.warning(
-            "RDUAL's Triton temporal kernels failed (%s: %s); using its PyTorch path",
+            "RDUAL's Triton kernels failed (%s: %s); using its PyTorch path",
             type(error).__name__,
             error,
         )
         model.temporal.backend = "reference"
+        rdual_arch.NA_TRITON = False
         return run()
 
 
