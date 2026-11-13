@@ -114,6 +114,47 @@ def test_a_carried_state_changes_the_window_against_a_cold_start():
     assert (carried - cold).abs().amax() > 1e-3
 
 
+def test_on_demand_flow_lookups_match_the_volume(monkeypatch):
+    torch.manual_seed(0)
+    feature0, feature1 = torch.randn(2, 2, 16, 6, 9).unbind(0)
+    grid = rdual_arch._neuflow_coords_grid(2, 6, 9, torch.device("cpu"))
+    # Targets inside, across and past the borders (zero padding).
+    flow = torch.randn(2, 2, 6, 9) * 4
+    volume = rdual_arch._neuflow_lookup(
+        rdual_arch._neuflow_correlation(feature0, feature1), grid, flow
+    )
+    # A chunk smaller than one row of queries splits the lookups.
+    monkeypatch.setattr(rdual_arch, "_LOOKUP_CHUNK_BYTES", 81 * 16 * 4 * 5)
+    on_demand = rdual_arch._neuflow_lookup_features(feature0, feature1, grid, flow)
+    torch.testing.assert_close(on_demand, volume, rtol=1e-5, atol=1e-5)
+
+
+def test_window_memory_modes(monkeypatch):
+    model = _temporal_model()
+    frames = torch.rand(1, 6, 3, 32, 40)
+    called = []
+    real = rdual_arch._neuflow_lookup_features
+    monkeypatch.setattr(
+        rdual_arch,
+        "_neuflow_lookup_features",
+        lambda *a: called.append(1) or real(*a),
+    )
+    with torch.inference_mode():
+        _, state = run_window(model, frames[:, :3], 2)
+        past = (state, frames[:, 1])
+        default, default_state = run_window(model, frames[:, 2:], 3, past)
+        assert not called
+        recomputed, recomputed_state = run_window(
+            model, frames[:, 2:], 3, past, hold_encodes=False
+        )
+        on_demand, _ = run_window(model, frames[:, 2:], 3, past, flow_volume=False)
+    assert called
+    # Encoding a frame again repeats the same operations on the same input.
+    assert torch.equal(recomputed, default)
+    assert torch.equal(recomputed_state, default_state)
+    torch.testing.assert_close(on_demand, default, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("keep", [0, 4])
 def test_a_window_keeps_one_to_all_of_its_frames(keep):
     with pytest.raises(ValueError, match="keep must be"):

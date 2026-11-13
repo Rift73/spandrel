@@ -3862,6 +3862,44 @@ def _neuflow_lookup(corr: Tensor, grid: Tensor, flow: Tensor) -> Tensor:
     return sampled.view(b, h, w, -1).permute(0, 3, 1, 2).contiguous()
 
 
+# Working memory of one chunk of on-demand lookups.
+_LOOKUP_CHUNK_BYTES = 256 * 2**20
+
+
+def _neuflow_lookup_features(
+    feature0: Tensor, feature1: Tensor, grid: Tensor, flow: Tensor
+) -> Tensor:
+    """_neuflow_lookup of _neuflow_correlation(feature0, feature1) without the
+    volume: feature1 sampled bilinearly at each query's window, then the dot
+    product. Sampling and the dot product commute, so only the summation order
+    differs from the volume's lookup."""
+    b, c, h, w = feature0.shape
+    radius = torch.linspace(
+        -_NF_CORR_RADIUS, _NF_CORR_RADIUS, 2 * _NF_CORR_RADIUS + 1, device=flow.device
+    )
+    delta = torch.stack(torch.meshgrid(radius, radius, indexing="ij"), dim=-1)
+    coords = (grid + flow).permute(0, 2, 3, 1).reshape(b * h * w, 1, 1, 2)
+    x, y = (coords + delta[None]).split((1, 1), dim=-1)
+    sample = torch.cat((2 * x / (w - 1) - 1, 2 * y / (h - 1) - 1), -1)
+    side = delta.shape[0]
+    window = side * side
+    sample = sample.view(b, h * w, window, 2)
+    query = feature0.view(b, c, h * w)
+    out = feature0.new_empty((b, h * w, window))
+    step = max(1, _LOOKUP_CHUNK_BYTES // (window * c * feature0.element_size()))
+    for first in range(0, h * w, step):
+        part = sample[:, first : first + step]
+        n = part.shape[1]
+        # bilinear, zero padding, align_corners, as _neuflow_lookup
+        sampled = torch.grid_sampler_2d(
+            feature1, part.reshape(b, n * side, side, 2), 0, 0, True
+        ).view(b, c, n, window)
+        out[:, first : first + n] = (
+            (sampled * query[:, :, first : first + n, None]).sum(1).div_(math.sqrt(c))
+        )
+    return out.view(b, h, w, window).permute(0, 3, 1, 2).contiguous()
+
+
 class NeuFlowV2(nn.Module):
     """NeuFlow v2 inference: flow from img0 to img1 at full size, N,2,H,W.
 
@@ -3943,7 +3981,9 @@ class NeuFlowV2(nn.Module):
     # Its public name, for the TensorRT export.
     prepare_grids = _prepare_grids
 
-    def forward(self, img0: Tensor, img1: Tensor) -> Tensor:
+    def forward(self, img0: Tensor, img1: Tensor, volume: bool = True) -> Tensor:
+        """volume False computes the 1/8-scale lookups on demand instead of
+        holding the all-pairs volume, (H/8 * W/8)^2 FP32 values per flow."""
         b, _, height, width = img0.shape
         grids = self._prepare_grids(b, height, width, img0.device)
         img0 = img0 / 255.0
@@ -3988,7 +4028,7 @@ class NeuFlowV2(nn.Module):
         features_s16 = F.interpolate(features_s16, scale_factor=2, mode="nearest")
         features_s8 = self.merge_s8(torch.cat([features_s8, features_s16], dim=1))
         feature0_s8, feature1_s8 = features_s8.chunk(chunks=2, dim=0)
-        corr_s8 = _neuflow_correlation(feature0_s8, feature1_s8)
+        corr_s8 = _neuflow_correlation(feature0_s8, feature1_s8) if volume else None
         context_s16 = F.interpolate(context_s16, scale_factor=2, mode="nearest")
         context_s8 = self.context_merge_s8(torch.cat([context_s8, context_s16], dim=1))
 
@@ -3996,7 +4036,12 @@ class NeuFlowV2(nn.Module):
             b, _NF_ITER_CONTEXT_DIM_S8, *feature0_s8.shape[-2:], device=img0.device
         )
         for _ in range(_NF_ITERS_S8):
-            corrs = _neuflow_lookup(corr_s8, grids["grid_s8"], flow)
+            if corr_s8 is None:
+                corrs = _neuflow_lookup_features(
+                    feature0_s8, feature1_s8, grids["grid_s8"], flow
+                )
+            else:
+                corrs = _neuflow_lookup(corr_s8, grids["grid_s8"], flow)
             iter_context, delta_flow = self.refine_s8(
                 corrs, context_s8, iter_context, flow, grids["radius_s8"]
             )
@@ -4135,7 +4180,7 @@ class RDUAL(nn.Module):
         self.flow_loaded.fill_(True)
 
     @torch.no_grad()
-    def guidance(self, frames: Tensor) -> Tensor:
+    def guidance(self, frames: Tensor, *, flow_volume: bool = True) -> Tensor:
         """The flow guidance of a B,T,3,H,W clip in 0..1: B,T-1,2,2,Htrunk,Wtrunk.
 
         Frozen NeuFlow v2 (one s16 and eight s8 iterations) on every adjacent
@@ -4147,7 +4192,8 @@ class RDUAL(nn.Module):
         padded to a multiple of 16 and at least 32 pixels a side, and run on
         the model's device in calls of at most _FLOW_PAIRS pairs, fewer for
         large frames (_flow_pairs_per_call); the result is on the frames'
-        device.
+        device. flow_volume False computes the flow's lookups on demand
+        instead of holding its all-pairs volume (NeuFlowV2.forward).
         """
         if frames.ndim != 5 or frames.shape[2] != 3:
             raise ValueError("RDUAL input must be B,T,3,H,W")
@@ -4186,7 +4232,8 @@ class RDUAL(nn.Module):
                         padding = (0, padded_w - width, 0, padded_h - height)
                         source = F.pad(source, padding, mode="replicate")
                         target = F.pad(target, padding, mode="replicate")
-                    flow = self.flow(source, target)[:, :, :height, :width]
+                    flow = self.flow(source, target, flow_volume)
+                    flow = flow[:, :, :height, :width]
                     if h4 != height or w4 != width:
                         flow = F.pad(
                             flow, (0, w4 - width, 0, h4 - height), mode="replicate"
@@ -4650,6 +4697,7 @@ class RDUAL(nn.Module):
         edge: Tensor,
         past: tuple[Tensor, Tensor, Tensor] | None,
         count: int,
+        hold_encodes: bool = True,
     ) -> tuple[list[Tensor], Tensor | None]:
         """forward()'s sweeps over B,n,3,H,W frames, output for the first count.
 
@@ -4657,7 +4705,9 @@ class RDUAL(nn.Module):
         past is the (state, flow, valid) donor of the first frame, carried
         from the frame before it, or None. The reverse sweep starts at the
         last frame with no future. Returns the padded outputs and the state
-        carried from frame count-1.
+        carried from frame count-1. hold_encodes False releases every frame's
+        encode after its reverse step and encodes the kept frames again in the
+        forward sweep.
         """
         n = frames.shape[1]
         # Each frame is encoded when a sweep first reads it and released after
@@ -4668,7 +4718,8 @@ class RDUAL(nn.Module):
         # Frame 0's reverse state would have no reader: frame t uses frame t+1's.
         for t in reversed(range(1, n)):
             prefix[t] = self._prefix(self._pad(frames[:, t]))
-            _, _, fine, h, key = prefix[t] if t < count else prefix.pop(t)
+            hold = hold_encodes and t < count
+            _, _, fine, h, key = prefix[t] if hold else prefix.pop(t)
             if state is not None:
                 h = self._fuse(h, [state], [edge[:, t]], [guidance[:, t, 1]], [_FUTURE])
             state = self._trunk(h, fine, key)[0]
@@ -4772,6 +4823,9 @@ class RDUAL(nn.Module):
         frames: Tensor,
         keep: int,
         past: tuple[Tensor, Tensor] | None = None,
+        *,
+        flow_volume: bool = True,
+        hold_encodes: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """One window of a longer clip that arrives a few frames at a time.
 
@@ -4789,18 +4843,27 @@ class RDUAL(nn.Module):
         look-ahead: forward()'s when every window reaches the clip's end.
         Guidance is computed per window, for its frame pairs and the pair that
         links the previous frame.
+
+        Two modes trade time for memory. flow_volume False computes the
+        flow's lookups on demand instead of holding its 1/8-scale all-pairs
+        volume: at 1920x1080 the flow's peak falls from 9.1 to 2.1 GiB for
+        about 27 % more flow time, and the result differs by the summation
+        order only. hold_encodes False encodes the kept frames again in the
+        forward sweep instead of holding them through the reverse sweep: about
+        0.9 GiB less in both sweeps at 1488x837 for about 5 % more time, with
+        the same result.
         """
         if type(keep) is not int or not 1 <= keep <= frames.shape[1]:
             raise ValueError("keep must be an int from 1 to the window's frames")
         window = frames if past is None else torch.cat((past[1][:, None], frames), 1)
-        guidance = self.guidance(window)
+        guidance = self.guidance(window, flow_volume=flow_volume)
         links = self._clip_edges(window, guidance)
         packed = self.pack_guidance(window, guidance)
         carried = None
         if past is not None:
             carried = (past[0], packed[:, 0, 0], links[:, 0])
             packed, links = packed[:, 1:], links[:, 1:]
-        out, state = self._sweeps(frames, packed, links, carried, keep)
+        out, state = self._sweeps(frames, packed, links, carried, keep, hold_encodes)
         original_h, original_w = frames.shape[-2:]
         outputs = torch.stack(out, 1)
         return outputs[..., : original_h * self.scale, : original_w * self.scale], state

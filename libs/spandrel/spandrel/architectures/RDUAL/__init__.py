@@ -78,10 +78,18 @@ def _window(
     frames: torch.Tensor,
     keep: int,
     past: tuple[torch.Tensor, torch.Tensor] | None,
+    flow_volume: bool,
+    hold_encodes: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cuda = frames.device.type == "cuda"
     with torch.autocast("cuda", torch.bfloat16, enabled=cuda):
-        outputs, state = model.infer_window(frames.float(), keep, past)
+        outputs, state = model.infer_window(
+            frames.float(),
+            keep,
+            past,
+            flow_volume=flow_volume,
+            hold_encodes=hold_encodes,
+        )
     return outputs.float(), state
 
 
@@ -121,12 +129,18 @@ def run_window(
     frames: torch.Tensor,
     keep: int,
     past: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    flow_volume: bool = True,
+    hold_encodes: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RDUAL.infer_window() with run_clip's precision and Triton fallback: the
     B,keep,3,sH,sW outputs in FP32 of a window of B,n,3,H,W frames and the state
     to carry, from the (state, previous frame) `past` of the window before it or a
-    cold start."""
-    return _falling_back(model, lambda: _window(model, frames, keep, past))
+    cold start. flow_volume and hold_encodes are infer_window()'s memory modes."""
+    return _falling_back(
+        model,
+        lambda: _window(model, frames, keep, past, flow_volume, hold_encodes),
+    )
 
 
 def _call(model: RDUAL, image: torch.Tensor) -> torch.Tensor:
