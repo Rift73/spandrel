@@ -3998,6 +3998,8 @@ class NeuFlowV2(nn.Module):
                 corrs, context_s8, iter_context, flow, grids["radius_s8"]
             )
             flow = flow + delta_flow
+        # The volume is the flow's largest tensor and the upsampling reads none of it.
+        del corr_s8, corrs
 
         return self.upsample_s8(self.conv_s8(img0), flow) * 8
 
