@@ -5,9 +5,11 @@ from typing import Any
 
 import pytest
 import torch
+from torch import nn
 
 from spandrel import MAIN_REGISTRY
 from spandrel.architectures.__arch_helpers import flash_window
+from spandrel.architectures.__arch_helpers.inference import tail_scale_and_halo
 from spandrel.architectures.ATD import ATD
 from spandrel.architectures.DRCT import DRCT
 from spandrel.architectures.DRFT import DRFT
@@ -223,3 +225,63 @@ def test_exports_need_a_window():
     with torch.no_grad():
         assert descriptor(torch.rand(1, 3, 5, 40)).shape == (1, 3, 10, 80)
         assert descriptor.model(torch.rand(1, 3, 5, 40)).shape == (1, 3, 10, 80)
+
+
+def _forced_bands(monkeypatch: pytest.MonkeyPatch, rows: int) -> None:
+    """The banded tail on the CPU, in bands of `rows` trunk rows."""
+    monkeypatch.setattr(
+        HEART,
+        "tail_plan",
+        lambda self, _x: tail_scale_and_halo(
+            nn.Sequential(self.conv_before_upsample, self.upsample, self.conv_last)
+        ),
+    )
+    monkeypatch.setattr(heart_arch, "WHOLE_TAIL_ROWS", 0)
+    monkeypatch.setattr(heart_arch, "MIN_BAND_ROWS", rows)
+    monkeypatch.setattr(heart_arch, "BAND_DIVISOR", 10**6)
+
+
+@pytest.mark.parametrize("scale", [2, 3, 4, 8])
+@pytest.mark.parametrize(("h", "w"), [(37, 45), (5, 7), (64, 9)])
+def test_banded_tail_computes_the_whole_pass(
+    monkeypatch: pytest.MonkeyPatch, scale: int, h: int, w: int
+):
+    torch.manual_seed(0)
+    model = _small(upscale=scale).eval()
+    image = torch.rand(1, 3, h, w)
+    with torch.no_grad():
+        whole = model(image)
+        # 7 rows: the padded trunk (32 or 64 rows) is not a whole number of bands
+        _forced_bands(monkeypatch, rows=7)
+        banded = model(image)
+    assert banded.shape == whole.shape == (1, 3, h * scale, w * scale)
+    # a band's convolutions may sum in another order: FP32 rounding
+    torch.testing.assert_close(banded, whole, atol=1e-5, rtol=0)
+
+
+def test_an_image_shorter_than_one_band_runs_the_tail_whole(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model = _small(upscale=4).eval()
+    _forced_bands(monkeypatch, rows=64)
+    calls: list[int] = []
+    tail = model.tail
+    monkeypatch.setattr(model, "tail", lambda t: calls.append(t.shape[2]) or tail(t))
+    with torch.no_grad():
+        model(torch.rand(1, 3, 20, 20))
+    assert calls == [32]
+
+
+def test_tail_plan_bands_only_eager_nvidia_inference(monkeypatch: pytest.MonkeyPatch):
+    x = torch.rand(1, 24, 8, 8)
+    with torch.no_grad():
+        # the CPU keeps the whole pass
+        assert _small(upscale=4).eval().tail_plan(x) is None
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+        monkeypatch.setattr(torch.version, "hip", None)
+        assert _small(upscale=4).eval().tail_plan(x) == (4, 4)
+        assert _small(upscale=2).eval().tail_plan(x) == (2, 3)
+        # nothing to band at 1x
+        assert _small(upscale=1).eval().tail_plan(x) is None
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+        assert _small(upscale=4).eval().tail_plan(x) is None

@@ -26,7 +26,14 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
 from ...__arch_helpers.flash_window import flash_window_attention
-from ...__arch_helpers.inference import traced
+from ...__arch_helpers.inference import banded_tail, tail_scale_and_halo, traced
+
+# spandrel: the high-resolution tail (conv_before_upsample, upsample, conv_last) runs in
+# bands of a BAND_DIVISOR-th of the padded trunk's rows, at least MIN_BAND_ROWS, as ESRGAN's
+# does; a trunk of WHOLE_TAIL_ROWS rows or fewer runs it whole.
+BAND_DIVISOR = 8
+MIN_BAND_ROWS = 32
+WHOLE_TAIL_ROWS = 256
 
 
 class iLN(nn.Module):
@@ -730,7 +737,37 @@ class HEART(nn.Module):
 
         x = self.conv_first(x)
         x = self.conv_after_body(self.forward_features(x)) + x
-        x = self.conv_before_upsample(x)
-        x = self.conv_last(self.upsample(x))
+        plan = self.tail_plan(x)
+        if plan is None:
+            x = self.tail(x)
+        else:
+            trunk_rows = x.shape[2]
+            rows = (
+                trunk_rows
+                if trunk_rows <= WHOLE_TAIL_ROWS
+                # an 8x tail's band holds four times a 4x one's pixels per row
+                else max(
+                    MIN_BAND_ROWS,
+                    trunk_rows // (BAND_DIVISOR * max(1, plan[0] // 4) ** 2),
+                )
+            )
+            x = banded_tail(self.tail, x, *plan, rows=rows)
 
         return x[:, :, : h * self.upscale, : w * self.upscale]
+
+    def tail(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv_last(self.upsample(self.conv_before_upsample(x)))
+
+    def tail_plan(self, x: torch.Tensor) -> tuple[int, int] | None:
+        """(scale, halo) for banding the high-resolution tail in plain eager inference on
+        an NVIDIA GPU (any precision); None for the whole pass: tracing, export,
+        training, ROCm, the CPU, a tail of no upscaling, or one tail_scale_and_halo
+        cannot band."""
+        if not (x.is_cuda and torch.version.hip is None and plain_inference(x, self)):
+            return None
+        if traced():
+            return None
+        plan = tail_scale_and_halo(
+            nn.Sequential(self.conv_before_upsample, self.upsample, self.conv_last)
+        )
+        return plan if plan is not None and plan[0] > 1 else None
