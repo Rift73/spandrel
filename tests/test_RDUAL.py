@@ -168,6 +168,58 @@ def test_the_last_stage_in_bands_is_the_whole_frame_stage(monkeypatch, size):
     torch.testing.assert_close(banded, whole)
 
 
+def test_a_tile_that_covers_the_frame_is_the_untiled_window():
+    model = _temporal_model()
+    frames = torch.rand(1, 4, 3, 37, 50)
+    with torch.inference_mode():
+        untiled, state = run_window(model, frames, 3)
+        covered, covered_state = run_window(model, frames, 3, tile=(40, 52))
+    assert torch.equal(covered, untiled)
+    assert torch.equal(covered_state, state)
+
+
+def test_tile_starts_sit_on_the_grid_and_the_last_tile_ends_at_the_frame():
+    for length, tile, overlap in ((837, 452, 64), (1488, 776, 64), (1080, 400, 32)):
+        spans = rdual_arch._tile_axis(length, tile, overlap)
+        padded = (length + 3) // 4 * 4
+        assert len({size for _, size in spans}) == 1
+        assert all(start % rdual_arch._TILE_GRID == 0 for start, _ in spans)
+        assert spans[0][0] == 0 and spans[-1][0] + spans[-1][1] == padded
+        assert spans[0][1] >= tile // 4 * 4
+        assert all(
+            a + size - b >= overlap for (a, size), (b, _) in zip(spans, spans[1:])
+        )
+
+
+@pytest.mark.parametrize("size", [(37, 50), (41, 29)])
+def test_tiled_windows_carry_one_state_per_tile(size):
+    # Odd sizes: the grid does not divide the padded frame evenly.
+    model = _temporal_model()
+    frames = torch.rand(1, 6, 3, *size)
+    tile, overlap = (24, 20), 8
+    rows, cols = rdual_arch._tile_grid(size, tile, overlap)
+    assert len(rows) > 1 and len(cols) > 1
+    assert len({span[1] for span in rows}) == len({span[1] for span in cols}) == 1
+    with torch.inference_mode():
+        first, state = run_window(model, frames[:, :3], 2, tile=tile, overlap=overlap)
+        assert first.shape == (1, 2, 3, size[0] * 2, size[1] * 2)
+        assert state.shape[0] == len(rows) * len(cols)
+        past = (state, frames[:, 1])
+        carried, _ = run_window(model, frames[:, 2:], 3, past, tile=tile, overlap=overlap)
+        cold, _ = run_window(model, frames[:, 2:], 3, tile=tile, overlap=overlap)
+        assert carried.shape == cold.shape == (1, 3, 3, size[0] * 2, size[1] * 2)
+        assert (carried - cold).abs().amax() > 1e-3
+        assert torch.isfinite(carried).all()
+        # The tiles' states go together: not into an untiled window or other tiles.
+        with pytest.raises(ValueError, match="tile"):
+            run_window(model, frames[:, 2:], 3, past)
+        with pytest.raises(ValueError, match="tile"):
+            run_window(model, frames[:, 2:], 3, past, tile=(16, 16), overlap=4)
+        _, untiled_state = run_window(model, frames[:, :3], 2)
+        with pytest.raises(ValueError, match="tile"):
+            run_window(model, frames[:, 2:], 3, (untiled_state, frames[:, 1]), tile=tile, overlap=overlap)
+
+
 @pytest.mark.parametrize("keep", [0, 4])
 def test_a_window_keeps_one_to_all_of_its_frames(keep):
     with pytest.raises(ValueError, match="keep must be"):

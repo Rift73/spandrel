@@ -3900,6 +3900,71 @@ def _neuflow_lookup_features(
     return out.view(b, h, w, window).permute(0, 3, 1, 2).contiguous()
 
 
+# Tile starts on this grid of input pixels keep the trunk's windows, regions
+# and retrieval blocks (anchored at the frame's origin) as the whole frame has
+# them.
+_TILE_GRID = 128
+
+
+def _tile_axis(length: int, tile: int, overlap: int) -> tuple[tuple[int, int], ...]:
+    """(start, size) of equal tiles along an axis of the frame padded to a
+    multiple of four, neighbors overlapping by at least overlap, the last
+    ending at the frame's end; one tile when it covers the axis.
+
+    The starts are multiples of _TILE_GRID: the stride is rounded down to it
+    and the size grown to match, by less than _TILE_GRID per tile after the
+    first. A stride below _TILE_GRID keeps starts on multiples of four.
+    """
+    padded = (length + 3) // 4 * 4
+    size = max(4, tile // 4 * 4)
+    if size >= padded:
+        return ((0, padded),)
+    if size <= overlap:
+        raise ValueError("A tile must be larger than its overlap")
+    count = -(-(padded - overlap) // (size - overlap))
+    stride = (padded - size) / (count - 1)
+    if stride >= _TILE_GRID:
+        step = int(stride) // _TILE_GRID * _TILE_GRID
+        size = padded - (count - 1) * step
+        return tuple((k * step, size) for k in range(count))
+    return tuple((round(k * stride / 4) * 4, size) for k in range(count))
+
+
+def _tile_grid(
+    shape: tuple[int, int] | torch.Size, tile: tuple[int, int] | None, overlap: int
+) -> tuple[tuple[tuple[int, int], ...], ...] | None:
+    """The (rows, columns) of infer_window's tiles, or None when untiled."""
+    if tile is None:
+        return None
+    if type(overlap) is not int or overlap < 0:
+        raise ValueError("overlap must be a non-negative int")
+    rows, cols = _tile_axis(shape[0], tile[0], overlap), _tile_axis(
+        shape[1], tile[1], overlap
+    )
+    if len(rows) == 1 and len(cols) == 1:
+        return None
+    return rows, cols
+
+
+def _tile_ramps(
+    spans: tuple[tuple[int, int], ...], length: int, scale: int, like: Tensor
+) -> list[Tensor]:
+    """Per tile, its output weights along the axis: rising linearly across the
+    overlap with the tile before it and falling across the one after it."""
+    ramps = []
+    for k, (start, size) in enumerate(spans):
+        w = like.new_ones(size * scale)
+        position = torch.arange(size * scale, device=like.device, dtype=like.dtype)
+        if k > 0:
+            span = (spans[k - 1][0] + spans[k - 1][1] - start) * scale
+            w = torch.minimum(w, (position + 0.5) / span)
+        if k + 1 < len(spans):
+            span = (start + size - spans[k + 1][0]) * scale
+            w = torch.minimum(w, (size * scale - position - 0.5) / span)
+        ramps.append(w.clamp(min=0))
+    return ramps
+
+
 # Working memory of one band of the output's last 2x stage (_tail_bands).
 _TAIL_BAND_BYTES = 64 * 2**20
 
@@ -4882,6 +4947,8 @@ class RDUAL(nn.Module):
         *,
         flow_volume: bool = True,
         hold_encodes: bool = True,
+        tile: tuple[int, int] | None = None,
+        overlap: int = 64,
     ) -> tuple[Tensor, Tensor]:
         """One window of a longer clip that arrives a few frames at a time.
 
@@ -4908,9 +4975,19 @@ class RDUAL(nn.Module):
         forward sweep instead of holding them through the reverse sweep: about
         0.9 GiB less in both sweeps at 1488x837 for about 5 % more time, with
         the same result.
+
+        tile (height, width) runs the trunk, both sweeps and the outputs per
+        spatial tile of about that size (grown to start tiles on a 128-pixel
+        grid), overlapping by at least overlap pixels,
+        while the flow, the links and the alignment cues are computed on the
+        whole frame and cropped; outputs are blended linearly across the
+        overlaps. The returned state then holds one state per tile, tiles
+        first, and a window that takes it must use the same frame size, tile
+        and overlap. A tile that covers the frame is the untiled path.
         """
         if type(keep) is not int or not 1 <= keep <= frames.shape[1]:
             raise ValueError("keep must be an int from 1 to the window's frames")
+        grid = _tile_grid(frames.shape[-2:], tile, overlap)
         window = frames if past is None else torch.cat((past[1][:, None], frames), 1)
         guidance = self.guidance(window, flow_volume=flow_volume)
         links = self._clip_edges(window, guidance)
@@ -4919,10 +4996,82 @@ class RDUAL(nn.Module):
         if past is not None:
             carried = (past[0], packed[:, 0, 0], links[:, 0])
             packed, links = packed[:, 1:], links[:, 1:]
-        out, state = self._sweeps(frames, packed, links, carried, keep, hold_encodes)
         original_h, original_w = frames.shape[-2:]
-        outputs = torch.stack(out, 1)
+        if grid is None:
+            if carried is not None and carried[0].ndim != 4:
+                raise ValueError("A tiled state needs the same tiles")
+            out, state = self._sweeps(
+                frames, packed, links, carried, keep, hold_encodes
+            )
+            outputs = torch.stack(out, 1)
+        else:
+            outputs, state = self._tiled_sweeps(
+                frames, packed, links, carried, keep, hold_encodes, grid
+            )
         return outputs[..., : original_h * self.scale, : original_w * self.scale], state
+
+    def _tiled_sweeps(
+        self,
+        frames: Tensor,
+        packed: Tensor,
+        links: Tensor,
+        carried: tuple[Tensor, Tensor, Tensor] | None,
+        keep: int,
+        hold_encodes: bool,
+        grid: tuple[tuple[tuple[int, int], ...], ...],
+    ) -> tuple[Tensor, Tensor]:
+        """_sweeps per tile of the padded frames with the whole frame's packed
+        guidance cropped to the tile's trunk grid (half its pixels); returns
+        the blended padded B,keep,3,sH,sW outputs and the tiles' states."""
+        rows, cols = grid
+        if carried is not None and (
+            carried[0].ndim != 5 or carried[0].shape[0] != len(rows) * len(cols)
+        ):
+            raise ValueError("The carried state is not one of these tiles")
+        batch, count = frames.shape[:2]
+        padded = self._pad(frames.flatten(0, 1))
+        padded = padded.unflatten(0, (batch, count))
+        height, width = padded.shape[-2:]
+        scale = self.scale
+        outputs = None
+        weight = padded.new_zeros((height * scale, width * scale))
+        states = []
+        for (y0, th), wy in zip(rows, _tile_ramps(rows, height, scale, padded)):
+            for (x0, tw), wx in zip(cols, _tile_ramps(cols, width, scale, padded)):
+                index = len(states)
+                crop = (slice(y0 // 2, (y0 + th) // 2), slice(x0 // 2, (x0 + tw) // 2))
+                past = None
+                if carried is not None:
+                    past = (
+                        carried[0][index],
+                        carried[1][..., crop[0], crop[1]],
+                        carried[2],
+                    )
+                out, state = self._sweeps(
+                    padded[..., y0 : y0 + th, x0 : x0 + tw],
+                    packed[..., crop[0], crop[1]],
+                    links,
+                    past,
+                    keep,
+                    hold_encodes,
+                )
+                states.append(state)
+                ramp = wy[:, None] * wx[None, :]
+                region = (
+                    slice(y0 * scale, (y0 + th) * scale),
+                    slice(x0 * scale, (x0 + tw) * scale),
+                )
+                tile_out = torch.stack(out, 1)
+                del out
+                if outputs is None:
+                    outputs = tile_out.new_zeros(
+                        (*tile_out.shape[:3], height * scale, width * scale)
+                    )
+                outputs[..., region[0], region[1]] += tile_out * ramp
+                weight[region] += ramp
+                del tile_out
+        assert outputs is not None
+        return outputs / weight, torch.stack(states)
 
     def step_functions(
         self, compile: Callable[[Callable], Callable] | None = None
