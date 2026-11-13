@@ -3900,6 +3900,10 @@ def _neuflow_lookup_features(
     return out.view(b, h, w, window).permute(0, 3, 1, 2).contiguous()
 
 
+# Working memory of one band of the output's last 2x stage (_tail_bands).
+_TAIL_BAND_BYTES = 64 * 2**20
+
+
 class NeuFlowV2(nn.Module):
     """NeuFlow v2 inference: flow from img0 to img1 at full size, N,2,H,W.
 
@@ -4517,13 +4521,63 @@ class RDUAL(nn.Module):
             h = group(h)
         return h, hr, packed
 
+    def _tail_bands(self, t2: Tensor) -> Tensor:
+        """self.tail[4:](t2), the last 2x stage, in horizontal bands of t2.
+
+        Each band runs the expanding convolution on its rows plus a two-row
+        halo, shuffles them and runs the output convolution on the rows it
+        owns plus a one-row halo, zero rows standing in for the padding at
+        the frame's edges; only one band's expanded features are alive.
+        """
+        expand, shuffle, last = self.tail[4], self.tail[5], self.tail[6]
+        b, _, height, width = t2.shape
+        factor = shuffle.upscale_factor
+        row_bytes = expand.out_channels * width * t2.element_size()
+        rows = max(1, _TAIL_BAND_BYTES // row_bytes)
+        out = None
+        for first in range(0, height, rows):
+            stop = min(height, first + rows)
+            # expanded rows [first - 1, stop + 1) need t2 rows [first - 2, stop + 2)
+            low, high = max(0, first - 2), min(height, stop + 2)
+            band = F.pad(
+                t2[:, :, low:high], (0, 0, low - (first - 2), (stop + 2) - high)
+            )
+            expanded = F.conv2d(band, expand.weight, expand.bias, padding=(0, 1))
+            # rows [first - 1, stop + 1) of the expanded stage; outside the frame
+            # they are the output convolution's zero padding
+            if first == 0:
+                expanded[:, :, :1] = 0
+            if stop == height:
+                expanded[:, :, -1:] = 0
+            fine = F.pixel_shuffle(expanded, factor)
+            del expanded
+            # output rows [first * f, stop * f) need fine rows widened by one
+            fine = fine[:, :, factor - 1 : fine.shape[-2] - (factor - 1)]
+            part = F.conv2d(fine, last.weight, last.bias, padding=(0, 1))
+            del fine
+            if out is None:
+                out = part.new_empty(
+                    (b, part.shape[1], height * factor, width * factor)
+                )
+            out[:, :, first * factor : stop * factor] = part
+        return out
+
     def _tail(
         self, shifted: Tensor, stem: Tensor, h: Tensor, hr: Tensor, packed: tuple
     ) -> Tensor:
         height, width = h.shape[-2:]
         features = stem + self.trunk_end(self.final_norm(h))
         t2 = self.tail[:4](features) + hr
-        out = self.tail[4:](t2)
+        # Without gradients the deployed stage runs in bands: the same result
+        # with one band's expanded features alive instead of the frame's.
+        if (
+            not torch.is_grad_enabled()
+            and isinstance(self.tail[4], nn.Conv2d)
+            and isinstance(self.tail[6], nn.Conv2d)
+        ):
+            out = self._tail_bands(t2)
+        else:
+            out = self.tail[4:](t2)
         if self.internal_scale >= 4:
             extra = self.xg(t2, packed, (height, width))
             out = out + (

@@ -155,6 +155,19 @@ def test_window_memory_modes(monkeypatch):
     torch.testing.assert_close(on_demand, default, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("size", [(5, 9), (37, 50), (64, 40)])
+def test_the_last_stage_in_bands_is_the_whole_frame_stage(monkeypatch, size):
+    model = RDUAL(scale=2, use_checkpoint=False).eval()
+    model.prepare_for_export()
+    t2 = torch.randn(1, 64, *size)
+    # Three rows of t2 per band, so bands meet inside the frame and at its edges.
+    monkeypatch.setattr(rdual_arch, "_TAIL_BAND_BYTES", 256 * size[1] * 4 * 3)
+    with torch.no_grad():
+        whole = model.tail[4:](t2)
+        banded = model._tail_bands(t2)
+    torch.testing.assert_close(banded, whole)
+
+
 @pytest.mark.parametrize("keep", [0, 4])
 def test_a_window_keeps_one_to_all_of_its_frames(keep):
     with pytest.raises(ValueError, match="keep must be"):
