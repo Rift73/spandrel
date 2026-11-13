@@ -16,6 +16,7 @@ from ..architectures import (
     GFPGAN,
     GRL,
     HAT,
+    HEART,
     IPT,
     PLKSR,
     RCAN,
@@ -116,4 +117,5 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(WSR.WSRArch()),
     ArchSupport.from_architecture(FIGSR.FIGSRArch()),
     ArchSupport.from_architecture(GFISRv2.GFISRv2Arch()),
+    ArchSupport.from_architecture(HEART.HEARTArch()),
 )
