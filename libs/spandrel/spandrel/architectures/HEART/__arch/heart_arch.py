@@ -21,10 +21,12 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils import checkpoint
 
+from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
 from ...__arch_helpers.flash_window import flash_window_attention
+from ...__arch_helpers.inference import traced
 
 
 class iLN(nn.Module):
@@ -43,12 +45,26 @@ class iLN(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # x: (B, L, C) where L = H*W
         b = x.shape[0]
+        if x.is_cuda and torch.version.hip is None and not traced():
+            if plain_inference(x, self):
+                return self.fused(x)
         x_flat = x.reshape(b, -1)
         mean = x_flat.mean(dim=1, keepdim=True).reshape(b, 1, 1)
         var = x_flat.var(dim=1, keepdim=True, unbiased=False).reshape(b, 1, 1)
         std = torch.sqrt(var + self.eps)
         x_norm = (x - mean) / std
         return self.weight * x_norm + self.bias, std
+
+    def fused(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """spandrel: eager CUDA inference in two passes over x instead of six: one
+        reduction for mean and variance, then x * (weight / std) + (bias - mean *
+        weight / std) in one kernel."""
+        b = x.shape[0]
+        var, mean = torch.var_mean(x.reshape(b, -1), dim=1, keepdim=True, correction=0)
+        std = torch.sqrt(var + self.eps).reshape(b, 1, 1)
+        scale = self.weight / std
+        shift = self.bias - mean.reshape(b, 1, 1) * scale
+        return torch.addcmul(shift, x, scale), std
 
 
 class AffineTransform(nn.Module):

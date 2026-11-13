@@ -13,6 +13,7 @@ from spandrel.architectures.DRCT import DRCT
 from spandrel.architectures.DRFT import DRFT
 from spandrel.architectures.HAT import HAT
 from spandrel.architectures.HEART import HEART, HEARTArch
+from spandrel.architectures.HEART.__arch import heart_arch
 from spandrel.architectures.SST.__arch import sst_arch
 from spandrel.architectures.Swin2SR import Swin2SR
 from spandrel.architectures.SwinIR import SwinIR
@@ -194,3 +195,21 @@ def test_window_kernel_matches_pytorchs_attention(
         monkeypatch.setattr(flash_window, "FLASH_WINDOW", False)
         expected = model(image)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0.02)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_fused_iln_matches_iln(dtype: torch.dtype):
+    # eager CUDA inference takes the fused path; its maths runs anywhere
+    torch.manual_seed(0)
+    norm = heart_arch.iLN(24)
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+        norm.bias.uniform_(-0.2, 0.2)
+    norm = norm.to(dtype)
+    x = (torch.randn(2, 37 * 45, 24) * 3 + 1).to(dtype)
+    with torch.no_grad():
+        expected, expected_std = norm(x)
+        actual, std = norm.fused(x)
+    tolerance = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(std, expected_std, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
