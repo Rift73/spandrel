@@ -24,6 +24,8 @@ from torch.utils import checkpoint
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
+from ...__arch_helpers.flash_window import flash_window_attention
+
 
 class iLN(nn.Module):
     """Image restoration tailored layer normalization (i-LN).
@@ -271,6 +273,20 @@ class RIBWindowAttention(nn.Module):
         pos_q = pos_q * (r**-0.5)
         q_cat = torch.cat([q, pos_q], dim=-1)
         k_cat = torch.cat([k, pos_k], dim=-1)
+
+        # spandrel: eager inference runs it in flash_window's kernel when it can,
+        # which takes q, k and v as they are; scaled_dot_product_attention's fused
+        # kernels want widths of a multiple of 8 and v as wide as q and k.
+        if not self.training:
+            out = flash_window_attention(
+                q_cat.transpose(1, 2),
+                k_cat.transpose(1, 2),
+                v.transpose(1, 2),
+                None,
+                1.0,
+            )
+            if out is not None:
+                return out.transpose(1, 2)
 
         d_total = q_cat.shape[-1]
         pad = (8 - (d_total % 8)) % 8

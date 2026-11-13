@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from spandrel import MAIN_REGISTRY
+from spandrel.architectures.__arch_helpers import flash_window
 from spandrel.architectures.ATD import ATD
 from spandrel.architectures.DRCT import DRCT
 from spandrel.architectures.DRFT import DRFT
@@ -135,3 +136,61 @@ def test_low_precision(dtype):
 
 def test_size_requirements():
     assert_size_requirements(HEARTArch().load(_small().state_dict()))
+
+
+def _attention(q, k, v, bias, scale):
+    # flash_window.launch's contract with PyTorch's attention: no padding needed
+    assert bias is None
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)
+
+
+def test_inference_attends_through_the_window_kernel(monkeypatch: pytest.MonkeyPatch):
+    torch.manual_seed(0)
+    model = _small(depths=(3, 2)).eval()
+    image = torch.rand(1, 3, 37, 45)
+    with torch.no_grad():
+        expected = model(image)
+        calls: list[tuple[int, ...]] = []
+
+        def launch(q, k, v, bias, scale):
+            calls.append((*q.shape, v.shape[-1]))
+            return _attention(q, k, v, bias, scale)
+
+        monkeypatch.setattr(flash_window, "usable", lambda *_: True)
+        monkeypatch.setattr(flash_window, "launch", launch)
+        actual = model(image)
+    # 2 + 1 attention blocks; q and k carry the 8 position features, unpadded
+    assert len(calls) == 3
+    assert calls[0][1:] == (2, 1024, 12 + 8, 12)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+
+
+def test_training_keeps_pytorchs_attention(monkeypatch: pytest.MonkeyPatch):
+    def launch(*_: object) -> torch.Tensor:
+        raise AssertionError("the kernel ran")
+
+    monkeypatch.setattr(flash_window, "usable", lambda *_: True)
+    monkeypatch.setattr(flash_window, "launch", launch)
+    _small().train()(torch.rand(1, 3, 32, 32))
+
+
+@pytest.mark.skipif(
+    not (
+        flash_window.AVAILABLE
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the kernel runs on NVIDIA GPUs with Triton",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_window_kernel_matches_pytorchs_attention(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
+):
+    torch.manual_seed(0)
+    model = _small(depths=(3, 2)).eval().cuda().to(dtype)
+    image = torch.rand(1, 3, 70, 45, device="cuda", dtype=dtype)
+    with torch.no_grad():
+        actual = model(image)
+        monkeypatch.setattr(flash_window, "FLASH_WINDOW", False)
+        expected = model(image)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0.02)
