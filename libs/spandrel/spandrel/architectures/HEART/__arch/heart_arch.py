@@ -523,17 +523,17 @@ class HAB_RIB(Derived):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim)
 
-    def conv_branch(self, x: torch.Tensor) -> torch.Tensor:
+    def conv_branch(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """spandrel: conv_block on channels-last x, its channel attention as linear
-        maps."""
+        maps: the convolutions' output and the attention's (B, C) gate, which the
+        caller applies with the residual's other factors in one pass."""
         conv_0, activation, conv_1, channel = self.conv_block.cab
         _, squeeze, relu, expand, sigmoid = channel.attention
         x = self.run_conv(
             "cab 1", conv_1, activation(self.run_conv("cab 0", conv_0, x))
         )
         y = F.linear(x.mean((2, 3)), squeeze.weight.flatten(1), squeeze.bias)
-        y = sigmoid(F.linear(relu(y), expand.weight.flatten(1), expand.bias))
-        return x.mul_(y[:, :, None, None])
+        return x, sigmoid(F.linear(relu(y), expand.weight.flatten(1), expand.bias))
 
     def forward_tokens(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
         """spandrel: forward in the token layout (token_layout)."""
@@ -541,17 +541,21 @@ class HAB_RIB(Derived):
         b, n, c = x.shape
         x_norm, std1 = self.norm1(x)
         image = x_norm.view(b, h, w, c)
+        conv_x, gate = self.conv_branch(image.permute(0, 3, 1, 2))
         # a view of the convolution's channels-last output: the tokens' layout
-        residual = self.conv_branch(image.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        conv_x = conv_x.permute(0, 2, 3, 1)
+        scale = std1.view(b, 1, 1, 1)
+        # x + std1 * (attention + conv_scale * gate * conv) in one pass per term
+        conv_factor = (gate * self.conv_scale)[:, None, None, :] * scale
         if self.use_attention:
-            residual = self.attn.forward_tokens(image).add_(
-                residual, alpha=self.conv_scale
+            x = torch.addcmul(
+                x.view(b, h, w, c), self.attn.forward_tokens(image), scale
             )
+            x = x.addcmul_(conv_x, conv_factor)
         else:
-            residual = residual.mul_(self.conv_scale)
-        del x_norm, image
-        x = torch.addcmul(x, residual.reshape(b, n, c), std1.view(b, 1, 1))
-        del residual
+            x = torch.addcmul(x.view(b, h, w, c), conv_x, conv_factor)
+        del x_norm, image, conv_x
+        x = x.view(b, n, c)
         x_norm, std2 = self.norm2(x)
         return x.addcmul_(self.mlp(x_norm), std2.view(b, 1, 1))
 
