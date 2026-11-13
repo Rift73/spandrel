@@ -14,6 +14,7 @@ from ...__helpers.model_descriptor import (
     SizeRequirements,
     StateDict,
 )
+from ...__helpers.rocm.common import from_triton
 
 if TYPE_CHECKING:
     from .__arch.rdual_arch import RDUAL
@@ -53,18 +54,6 @@ def __getattr__(name: str) -> object:
 
         return getattr(rdual_arch, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _from_triton(error: BaseException) -> bool:
-    """Whether the error, or one it was raised from, comes from Triton itself."""
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if type(current).__module__.partition(".")[0] == "triton":
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def _forward(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
@@ -107,7 +96,7 @@ def _falling_back(model: RDUAL, run: Callable[[], T]) -> T:
         return run()
     except Exception as error:
         triton = model.temporal.backend == "auto" or rdual_arch.NA_TRITON
-        if not triton or not _from_triton(error):
+        if not triton or not from_triton(error):
             raise
         logger.warning(
             "RDUAL's Triton kernels failed (%s: %s); using its PyTorch path",

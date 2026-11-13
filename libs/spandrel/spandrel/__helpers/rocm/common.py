@@ -79,6 +79,20 @@ def plain_inference(x: torch.Tensor, module: nn.Module) -> bool:
     return True
 
 
+def from_triton(error: BaseException) -> bool:
+    """Whether the error, or one it was raised from, comes from Triton itself: a
+    Triton kernel that fails to compile or launch switches itself off, while other
+    errors (out of memory, wrong inputs) are raised."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__module__.partition(".")[0] == "triton":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def is_depthwise_3x3(m: nn.Module) -> bool:
     """
     A plain nn.Conv2d (not a subclass, whose forward may differ) computing a

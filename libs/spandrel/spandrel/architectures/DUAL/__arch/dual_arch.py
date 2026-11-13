@@ -55,7 +55,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from spandrel.__helpers.rocm.common import plain_inference
+from spandrel.__helpers.rocm.common import from_triton, plain_inference
 from spandrel.util import store_hyperparameters
 
 from . import na_triton
@@ -552,18 +552,6 @@ def _na_triton_usable(module: nn.Module, x: Tensor, dim: int) -> bool:
     )
 
 
-def _from_triton(error: BaseException) -> bool:
-    """Whether the error, or one it was raised from, comes from Triton itself."""
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if type(current).__module__.partition(".")[0] == "triton":
-            return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
 class _SpatialAttention(_WindowAttention):
     """Original projections with optional per-query context neighborhoods."""
 
@@ -784,7 +772,7 @@ class _SpatialAttention(_WindowAttention):
                 self.window,
             )
         except Exception as error:
-            if not _from_triton(error):
+            if not from_triton(error):
                 raise
             NA_TRITON = False
             logger.warning(
