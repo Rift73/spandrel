@@ -6,7 +6,7 @@ import torch
 
 from spandrel import MAIN_REGISTRY
 from spandrel.architectures.DUAL import DUAL, DUALArch
-from spandrel.architectures.DUAL.__arch import dual_arch
+from spandrel.architectures.DUAL.__arch import dual_arch, na_local_triton
 from spandrel.architectures.DUAL.__arch.dual_arch import (
     _SpatialAttention,
     dual_light,
@@ -440,3 +440,159 @@ def test_every_dot_dual_loads_with_local_and_retrieval_na():
         assert layers and all(layer is local for layer in layers)
     with pytest.raises(ValueError, match="local_na requires"):
         _small(qk="cosine", context_na=False)
+
+
+needs_kernel = pytest.mark.skipif(
+    not (
+        na_local_triton.AVAILABLE
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the kernels run on NVIDIA GPUs with Triton",
+)
+
+
+def _counted(monkeypatch, name):
+    calls = []
+    launch = getattr(na_local_triton, name)
+
+    def counted(*args):
+        calls.append(args)
+        return launch(*args)
+
+    monkeypatch.setattr(na_local_triton, name, counted)
+    return calls
+
+
+def _local_attention(channels, window):
+    attention = _SpatialAttention(channels, channels // 32, window, pos_bias="rpb")
+    assert attention.relative_bias is not None
+    attention.relative_bias.data.normal_(0, 0.5)
+    attention.local_na = True
+    return attention.cuda().eval().half()
+
+
+# batch 2, non-square, partial 8x8 query tiles, above the window on one or both
+# axes, and a 2,080 x 2,080 map: 67,600 query tiles, past the 65,535 programs a
+# second grid axis holds
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "window", "shape"),
+    [
+        (2, 128, 16, (40, 37)),
+        (1, 128, 16, (17, 200)),
+        (1, 64, 16, (96, 9)),
+        (2, 64, 8, (25, 13)),
+        (1, 32, 16, (2080, 2080)),
+    ],
+)
+def test_local_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, channels, window, shape
+):
+    torch.manual_seed(0)
+    attention = _local_attention(channels, window)
+    x = torch.randn(batch, channels, *shape, device="cuda").half()
+    calls = _counted(monkeypatch, "local_na")
+    with torch.no_grad():
+        actual = attention.pre_gate_core(x)
+        assert len(calls) == 1
+        monkeypatch.setattr(dual_arch, "LOCAL_NA_TRITON", False)
+        expected = attention.pre_gate_core(x)
+    assert len(calls) == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-3)
+
+
+@needs_kernel
+def test_local_na_kernel_stays_off_up_to_the_window_and_outside_inference(
+    monkeypatch,
+):
+    attention = _local_attention(64, 16)
+    calls = _counted(monkeypatch, "local_na")
+    with torch.no_grad():
+        attention.pre_gate_core(torch.randn(1, 64, 16, 16, device="cuda").half())
+        attention.float().pre_gate_core(torch.randn(1, 64, 17, 17, device="cuda"))
+    attention.half().pre_gate_core(torch.randn(1, 64, 17, 17, device="cuda").half())
+    assert not calls
+
+
+def _retrieval_operands(batch, channels, fine, coarse):
+    q = torch.randn(batch, channels, *fine, device="cuda").half()
+    k = torch.randn(batch, channels, *coarse, device="cuda").half()
+    v = torch.randn(batch, channels, *coarse, device="cuda").half()
+    log_tau = (torch.randn(channels // 32, device="cuda") * 0.3).half()
+    return q, k, v, log_tau
+
+
+# coarse grids above 48 on one or both axes, odd fine sizes, batch 2, and a
+# 2,100 x 2,100 query map: 69,169 query tiles, past a second grid axis
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "fine", "coarse"),
+    [
+        (2, 128, (100, 98), (50, 49)),
+        (1, 64, (120, 60), (60, 30)),
+        (2, 64, (97, 41), (49, 21)),
+        (1, 32, (2100, 2100), (1050, 1050)),
+    ],
+)
+def test_retrieval_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, channels, fine, coarse
+):
+    torch.manual_seed(0)
+    q, k, v, log_tau = _retrieval_operands(batch, channels, fine, coarse)
+    calls = _counted(monkeypatch, "retrieval_na")
+    with torch.no_grad():
+        actual = dual_arch.attend_packed(dual_arch.pack_qk(q, k, na=True), v, log_tau)
+        assert len(calls) == 1
+        monkeypatch.setattr(dual_arch, "RETRIEVAL_NA_TRITON", False)
+        expected = dual_arch.attend_packed(dual_arch.pack_qk(q, k, na=True), v, log_tau)
+    assert len(calls) == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2e-3)
+
+
+@needs_kernel
+def test_retrieval_na_kernel_stays_off_up_to_48(monkeypatch):
+    q, k, v, log_tau = _retrieval_operands(1, 64, (96, 90), (48, 45))
+    calls = _counted(monkeypatch, "retrieval_na")
+    with torch.no_grad():
+        dual_arch.attend_packed(dual_arch.pack_qk(q, k, na=True), v, log_tau)
+    assert not calls
+
+
+class _TritonError(Exception):
+    pass
+
+
+_TritonError.__module__ = "triton.compiler.errors"
+
+
+def _local_na_failing_with(monkeypatch, error):
+    def launch(*_):
+        raise error
+
+    monkeypatch.setattr(dual_arch, "LOCAL_NA_TRITON", True)
+    monkeypatch.setattr(dual_arch, "_na_kernel_usable", lambda *_: True)
+    monkeypatch.setattr(na_local_triton, "local_na", launch)
+    torch.manual_seed(0)
+    attention = _SpatialAttention(64, 2, 16, pos_bias="rpb").eval()
+    attention.local_na = True
+    return attention, torch.randn(1, 64, 20, 18)
+
+
+def test_a_triton_failure_switches_to_the_local_na_pytorch_form(monkeypatch):
+    error = RuntimeError("kernel launch")
+    error.__cause__ = _TritonError("ast.Num")
+    attention, x = _local_na_failing_with(monkeypatch, error)
+    with torch.no_grad():
+        actual = attention.pre_gate_core(x)
+        assert not dual_arch.LOCAL_NA_TRITON
+        assert torch.equal(actual, attention.pre_gate_core(x))
+
+
+def test_other_local_na_kernel_failures_are_raised(monkeypatch):
+    attention, x = _local_na_failing_with(
+        monkeypatch, torch.OutOfMemoryError("CUDA out of memory")
+    )
+    with torch.no_grad(), pytest.raises(torch.OutOfMemoryError):
+        attention.pre_gate_core(x)
+    assert dual_arch.LOCAL_NA_TRITON

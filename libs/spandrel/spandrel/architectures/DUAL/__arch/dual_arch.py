@@ -27,7 +27,8 @@ Local G16 attention and the regional channel-attention mixer are unchanged.
 NA requires the default RFB positional bias and dot-product attention. Its
 differentiable SDPA path supports training. spandrel: eager CUDA inference
 runs NA as one Triton kernel (na_triton.py, chaiNNer-C's TensorRT plugin
-kernel) when Triton imports, and the SDPA path otherwise.
+kernel) when Triton imports, and the SDPA path otherwise; the local and the
+retrieval NA likewise run as Triton kernels (na_local_triton.py).
 
 Dependencies: PyTorch. (spandrel: the traiNNer registration and the optional
 Triton direct attention of the original file are not bundled; see below.) No
@@ -58,7 +59,7 @@ from torch.utils.checkpoint import checkpoint
 from spandrel.__helpers.rocm.common import from_triton, plain_inference
 from spandrel.util import store_hyperparameters
 
-from . import na_triton
+from . import na_local_triton, na_triton
 
 logger = logging.getLogger("spandrel.dual")
 
@@ -552,6 +553,41 @@ def _na_triton_usable(module: nn.Module, x: Tensor, dim: int) -> bool:
     )
 
 
+# spandrel: eager CUDA inference runs the local and the retrieval neighborhood
+# attention as Triton kernels (na_local_triton.py) when Triton imports; a kernel that
+# fails to compile or launch turns its switch off for the rest of the process, and the
+# PyTorch path runs instead.
+LOCAL_NA_TRITON = na_local_triton.AVAILABLE
+RETRIEVAL_NA_TRITON = na_local_triton.AVAILABLE
+_WEIGHTLESS = nn.Module().eval()
+
+
+def _na_kernel_usable(enabled: bool, module: nn.Module, x: Tensor) -> bool:
+    """Whether a local / retrieval NA kernel may run: plain eager inference (no
+    tracing, export, compile, gradients, autocast or dispatch mode) on an NVIDIA GPU
+    with FP16 features."""
+    return (
+        enabled
+        and x.is_cuda
+        and torch.version.hip is None
+        and x.dtype == torch.float16
+        and _eager_inference(module)
+        and plain_inference(x, module)
+    )
+
+
+def _kernel_failed(name: str, error: Exception) -> None:
+    """Raises error unless it comes from Triton; then warns once."""
+    if not from_triton(error):
+        raise error
+    logger.warning(
+        "DUAL's Triton %s neighborhood attention failed (%s: %s); using its PyTorch path",
+        name,
+        type(error).__name__,
+        error,
+    )
+
+
 # Attention elements per SDPA call before tiled local/retrieval NA splits tiles.
 _NA_ELEMENT_CAP = 2**27
 
@@ -1003,6 +1039,32 @@ class _SpatialAttention(_WindowAttention):
         # features, and low-precision rounding depends on the path.
         return output[:, :height, :width].permute(0, 3, 1, 2).contiguous()
 
+    def _local_na_triton(self, x: Tensor) -> Tensor | None:
+        """spandrel: _local_na_core from the Triton kernel, reading qkv (B, H*W, 3C)
+        as the projection writes it; None when the kernel failed, which switches
+        LOCAL_NA_TRITON off for good."""
+        global LOCAL_NA_TRITON
+        assert self.relative_bias is not None
+        batch, channels, height, width = x.shape
+        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+        qkv = self.qkv(tokens)
+        # the bias rounded to the features' type, as the PyTorch path rounds it
+        table = (
+            self.relative_bias.to(calculation_dtype(x.dtype))
+            .to(x.dtype)
+            .t()
+            .contiguous()
+        )
+        try:
+            out = na_local_triton.local_na(
+                qkv.contiguous(), table, height, width, self.window
+            )
+        except Exception as error:
+            _kernel_failed("local", error)
+            LOCAL_NA_TRITON = False
+            return None
+        return out.permute(0, 3, 1, 2)
+
     def _local_na_core(self, x: Tensor) -> Tensor:
         """Per-query window neighborhoods with dense RPB, batched in 8x8 tiles.
 
@@ -1013,6 +1075,10 @@ class _SpatialAttention(_WindowAttention):
             raise ValueError("local_na requires RPB bias and dot-product attention")
         batch, channels, height, width = x.shape
         heads, dim, tile, window = self.heads, channels // self.heads, 8, self.window
+        if dim == 32 and _na_kernel_usable(LOCAL_NA_TRITON, self, x):
+            out = self._local_na_triton(x)
+            if out is not None:
+                return out
         geometry = na_geometry(
             (height, width), (height, width), window, tile, 1, x.device
         )
@@ -1288,12 +1354,37 @@ def pack_qk(q: Tensor, k: Tensor, *, na: bool = False) -> tuple:
     return layout, classes, q.shape[0]
 
 
+def _retrieval_na_triton(
+    query: Tensor, key: Tensor, v: Tensor, log_tau: Tensor, shape: torch.Size
+) -> Tensor | None:
+    """spandrel: attend_packed's neighborhood branch from the Triton kernel, reading
+    the BCHW projections pack_qk viewed; None when the kernel failed, which switches
+    RETRIEVAL_NA_TRITON off for good."""
+    global RETRIEVAL_NA_TRITON
+    images, channels, height, width = shape
+    q = query.transpose(1, 2).reshape(images, channels, height, width)
+    k = key.transpose(1, 2).reshape(images, channels, *v.shape[-2:])
+    tau = log_tau.exp().clamp(0.1, 10).to(q.dtype)
+    try:
+        return na_local_triton.retrieval_na(
+            q.contiguous(), k.contiguous(), v.contiguous(), tau.contiguous()
+        )
+    except Exception as error:
+        _kernel_failed("retrieval", error)
+        RETRIEVAL_NA_TRITON = False
+        return None
+
+
 def attend_packed(packed: tuple, v: Tensor, log_tau: Tensor) -> Tensor:
     layout, classes, batch = packed
     if isinstance(layout, NAGeometry):
         query, key = classes
         images, channels, height, width = batch
         heads = channels // 32
+        if _na_kernel_usable(RETRIEVAL_NA_TRITON, _WEIGHTLESS, v):
+            out = _retrieval_na_triton(query, key, v, log_tau, batch)
+            if out is not None:
+                return out
         value = v.reshape(query.shape[0], 32, -1).transpose(1, 2)
         tau = log_tau.exp().clamp(0.1, 10).to(query.dtype).repeat(images)
         query = query * tau[:, None, None]
