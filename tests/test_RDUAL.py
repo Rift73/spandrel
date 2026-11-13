@@ -1,3 +1,4 @@
+import importlib
 import os
 import subprocess
 import sys
@@ -172,3 +173,30 @@ def test_importing_spandrel_leaves_the_architecture_module_unloaded():
     spandrel = Path(__file__).parent.parent / "libs" / "spandrel"
     env = {**os.environ, "PYTHONPATH": str(spandrel)}
     subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=240)
+
+
+def test_the_export_names_are_the_architecture_modules_own():
+    package = importlib.import_module("spandrel.architectures.RDUAL")
+
+    pairs = {
+        "HAS_DIRECT_ATTENTION": "_HAS_DIRECT_ATTENTION",
+        "DIRECT_ATTENTION_ERROR": "_DIRECT_ATTENTION_ERROR",
+        "SpatialAttention": "_SpatialAttention",
+        "GROUP_INDICES": "_INDICES",
+        **{
+            f"NF_{kind}_{level}": f"_NF_{kind}_{level}"
+            for kind in ("CONTEXT_DIM", "FEATURE_DIM", "ITER_CONTEXT_DIM", "ITERS")
+            for level in ("S16", "S8")
+        },
+    }
+    if rdual_arch.HAS_DIRECT_ATTENTION:
+        pairs["TEMPORAL_FORWARD_KERNEL"] = "_temporal_forward_kernel"
+        pairs["KV_WARP_FORWARD_KERNEL"] = "_kv_warp_forward_kernel"
+    else:
+        assert package.TEMPORAL_FORWARD_KERNEL is None
+        assert package.KV_WARP_FORWARD_KERNEL is None
+    for public, private in pairs.items():
+        assert getattr(package, public) is getattr(rdual_arch, private), public
+    assert package.NeuFlowV2 is rdual_arch.NeuFlowV2
+    neuflow = rdual_arch.NeuFlowV2
+    assert neuflow.prepare_grids is vars(neuflow)["_prepare_grids"]

@@ -3937,6 +3937,9 @@ class NeuFlowV2(nn.Module):
             self._grids_key = key
         return self._grids
 
+    # Its public name, for the TensorRT export.
+    prepare_grids = _prepare_grids
+
     def forward(self, img0: Tensor, img1: Tensor) -> Tensor:
         b, _, height, width = img0.shape
         grids = self._prepare_grids(b, height, width, img0.device)
@@ -5298,3 +5301,24 @@ if _HAS_DIRECT_ATTENTION:
 
 def rdual(scale: int = 4, use_checkpoint: bool = True, **kwargs: Any) -> RDUAL:
     return RDUAL(scale=scale, use_checkpoint=use_checkpoint, **kwargs)
+
+
+# Public names for the TensorRT export. The body keeps its own names, as in the
+# trainer's copy; every one of these is bound once, at import.
+HAS_DIRECT_ATTENTION = _HAS_DIRECT_ATTENTION
+DIRECT_ATTENTION_ERROR = _DIRECT_ATTENTION_ERROR
+if _HAS_DIRECT_ATTENTION:
+    TEMPORAL_FORWARD_KERNEL = _temporal_forward_kernel
+    KV_WARP_FORWARD_KERNEL = _kv_warp_forward_kernel
+else:
+    TEMPORAL_FORWARD_KERNEL = KV_WARP_FORWARD_KERNEL = None
+SpatialAttention = _SpatialAttention
+GROUP_INDICES = _INDICES
+NF_CONTEXT_DIM_S16 = _NF_CONTEXT_DIM_S16
+NF_CONTEXT_DIM_S8 = _NF_CONTEXT_DIM_S8
+NF_FEATURE_DIM_S16 = _NF_FEATURE_DIM_S16
+NF_FEATURE_DIM_S8 = _NF_FEATURE_DIM_S8
+NF_ITER_CONTEXT_DIM_S16 = _NF_ITER_CONTEXT_DIM_S16
+NF_ITER_CONTEXT_DIM_S8 = _NF_ITER_CONTEXT_DIM_S8
+NF_ITERS_S16 = _NF_ITERS_S16
+NF_ITERS_S8 = _NF_ITERS_S8

@@ -23,13 +23,35 @@ logger = logging.getLogger("spandrel.rdual")
 T = TypeVar("T")
 
 
+# The architecture module's public names for the TensorRT export.
+_EXPORT_NAMES = frozenset(
+    (
+        "HAS_DIRECT_ATTENTION",
+        "DIRECT_ATTENTION_ERROR",
+        "TEMPORAL_FORWARD_KERNEL",
+        "KV_WARP_FORWARD_KERNEL",
+        "SpatialAttention",
+        "GROUP_INDICES",
+        "NeuFlowV2",
+        "NF_CONTEXT_DIM_S16",
+        "NF_CONTEXT_DIM_S8",
+        "NF_FEATURE_DIM_S16",
+        "NF_FEATURE_DIM_S8",
+        "NF_ITER_CONTEXT_DIM_S16",
+        "NF_ITER_CONTEXT_DIM_S8",
+        "NF_ITERS_S16",
+        "NF_ITERS_S8",
+    )
+)
+
+
 def __getattr__(name: str) -> object:
     # The architecture's module imports Triton and Flex attention and registers its
     # kernels: it loads with the first RDUAL model, not with every import of spandrel.
-    if name == "RDUAL":
-        from .__arch.rdual_arch import RDUAL
+    if name == "RDUAL" or name in _EXPORT_NAMES:
+        from .__arch import rdual_arch
 
-        return RDUAL
+        return getattr(rdual_arch, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
