@@ -346,3 +346,59 @@ def test_early_freeing_keeps_the_attentions_output(shift: bool):
     x = torch.rand(1, 24, 64, 96)
     with torch.no_grad():
         assert torch.equal(attn(x), _attention_before_early_freeing(attn, x))
+
+
+def _forced_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The token layout on the CPU, for inference."""
+    monkeypatch.setattr(
+        heart_arch,
+        "token_layout",
+        lambda _x, module: not module.training and not torch.is_grad_enabled(),
+    )
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda: _small(depths=(3, 2)), id="shifted-and-plain"),
+        pytest.param(lambda: _small(attention_freq=1, upscale=4), id="every-block"),
+        pytest.param(lambda: _small(resi_connection="identity"), id="identity"),
+        pytest.param(lambda: _small(upscale=1, patch_norm=False), id="1x"),
+    ],
+)
+@pytest.mark.parametrize(("h", "w"), [(37, 45), (5, 7), (64, 33)])
+def test_token_layout_computes_the_same_model(
+    monkeypatch: pytest.MonkeyPatch, make, h: int, w: int
+):
+    torch.manual_seed(0)
+    model = make().eval()
+    for p in model.parameters():
+        nn.init.normal_(p, 0, 0.05)
+    image = torch.rand(1, 3, h, w)
+    with torch.no_grad():
+        expected = model(image)
+        _forced_tokens(monkeypatch)
+        actual = model(image)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_token_layout_stays_off_where_the_original_layout_runs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model = _small().eval()
+    x = torch.rand(1, 64, 24)
+    with torch.no_grad():
+        # the CPU
+        assert not heart_arch.token_layout(x, model)
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+        monkeypatch.setattr(torch.version, "hip", None)
+        assert heart_arch.token_layout(x, model)
+        # ROCm
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+        assert not heart_arch.token_layout(x, model)
+        monkeypatch.setattr(torch.version, "hip", None)
+    # gradients and training
+    assert not heart_arch.token_layout(x, model)
+    with torch.no_grad():
+        assert not heart_arch.token_layout(x, model.train())

@@ -26,7 +26,12 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
 from ...__arch_helpers.flash_window import flash_window_attention
-from ...__arch_helpers.inference import banded_tail, tail_scale_and_halo, traced
+from ...__arch_helpers.inference import (
+    Derived,
+    banded_tail,
+    tail_scale_and_halo,
+    traced,
+)
 
 # spandrel: the high-resolution tail (conv_before_upsample, upsample, conv_last) runs in
 # bands of a BAND_DIVISOR-th of the padded trunk's rows, at least MIN_BAND_ROWS, as ESRGAN's
@@ -34,6 +39,25 @@ from ...__arch_helpers.inference import banded_tail, tail_scale_and_halo, traced
 BAND_DIVISOR = 8
 MIN_BAND_ROWS = 32
 WHOLE_TAIL_ROWS = 256
+
+
+def token_layout(x: torch.Tensor, module: nn.Module) -> bool:
+    """spandrel: whether module runs on x in the token layout, (B, H, W, C) memory with
+    channels-last convolutions on views of it and 1x1 convolutions as linear maps:
+    plain eager inference on an NVIDIA GPU. The CPU, ROCm, tracing and training keep the
+    original layout."""
+    return (
+        x.is_cuda
+        and torch.version.hip is None
+        and not traced()
+        and plain_inference(x, module)
+    )
+
+
+def _reflect_index(n: int, pad: int, device: torch.device) -> torch.Tensor:
+    """The rows (or columns) of a reflect padding of n by pad on each side."""
+    i = torch.arange(-pad, n + pad, device=device)
+    return torch.where(i < 0, -i, torch.where(i >= n, 2 * (n - 1) - i, i))
 
 
 class iLN(nn.Module):
@@ -332,6 +356,63 @@ class RIBWindowAttention(nn.Module):
             scale=1.0,
         ).transpose(1, 2)[:, :, :, :d]
 
+    def _positions(
+        self, bwin: int, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # RIB position features (fp32 for fp16-inference stability)
+        intermediate = F.relu(
+            self.rib_coords.to(dtype=torch.float32)
+            @ self.to_hidden.to(dtype=torch.float32)
+            + self.hidden_b.to(dtype=torch.float32)
+        )  # (N, hidden_d)
+        q_pos = torch.einsum(
+            "nd,hdr->hnr", intermediate, self.to_q.to(dtype=torch.float32)
+        )  # (heads, N, R)
+        k_pos = torch.einsum(
+            "nd,hdr->hnr", intermediate, self.to_k.to(dtype=torch.float32)
+        )
+        q_pos = (
+            q_pos.to(dtype).unsqueeze(0).expand(bwin, -1, -1, -1)
+        )  # (Bwin, heads, N, R)
+        k_pos = k_pos.to(dtype).unsqueeze(0).expand(bwin, -1, -1, -1)
+        return q_pos, k_pos
+
+    def forward_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """spandrel: the attention on tokens x (B, H, W, C), H and W multiples of the
+        window, as (B, H, W, C). The projections are linear maps on the tokens; one
+        gather pads (shifted windows) and partitions each of q, k and v, and one
+        gathers the windows back and crops."""
+        b, h, w, c = x.shape
+        ws = self.window_size[0]
+        s = ws // 2 if self.shift else 0
+        hd, wd = (h + 2 * s) // ws, (w + 2 * s) // ws
+        rows = _reflect_index(h, s, x.device).view(hd, 1, ws, 1)
+        cols = _reflect_index(w, s, x.device).view(1, wd, 1, ws)
+        qkv = F.linear(x, self.to_qkv.weight.flatten(1), self.to_qkv.bias)
+        q, k, v = (
+            qkv[..., i * c : (i + 1) * c][:, rows, cols].view(
+                b * hd * wd, ws * ws, self.num_heads, -1
+            )
+            for i in range(3)
+        )  # (Bwin, N, heads, D)
+        del qkv
+        q_pos, k_pos = self._positions(q.shape[0], q.dtype)
+        q_cat, k_cat = self._cat_position(q, k, q_pos, k_pos)
+        del q, k
+        out = self._flash_cat_attn(q_cat, k_cat, v)  # (Bwin, N, heads, D)
+        del q_cat, k_cat, v
+        # each token's window and place in it, past the shift's padding
+        ys = torch.arange(s, h + s, device=x.device)
+        xs = torch.arange(s, w + s, device=x.device)
+        out = out.reshape(b, hd, wd, ws, ws, c)[
+            :,
+            (ys // ws)[:, None],
+            (xs // ws)[None, :],
+            (ys % ws)[:, None],
+            (xs % ws)[None, :],
+        ]
+        return F.linear(out, self.to_out.weight.flatten(1), self.to_out.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)
         _, _, h, w = x.shape
@@ -366,24 +447,7 @@ class RIBWindowAttention(nn.Module):
         )  # (Bwin, N, heads, D)
         del qkv
 
-        # RIB position features (fp32 for fp16-inference stability)
-        intermediate = F.relu(
-            self.rib_coords.to(dtype=torch.float32)
-            @ self.to_hidden.to(dtype=torch.float32)
-            + self.hidden_b.to(dtype=torch.float32)
-        )  # (N, hidden_d)
-        q_pos = torch.einsum(
-            "nd,hdr->hnr", intermediate, self.to_q.to(dtype=torch.float32)
-        )  # (heads, N, R)
-        k_pos = torch.einsum(
-            "nd,hdr->hnr", intermediate, self.to_k.to(dtype=torch.float32)
-        )
-        bwin = q.shape[0]
-        q_pos = (
-            q_pos.to(q.dtype).unsqueeze(0).expand(bwin, -1, -1, -1)
-        )  # (Bwin, heads, N, R)
-        k_pos = k_pos.to(k.dtype).unsqueeze(0).expand(bwin, -1, -1, -1)
-
+        q_pos, k_pos = self._positions(q.shape[0], q.dtype)
         q_cat, k_cat = self._cat_position(q, k, q_pos, k_pos)
         del q, k
         out = self._flash_cat_attn(q_cat, k_cat, v)  # (Bwin, N, heads, D)
@@ -401,7 +465,7 @@ class RIBWindowAttention(nn.Module):
         return self.to_out(out)
 
 
-class HAB_RIB(nn.Module):
+class HAB_RIB(Derived):
     """Hybrid Attention Block: RIB window attention + CAB conv branch + i-LN."""
 
     def __init__(
@@ -445,7 +509,41 @@ class HAB_RIB(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim)
 
+    def conv_branch(self, x: torch.Tensor) -> torch.Tensor:
+        """spandrel: conv_block on channels-last x, its channel attention as linear
+        maps."""
+        conv_0, activation, conv_1, channel = self.conv_block.cab
+        _, squeeze, relu, expand, sigmoid = channel.attention
+        x = self.run_conv(
+            "cab 1", conv_1, activation(self.run_conv("cab 0", conv_0, x))
+        )
+        y = F.linear(x.mean((2, 3)), squeeze.weight.flatten(1), squeeze.bias)
+        y = sigmoid(F.linear(relu(y), expand.weight.flatten(1), expand.bias))
+        return x.mul_(y[:, :, None, None])
+
+    def forward_tokens(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
+        """spandrel: forward in the token layout (token_layout)."""
+        h, w = x_size
+        b, n, c = x.shape
+        x_norm, std1 = self.norm1(x)
+        image = x_norm.view(b, h, w, c)
+        # a view of the convolution's channels-last output: the tokens' layout
+        residual = self.conv_branch(image.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        if self.use_attention:
+            residual = self.attn.forward_tokens(image).add_(
+                residual, alpha=self.conv_scale
+            )
+        else:
+            residual = residual.mul_(self.conv_scale)
+        del x_norm, image
+        x = torch.addcmul(x, residual.reshape(b, n, c), std1.view(b, 1, 1))
+        del residual
+        x_norm, std2 = self.norm2(x)
+        return x.addcmul_(self.mlp(x_norm), std2.view(b, 1, 1))
+
     def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
+        if token_layout(x, self):
+            return self.forward_tokens(x, x_size)
         h, w = x_size
         b, _, c = x.shape
 
@@ -529,7 +627,7 @@ class AttenBlocksRIB(nn.Module):
         return x
 
 
-class RHAG_RIB(nn.Module):
+class RHAG_RIB(Derived):
     """Residual Hybrid Attention Group: AttenBlocksRIB -> 3x3 conv -> residual."""
 
     def __init__(
@@ -585,6 +683,13 @@ class RHAG_RIB(nn.Module):
         self.patch_unembed = PatchUnEmbed(embed_dim=dim)
 
     def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
+        if isinstance(self.conv, nn.Conv2d) and token_layout(x, self):
+            # spandrel: the closing convolution on a channels-last view of the tokens
+            y = self.residual_group(x, x_size)
+            b, n, c = y.shape
+            image = y.view(b, x_size[0], x_size[1], c).permute(0, 3, 1, 2)
+            y = self.run_conv("conv", self.conv, image).permute(0, 2, 3, 1)
+            return y.reshape(b, n, c).add_(x)
         return (
             self.patch_embed(
                 self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))
@@ -594,7 +699,7 @@ class RHAG_RIB(nn.Module):
 
 
 @store_hyperparameters()
-class HEART(nn.Module):
+class HEART(Derived):
     """HEART - Hybrid Efficient Attention with Rank-factorized bias Transformer.
 
     Simplified HAT-iLN: RIB window attention (FlashAttention-friendly) replaces
@@ -742,14 +847,32 @@ class HEART(nn.Module):
             x = layer(x, x_size)
 
         x = self.norm(x)
+        if token_layout(x, self):
+            # spandrel: the tokens as a channels-last image, without a copy
+            return x.view(x.shape[0], *x_size, -1).permute(0, 3, 1, 2)
         return self.patch_unembed(x, x_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h, w = x.shape[2:]
         x = self.check_image_size(x)
 
-        x = self.conv_first(x)
-        x = self.conv_after_body(self.forward_features(x)) + x
+        tokens = token_layout(x, self)
+        if tokens:
+            # spandrel: channels last from the first convolution to the last, so the
+            # trunk's tokens are the image's memory
+            x = x.contiguous(memory_format=torch.channels_last)
+            x = self.run_conv("conv_first", self.conv_first, x)
+            features = self.forward_features(x)
+            if isinstance(self.conv_after_body, nn.Conv2d):
+                features = self.run_conv(
+                    "conv_after_body", self.conv_after_body, features
+                )
+                x = features.add_(x)
+            else:
+                x = features + x
+        else:
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
         plan = self.tail_plan(x)
         if plan is None:
             x = self.tail(x)
@@ -766,7 +889,8 @@ class HEART(nn.Module):
             )
             x = banded_tail(self.tail, x, *plan, rows=rows)
 
-        return x[:, :, : h * self.upscale, : w * self.upscale]
+        x = x[:, :, : h * self.upscale, : w * self.upscale]
+        return x.contiguous() if tokens else x
 
     def tail(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv_last(self.upsample(self.conv_before_upsample(x)))
