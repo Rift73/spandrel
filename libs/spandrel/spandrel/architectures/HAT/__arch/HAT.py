@@ -12,6 +12,7 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
 from ...__arch_helpers.attention import pad_heads, window_attention
+from ...__arch_helpers.index_window import index_window_attention
 from ...__arch_helpers.inference import (
     Derived,
     add_into,
@@ -369,6 +370,17 @@ class HAB(Derived):
         qkv, width = attn.image_qkv(x)
         bias = attn.cached_bias(rpi_sa)
         dropout = attn.attn_drop.p if self.training else 0.0
+        # every window read and written in token order, the mask from the token's region
+        y = index_window_attention(
+            qkv.permute(1, 2, 3, 0, 4).unflatten(4, (attn.num_heads, -1)),
+            bias,
+            size,
+            shift,
+            width,
+            attn.scale,
+        )
+        if y is not None:
+            return attn.proj_drop(attn.proj(y))
         if shift > 0 and h > size and w > size:
             y = shifted_window_attention(
                 qkv, h, w, size, size, shift, shift, attn.num_heads, bias, attn_mask, attn.scale, dropout, width
