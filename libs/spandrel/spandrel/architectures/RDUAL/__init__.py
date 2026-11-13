@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, TypeVar
 
 import torch
 from typing_extensions import override
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from .__arch.rdual_arch import RDUAL
 
 logger = logging.getLogger("spandrel.rdual")
+
+T = TypeVar("T")
 
 
 def __getattr__(name: str) -> object:
@@ -49,15 +51,24 @@ def _forward(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
         return model(frames.float()).float()
 
 
-def run_clip(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
-    """B,T,3,H,W frames in 0..1 to B,T,3,sH,sW in FP32.
+def _window(
+    model: RDUAL,
+    frames: torch.Tensor,
+    keep: int,
+    past: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cuda = frames.device.type == "cuda"
+    with torch.autocast("cuda", torch.bfloat16, enabled=cuda):
+        outputs, state = model.infer_window(frames.float(), keep, past)
+    return outputs.float(), state
 
-    On CUDA the trunk runs under BF16 autocast; the bundled flow switches autocast
-    off for itself. When the temporal stage's Triton kernels fail to compile (a
-    Triton too old for this Python, for example), the model switches to its PyTorch
-    temporal path for good and runs the clip again."""
+
+def _falling_back(model: RDUAL, run: Callable[[], T]) -> T:
+    """run(), and when the temporal stage's Triton kernels fail to compile (a Triton
+    too old for this Python, for example), run() again on the model's PyTorch
+    temporal path, which it then keeps for good."""
     try:
-        return _forward(model, frames)
+        return run()
     except Exception as error:
         if model.temporal.backend != "auto" or not _from_triton(error):
             raise
@@ -67,7 +78,29 @@ def run_clip(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
             error,
         )
         model.temporal.backend = "reference"
-        return _forward(model, frames)
+        return run()
+
+
+def run_clip(model: RDUAL, frames: torch.Tensor) -> torch.Tensor:
+    """B,T,3,H,W frames in 0..1 to B,T,3,sH,sW in FP32.
+
+    On CUDA the trunk runs under BF16 autocast; the bundled flow switches autocast
+    off for itself. A failing Triton temporal kernel switches the model to its
+    PyTorch temporal path, and the clip runs again."""
+    return _falling_back(model, lambda: _forward(model, frames))
+
+
+def run_window(
+    model: RDUAL,
+    frames: torch.Tensor,
+    keep: int,
+    past: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RDUAL.infer_window() with run_clip's precision and Triton fallback: the
+    B,keep,3,sH,sW outputs in FP32 of a window of B,n,3,H,W frames and the state
+    to carry, from the (state, previous frame) `past` of the window before it or a
+    cold start."""
+    return _falling_back(model, lambda: _window(model, frames, keep, past))
 
 
 def _call(model: RDUAL, image: torch.Tensor) -> torch.Tensor:
@@ -126,4 +159,4 @@ class RDUALArch(Architecture["RDUAL"]):
         return descriptor
 
 
-__all__ = ["RDUALArch", "RDUAL", "run_clip"]
+__all__ = ["RDUALArch", "RDUAL", "run_clip", "run_window"]

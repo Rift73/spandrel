@@ -8,7 +8,7 @@ import torch
 
 from spandrel import MAIN_REGISTRY, ImageModelDescriptor
 from spandrel.architectures.DUAL.__arch.dual_arch import dual_light
-from spandrel.architectures.RDUAL import RDUAL, RDUALArch, run_clip
+from spandrel.architectures.RDUAL import RDUAL, RDUALArch, run_clip, run_window
 
 from .util import assert_loads_correctly, skip_if_unchanged
 
@@ -76,6 +76,46 @@ def test_one_image_is_a_clip_of_one_frame():
         clip = run_clip(descriptor.model, image[:, None])[:, 0]
     assert out.shape == (1, 3, 64, 80)
     torch.testing.assert_close(out, clip.clamp(0, 1), atol=0, rtol=0)
+
+
+def _temporal_model() -> RDUAL:
+    # The temporal stage starts at zero output; random weights make every frame
+    # read its neighbors and the carried state.
+    torch.manual_seed(0)
+    model = _model(scale=2).eval()
+    with torch.no_grad():
+        for parameter in model.temporal.parameters():
+            parameter.normal_(0, 0.05)
+    return model
+
+
+def test_chained_windows_reaching_the_end_are_the_whole_clip():
+    model = _temporal_model()
+    frames = torch.rand(1, 7, 3, 32, 40)
+    with torch.inference_mode():
+        whole = model(frames)
+        first, state = run_window(model, frames, 3)
+        second, _ = run_window(model, frames[:, 3:], 4, (state, frames[:, 2]))
+    assert first.shape == (1, 3, 3, 64, 80)
+    assert second.shape == (1, 4, 3, 64, 80)
+    torch.testing.assert_close(torch.cat((first, second), 1), whole)
+
+
+def test_a_carried_state_changes_the_window_against_a_cold_start():
+    model = _temporal_model()
+    frames = torch.rand(1, 6, 3, 32, 40)
+    with torch.inference_mode():
+        _, state = run_window(model, frames[:, :3], 3)
+        carried, _ = run_window(model, frames[:, 3:], 2, (state, frames[:, 2]))
+        cold, _ = run_window(model, frames[:, 3:], 2)
+    assert carried.shape == cold.shape == (1, 2, 3, 64, 80)
+    assert (carried - cold).abs().amax() > 1e-3
+
+
+@pytest.mark.parametrize("keep", [0, 4])
+def test_a_window_keeps_one_to_all_of_its_frames(keep):
+    with pytest.raises(ValueError, match="keep must be"):
+        _temporal_model().infer_window(torch.rand(1, 3, 3, 32, 40), keep)
 
 
 class _TritonError(Exception):

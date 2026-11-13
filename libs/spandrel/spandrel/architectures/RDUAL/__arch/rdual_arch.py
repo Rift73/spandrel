@@ -4724,6 +4724,45 @@ class RDUAL(nn.Module):
             del window, packed, links, out
         return torch.stack(outputs, 1)
 
+    @torch.no_grad()
+    def infer_window(
+        self,
+        frames: Tensor,
+        keep: int,
+        past: tuple[Tensor, Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """One window of a longer clip that arrives a few frames at a time.
+
+        frames is the window's B,n,3,H,W frames in 0..1 on the model's device;
+        the first keep of them get outputs, and the frames after those are its
+        look-ahead: the reverse sweep starts at the window's last frame with no
+        future, and they produce no output. past is the (state, frame) the
+        previous window returned and the B,3,H,W frame just before this window,
+        which links that state to the first frame; None starts cold, as
+        forward() starts a clip. Returns the B,keep,3,sH,sW outputs and the
+        state carried from frame keep-1, the past of a window that starts at
+        frame keep with frames[:, keep-1].
+
+        Chained windows give infer()'s result for the same chunks and
+        look-ahead: forward()'s when every window reaches the clip's end.
+        Guidance is computed per window, for its frame pairs and the pair that
+        links the previous frame.
+        """
+        if type(keep) is not int or not 1 <= keep <= frames.shape[1]:
+            raise ValueError("keep must be an int from 1 to the window's frames")
+        window = frames if past is None else torch.cat((past[1][:, None], frames), 1)
+        guidance = self.guidance(window)
+        links = self._clip_edges(window, guidance)
+        packed = self.pack_guidance(window, guidance)
+        carried = None
+        if past is not None:
+            carried = (past[0], packed[:, 0, 0], links[:, 0])
+            packed, links = packed[:, 1:], links[:, 1:]
+        out, state = self._sweeps(frames, packed, links, carried, keep)
+        original_h, original_w = frames.shape[-2:]
+        outputs = torch.stack(out, 1)
+        return outputs[..., : original_h * self.scale, : original_w * self.scale], state
+
     def step_functions(
         self, compile: Callable[[Callable], Callable] | None = None
     ) -> StepFunctions:
