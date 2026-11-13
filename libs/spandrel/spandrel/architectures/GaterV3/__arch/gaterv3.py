@@ -920,13 +920,21 @@ class GateRV3(nn.Module):
         B, C, H, W = inp.shape
         inp = self.check_img_size(inp, (H, W))
         x = self.in_to_dim(inp)
-        sisr = self.span_block0(x)
+        # spandrel: the SISR branch's dense convolutions channels last where cuDNN would
+        # convert each one's input and output (one conversion each way for the branch)
+        branch = self.on_gpu_eager(x)
+        sisr_in = x.contiguous(memory_format=torch.channels_last) if branch else x
+        sisr = self.span_block0(sisr_in)
         sisr_short = sisr
         sisr = self.span_n_b(sisr)
         sisr, sisr_out = self.span_end(sisr)
         sisr = self.sisr_end_conv(sisr)
-        sisr = self.sisr_cat_conv(torch.cat([x, sisr, sisr_short, sisr_out], dim=1))
-        del sisr_short, sisr_out
+        sisr = self.sisr_cat_conv(
+            torch.cat([sisr_in, sisr, sisr_short, sisr_out], dim=1)
+        )
+        del sisr_in, sisr_short, sisr_out
+        if branch:
+            sisr = sisr.contiguous()
         shorts = []
 
         for index, block in enumerate(self.gater_encode):
@@ -959,13 +967,21 @@ class GateRV3(nn.Module):
         x = x + self.gamma * self.short_to_dim(inp)
         return x[:, :, : H * self.scale, : W * self.scale]
 
+    def on_gpu_eager(self, x: Tensor) -> bool:
+        """spandrel: plain eager inference on an NVIDIA GPU: not tracing, export,
+        training, ROCm or the CPU, which keep the original's passes."""
+        return (
+            x.is_cuda
+            and torch.version.hip is None
+            and plain_inference(x, self)
+            and not traced()
+        )
+
     def tail_plan(self, x: Tensor) -> tuple[int, int] | None:
         """spandrel: (scale, halo) for banding the upsampler in plain eager inference on an
         NVIDIA GPU (any precision); None for the whole pass: tracing, export, training,
         ROCm, the CPU, no upscaling, or an upsampler tail_scale_and_halo cannot band."""
-        if not (x.is_cuda and torch.version.hip is None and plain_inference(x, self)):
-            return None
-        if traced():
+        if not self.on_gpu_eager(x):
             return None
         plan = tail_scale_and_halo(self.dim_to_in)
         return plan if plan is not None and plan[0] > 1 else None

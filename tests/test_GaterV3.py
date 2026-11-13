@@ -297,3 +297,25 @@ def test_on_the_cpu_and_in_a_trace_the_tail_runs_whole():
     image = torch.rand(1, 3, 24, 40)
     with torch.no_grad():
         assert model.tail_plan(image) is None
+
+
+def test_the_sisr_branch_channels_last_computes_the_same(monkeypatch):
+    from spandrel.architectures.GaterV3.__arch import gaterv3
+
+    torch.manual_seed(0)
+    model = GateRV3(enc_blocks=(1, 1, 1), dec_blocks=(1, 1, 1), num_latent=1).eval()
+    image = torch.rand(1, 3, 24, 40)
+    layouts: list[bool] = []
+    model.span_block0.register_forward_pre_hook(
+        lambda _m, args: layouts.append(
+            args[0].is_contiguous(memory_format=torch.channels_last)
+        )
+    )
+    with torch.no_grad():
+        plain = model(image)
+        monkeypatch.setattr(gaterv3.GateRV3, "on_gpu_eager", lambda self, _x: True)
+        monkeypatch.setattr(gaterv3.GateRV3, "tail_plan", lambda self, _x: None)
+        branch = model(image)
+    assert layouts == [False, True]
+    assert branch.is_contiguous()
+    torch.testing.assert_close(branch, plain, atol=1e-5, rtol=0)
