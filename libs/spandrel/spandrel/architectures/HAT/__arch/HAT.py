@@ -519,6 +519,14 @@ class OCAB(Derived):
         h, w = x_size
         b, _, c = x.shape
         ws, ows, heads = self.window_size, self.overlap_win_size, self.num_heads
+        if (ows - ws) % 2:
+            # The original's Unfold, padded by (ows - ws) // 2, then gives fewer key
+            # windows than query windows and fails on a reshape as well.
+            raise ValueError(
+                f"HAT's overlapping attention needs an even overlap: window {ws} with"
+                f" overlapping windows of {ows} (overlap_ratio {ows / ws - 1:g}) leaves"
+                f" {ows - ws}."
+            )
 
         shortcut = x
         x = self.norm1(x)

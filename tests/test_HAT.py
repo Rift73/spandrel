@@ -283,7 +283,17 @@ def _unfold_ocab(ocab: OCAB, x: torch.Tensor, h: int, w: int, rpi: torch.Tensor)
 
 
 @pytest.mark.parametrize(
-    ("window_size", "overlap_ratio"), [(16, 0.5), (13, 0.5), (16, 0.75), (8, 0.5)]
+    ("window_size", "overlap_ratio"),
+    [
+        (16, 0.5),
+        (13, 0.5),
+        (16, 0.75),
+        (8, 0.5),
+        (8, 0.25),
+        (12, 0.5),
+        (24, 0.25),
+        (7, 0.3),
+    ],
 )
 def test_overlapping_windows_match_unfold(window_size, overlap_ratio):
     torch.manual_seed(0)
@@ -305,3 +315,22 @@ def test_overlapping_windows_match_unfold(window_size, overlap_ratio):
         torch.testing.assert_close(
             ocab(x, (h, w), rpi), _unfold_ocab(ocab, x, h, w, rpi), rtol=0, atol=1e-6
         )
+
+
+@pytest.mark.parametrize(
+    ("window_size", "overlap_ratio"), [(7, 0.5), (7, 0.25), (12, 0.25)]
+)
+def test_an_odd_overlap_is_refused(window_size, overlap_ratio):
+    # The original's Unfold leaves fewer key windows than query windows there.
+    torch.manual_seed(0)
+    model = HAT(
+        embed_dim=12,
+        depths=(1,),
+        num_heads=(2,),
+        window_size=window_size,
+        overlap_ratio=overlap_ratio,
+        compress_ratio=2,
+        squeeze_factor=4,
+    ).eval()
+    with torch.no_grad(), pytest.raises(ValueError, match="even overlap"):
+        model(torch.rand(1, 3, 2 * window_size, 3 * window_size))
