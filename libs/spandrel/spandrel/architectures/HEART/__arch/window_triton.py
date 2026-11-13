@@ -57,6 +57,7 @@ if AVAILABLE:
         rank: tl.int32,
         scale: tl.float32,
         window: tl.constexpr,
+        linear: tl.constexpr,
         block_m: tl.constexpr,
         block_n: tl.constexpr,
         block_d: tl.constexpr,
@@ -67,7 +68,11 @@ if AVAILABLE:
         each C = heads * head_width; pos_q, pos_k (heads, N, rank) contiguous, pos_q
         already scaled; out (B, H, W, C) contiguous."""
         operand = out_ptr.dtype.element_ty
-        qb, wh = tl.program_id(0), tl.program_id(1)
+        if linear:
+            blocks = tl.cdiv(window * window, block_m)
+            qb, wh = tl.program_id(0) % blocks, tl.program_id(0) // blocks
+        else:
+            qb, wh = tl.program_id(0), tl.program_id(1)
         win, head = wh // heads, wh % heads
         image = win // windows_per_image
         wy = (win % windows_per_image) // windows_w
@@ -170,10 +175,16 @@ def launch(
     rank = pos_q.shape[-1]
     windows_h, windows_w = (h + 2 * shift) // window, (w + 2 * shift) // window
     out = qkv.new_empty((b, h, w, c))
-    grid = (
+    # CUDA caps a grid's second axis at 65,535 programs, which windows * heads passes
+    # above about 11 megapixels of 32 px windows with 6 heads: then one axis (2**31 - 1),
+    # the query blocks of a window and head next to each other. Below, the two axes,
+    # which measured 1-2 % faster on an RTX 5090.
+    blocks, windows_heads = (
         triton.cdiv(window * window, block_m),
         b * windows_h * windows_w * heads,
     )
+    linear = windows_heads > 65535
+    grid = (blocks * windows_heads,) if linear else (blocks, windows_heads)
     with torch.cuda.device(qkv.device):
         _heart_window[grid](
             qkv,
@@ -191,6 +202,7 @@ def launch(
             rank,
             scale,
             window=window,
+            linear=linear,
             block_m=block_m,
             block_n=block_n,
             block_d=_block(c // heads),

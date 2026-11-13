@@ -1718,8 +1718,10 @@ if _HAS_DIRECT_ATTENTION:
         BLOCK_N: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        query_block = tl.program_id(0)
-        batch_head = tl.program_id(1)
+        # one axis, query blocks fastest: CUDA caps a grid's second axis at 65,535
+        blocks = tl.cdiv(query_tokens, BLOCK_M)
+        query_block = tl.program_id(0) % blocks
+        batch_head = tl.program_id(0) // blocks
         batch = batch_head // num_heads
         head = batch_head - batch * num_heads
 
@@ -2416,10 +2418,8 @@ if _HAS_DIRECT_ATTENTION:
             dtype=torch.float32,
         )
         BLOCK_D = triton.next_power_of_2(head_dim)
-        grid = (
-            triton.cdiv(query_tokens, _FWD_BLOCK_M),
-            batch_windows * num_heads,
-        )
+        # one axis (the kernel splits it): CUDA caps the second at 65,535 programs
+        grid = (triton.cdiv(query_tokens, _FWD_BLOCK_M) * batch_windows * num_heads,)
         wrap_triton(_attention_forward_kernel)[grid](
             query,
             key,

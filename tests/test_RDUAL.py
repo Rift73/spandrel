@@ -329,3 +329,32 @@ def test_the_export_names_are_the_architecture_modules_own():
     assert package.NeuFlowV2 is rdual_arch.NeuFlowV2
     neuflow = rdual_arch.NeuFlowV2
     assert neuflow.prepare_grids is vars(neuflow)["_prepare_grids"]
+
+
+@pytest.mark.skipif(
+    not (
+        rdual_arch._HAS_DIRECT_ATTENTION
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the direct attention runs on NVIDIA GPUs with Triton",
+)
+def test_direct_attention_takes_more_windows_than_a_grid_axis_holds():
+    # 16,500 windows of 4 heads: 66,000 programs on the grid's first axis; the same
+    # windows in two calls under the limit give the same values
+    torch.manual_seed(0)
+    window, heads, half = 4, 4, 8_250
+    q, k, v = (
+        torch.randn(2 * half, heads, window * window, 16, device="cuda").half()
+        for _ in range(3)
+    )
+    table = torch.randn((2 * window - 1) ** 2, heads, device="cuda").half()
+    with torch.no_grad():
+        whole = rdual_arch.direct_attention(q, k, v, table, window)
+        parts = [
+            rdual_arch.direct_attention(
+                q[i : i + half], k[i : i + half], v[i : i + half], table, window
+            )
+            for i in (0, half)
+        ]
+    assert torch.equal(whole, torch.cat(parts))

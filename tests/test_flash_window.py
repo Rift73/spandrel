@@ -171,3 +171,14 @@ def test_other_failures_are_raised(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(torch.OutOfMemoryError):
         flash_window.flash_window_attention(q, q, q, None, 1.0)
     assert flash_window.FLASH_WINDOW
+
+
+@needs_kernel
+def test_more_windows_than_a_grid_axis_holds():
+    # windows * heads on the grid's first axis: 16,500 windows of 4 heads is 66,000
+    # programs, past the 65,535 that CUDA's second axis takes
+    q, k, v = operands(16_500, 4, 16, 16, 16, torch.float16)
+    with torch.no_grad():
+        out = flash_window.launch(q, k, v, None, 0.25)
+        reference = scaled_dot_product_attention(q, k, v, scale=0.25)
+    torch.testing.assert_close(out, reference, rtol=0, atol=2e-3)

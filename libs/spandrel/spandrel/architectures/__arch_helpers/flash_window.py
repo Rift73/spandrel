@@ -76,7 +76,8 @@ if AVAILABLE:
         last dimension contiguous; out (W, heads, N, d_v) and bias (heads, N, M)
         contiguous."""
         operand = out_ptr.dtype.element_ty
-        qb, wh = tl.program_id(0), tl.program_id(1)
+        blocks = tl.cdiv(n_queries, block_m)
+        qb, wh = tl.program_id(0) % blocks, tl.program_id(0) // blocks
         window, head = wh // heads, wh % heads
         m = qb * block_m + tl.arange(0, block_m)
         dq = tl.arange(0, block_dqk)
@@ -151,7 +152,11 @@ def launch(
     windows, heads, n_queries, d_qk = q.shape
     n_keys, d_v = k.shape[2], v.shape[3]
     out = q.new_empty((windows, heads, n_queries, d_v))
-    grid = (triton.cdiv(n_queries, block_m), windows * heads)
+    # One axis, the query blocks of a window and head next to each other (their keys
+    # stay in the cache): CUDA caps a grid's second and third axes at 65,535 programs,
+    # which windows * heads passes above about 2.8 megapixels of 16 px windows with 6
+    # heads; the first takes 2**31 - 1.
+    grid = (triton.cdiv(n_queries, block_m) * windows * heads,)
     with torch.cuda.device(q.device):
         _flash_window[grid](
             q,

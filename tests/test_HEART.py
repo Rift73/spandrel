@@ -452,3 +452,30 @@ def test_padded_iln_counts_the_real_channels(real: int, padded: int):
     assert torch.equal(actual[..., real:], torch.zeros_like(actual[..., real:]))
     with pytest.raises(ValueError):
         iln_triton.PaddedILN(source, real - 1)
+
+
+_NEEDS_TRITON_GPU = pytest.mark.skipif(
+    not (
+        heart_window.AVAILABLE
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the kernels run on NVIDIA GPUs with Triton",
+)
+
+
+@_NEEDS_TRITON_GPU
+def test_heart_window_kernel_takes_more_windows_than_a_grid_axis_holds():
+    # 8 px windows of 8 heads over a 768 x 768 trunk: 73,728 programs on the grid's
+    # first axis; the image's top half alone, under the limit, gives the same values
+    torch.manual_seed(0)
+    heads, width, window = 8, 8, 8
+    qkv = torch.randn(1, 768, 768, 3 * heads * width, device="cuda").half()
+    pos_q = torch.randn(heads, window * window, 8, device="cuda").half()
+    pos_k = torch.randn(heads, window * window, 8, device="cuda").half()
+    with torch.no_grad():
+        whole = heart_window.launch(qkv, pos_q, pos_k, heads, window, 0, 0.35)
+        top = heart_window.launch(
+            qkv[:, :384].contiguous(), pos_q, pos_k, heads, window, 0, 0.35
+        )
+    assert torch.equal(whole[:, :384], top)
