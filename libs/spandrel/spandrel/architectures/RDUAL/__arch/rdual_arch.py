@@ -384,6 +384,11 @@ def _inference_na_coordinates(height: int, width: int, device: torch.device) -> 
         return _na_coordinates(height, width, device)
 
 
+# Tiles per neighborhood-attention chunk in eager inference. Training, compiled
+# and export paths keep four, which their Flex block masks are built for.
+NA_INFERENCE_CHUNK = 64
+
+
 def _na_block_mask(
     height: int, width: int, window: int, first: int, device: torch.device
 ) -> Any:
@@ -569,8 +574,8 @@ class _SpatialAttention(nn.Module):
         """Gather, mask and attend a query chunk; return unassembled tile outputs."""
         batch, heads, _, dim = query.shape
         channels = heads * dim
-        tile, chunk_size = 16, 4
         kh, kw = min(height, self.window), min(width, self.window)
+        tile = 16
         uh, uw = min(height, kh + tile - 1), min(width, kw + tile - 1)
         eager_inference = (
             not self.training
@@ -578,6 +583,7 @@ class _SpatialAttention(nn.Module):
             and not torch.compiler.is_compiling()
             and not torch.onnx.is_in_onnx_export()
         )
+        chunk_size = NA_INFERENCE_CHUNK if eager_inference else 4
         coordinates = _inference_na_coordinates if eager_inference else _na_coordinates
         qlocal = coordinates(tile, tile, query.device)
         klocal = coordinates(uh, uw, query.device)
@@ -753,16 +759,16 @@ class _SpatialAttention(nn.Module):
         qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         query = query * dim**-0.5
-        output = x.new_empty((batch, channels, height, width), dtype=query.dtype)
-        tile, chunk_size = 16, 4
+        tile = 16
         tiles = [(y, z) for y in range(0, height, tile) for z in range(0, width, tile)]
         key_bias = None
-        if (
+        eager_inference = (
             not self.training
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
             and not torch.onnx.is_in_onnx_export()
-        ):
+        )
+        if eager_inference:
             # Every chunk in this layer uses the same local key coordinates.
             # Recompute once PER FORWARD so EMA/load updates cannot leave stale
             # positional factors. Arithmetic, dtype and SDPA backend stay intact.
@@ -771,6 +777,28 @@ class _SpatialAttention(nn.Module):
             _, key_bias = self.factored_bias.factors(
                 _inference_na_coordinates(uh, uw, query.device), query.dtype
             )
+        if eager_inference:
+            # Large chunks, and the tiles laid out in one copy: every tile is a
+            # full 16x16 block whose rows and columns past the image edge are
+            # cropped, so the kept values are those of the per-tile copies.
+            attended = torch.cat(
+                [
+                    self._na_chunk(query, key, value, first, height, width, key_bias)
+                    for first in range(0, len(tiles), NA_INFERENCE_CHUNK)
+                ],
+                1,
+            )
+            rows, cols = -(-height // tile), -(-width // tile)
+            return (
+                attended.reshape(batch, rows, cols, channels, tile, tile)
+                .permute(0, 3, 1, 4, 2, 5)
+                .reshape(batch, channels, rows * tile, cols * tile)[
+                    :, :, :height, :width
+                ]
+                .contiguous()
+            )
+        output = x.new_empty((batch, channels, height, width), dtype=query.dtype)
+        chunk_size = 4
         for first in range(0, len(tiles), chunk_size):
             attended = self._na_chunk(query, key, value, first, height, width, key_bias)
             for j, (y, z) in enumerate(tiles[first : first + chunk_size]):
