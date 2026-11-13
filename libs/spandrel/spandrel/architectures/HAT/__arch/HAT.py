@@ -352,13 +352,14 @@ class HAB(Derived):
         )
 
     def conv_branch(self, x):
-        """conv_block on channels-last x."""
+        """conv_block on channels-last x: the convolutions' output and the channel
+        attention's (B, C, 1, 1) gate, which the caller applies with conv_scale in the
+        residual's multiply-add."""
         conv_0, activation, conv_1, channel = self.conv_block.cab
         _, squeeze, relu, expand, sigmoid = channel.attention
         x = self.run_conv("cab 1", conv_1, activation(self.run_conv("cab 0", conv_0, x)))
         y = self.run_conv("attention 0", squeeze, x.mean((2, 3), keepdim=True))
-        y = sigmoid(self.run_conv("attention 1", expand, relu(y)))
-        return x * y if torch.is_grad_enabled() else x.mul_(y)
+        return x, sigmoid(self.run_conv("attention 1", expand, relu(y)))
 
     def window_branch(self, x, rpi_sa, attn_mask):
         """The windows' attention on x (b, h, w, c), its projection included. Every token's
@@ -391,10 +392,16 @@ class HAB(Derived):
         b, _, c = x.shape
         shortcut = x
         x = self.norm1(x).view(b, h, w, c)
-        conv_x = self.conv_branch(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).flatten(1, 2)
+        conv_x, gate = self.conv_branch(x.permute(0, 3, 1, 2))
+        conv_x = conv_x.permute(0, 2, 3, 1).flatten(1, 2)
         attn_x = self.drop_path(self.window_branch(x, rpi_sa, attn_mask)).flatten(1, 2)
-        scaled = conv_x * self.conv_scale if torch.is_grad_enabled() else conv_x.mul_(self.conv_scale)
-        x = add_into(add_into(shortcut, attn_x), scaled)
+        # the gate and conv_scale applied by the multiply-add that adds the convolutions'
+        # output: one pass instead of three
+        gate = gate.view(b, 1, c)
+        if torch.is_grad_enabled():
+            x = shortcut + attn_x + conv_x * gate * self.conv_scale
+        else:
+            x = add_into(shortcut, attn_x).addcmul_(conv_x, gate, value=self.conv_scale)
         return add_into(x, self.drop_path(self.mlp(self.norm2(x))))
 
     def forward_traced(self, x, x_size, rpi_sa, attn_mask):
