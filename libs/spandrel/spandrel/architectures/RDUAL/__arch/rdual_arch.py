@@ -3903,17 +3903,17 @@ def _neuflow_lookup_features(
 # Tile starts on this grid of input pixels keep the trunk's windows, regions
 # and retrieval blocks (anchored at the frame's origin) as the whole frame has
 # them.
-_TILE_GRID = 128
+TILE_GRID = 128
 
 
-def _tile_axis(length: int, tile: int, overlap: int) -> tuple[tuple[int, int], ...]:
+def tile_axis(length: int, tile: int, overlap: int) -> tuple[tuple[int, int], ...]:
     """(start, size) of equal tiles along an axis of the frame padded to a
     multiple of four, neighbors overlapping by at least overlap, the last
     ending at the frame's end; one tile when it covers the axis.
 
-    The starts are multiples of _TILE_GRID: the stride is rounded down to it
-    and the size grown to match, by less than _TILE_GRID per tile after the
-    first. A stride below _TILE_GRID keeps starts on multiples of four.
+    The starts are multiples of TILE_GRID: the stride is rounded down to it
+    and the size grown to match, by less than TILE_GRID per tile after the
+    first. A stride below TILE_GRID keeps starts on multiples of four.
     """
     padded = (length + 3) // 4 * 4
     size = max(4, tile // 4 * 4)
@@ -3923,14 +3923,14 @@ def _tile_axis(length: int, tile: int, overlap: int) -> tuple[tuple[int, int], .
         raise ValueError("A tile must be larger than its overlap")
     count = -(-(padded - overlap) // (size - overlap))
     stride = (padded - size) / (count - 1)
-    if stride >= _TILE_GRID:
-        step = int(stride) // _TILE_GRID * _TILE_GRID
+    if stride >= TILE_GRID:
+        step = int(stride) // TILE_GRID * TILE_GRID
         size = padded - (count - 1) * step
         return tuple((k * step, size) for k in range(count))
     return tuple((round(k * stride / 4) * 4, size) for k in range(count))
 
 
-def _tile_grid(
+def tile_grid(
     shape: tuple[int, int] | torch.Size, tile: tuple[int, int] | None, overlap: int
 ) -> tuple[tuple[tuple[int, int], ...], ...] | None:
     """The (rows, columns) of infer_window's tiles, or None when untiled."""
@@ -3938,7 +3938,7 @@ def _tile_grid(
         return None
     if type(overlap) is not int or overlap < 0:
         raise ValueError("overlap must be a non-negative int")
-    rows, cols = _tile_axis(shape[0], tile[0], overlap), _tile_axis(
+    rows, cols = tile_axis(shape[0], tile[0], overlap), tile_axis(
         shape[1], tile[1], overlap
     )
     if len(rows) == 1 and len(cols) == 1:
@@ -4987,7 +4987,7 @@ class RDUAL(nn.Module):
         """
         if type(keep) is not int or not 1 <= keep <= frames.shape[1]:
             raise ValueError("keep must be an int from 1 to the window's frames")
-        grid = _tile_grid(frames.shape[-2:], tile, overlap)
+        grid = tile_grid(frames.shape[-2:], tile, overlap)
         window = frames if past is None else torch.cat((past[1][:, None], frames), 1)
         guidance = self.guidance(window, flow_volume=flow_volume)
         links = self._clip_edges(window, guidance)
