@@ -52,6 +52,7 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1751,8 +1752,14 @@ class RegionalChannelAttention(nn.Module):
                     cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
                     a = (cosine * tau[head]).softmax(2)
                     vh = v[:, channels, rows.start : rows.stop]
-                    o = (a.to(v.dtype) * vh[:, None]).sum(2)
-                    out[:, channels, rows.start : rows.stop] = o.to(dtype)
+                    # a matrix product per position, as _class_core's
+                    o = (
+                        a.to(v.dtype).permute(0, 3, 4, 1, 2)
+                        @ vh.permute(0, 2, 3, 1)[..., None]
+                    )
+                    out[:, channels, rows.start : rows.stop] = (
+                        o[..., 0].permute(0, 3, 1, 2).to(dtype)
+                    )
         return out
 
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
@@ -2061,7 +2068,12 @@ class DynamicRouter(nn.Module):
 
 
 def _premixed_conv3x3(
-    x: Tensor, weight0: Tensor, bias0: Tensor, experts: Tensor, coefficients: Tensor
+    module: nn.Module,
+    x: Tensor,
+    weight0: Tensor,
+    bias0: Tensor,
+    experts: Tensor,
+    route: Callable[[], Tensor],
 ) -> Tensor:
     """One differentiable mixed kernel per sample, including batch > 1.
 
@@ -2070,8 +2082,11 @@ def _premixed_conv3x3(
     The coefficients sum to zero (softmax - 1/K), so the last expert's term folds into
     the others: base + sum_{k<K} c_k(p) * conv(W_k - W_K), one part fewer; the sum's
     rounding (|sum c_k| ~ 1e-7) times conv_K is far below the parts' own rounding.
+    `route` gives module's coefficients; it is called again when a routing kernel
+    failed, so that call is the PyTorch form throughout.
     """
     global ROUTING_NA_TRITON
+    coefficients = route()
     batch, channels, height, width = x.shape
     dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
     if coefficients.shape[-2:] != (1, 1):
@@ -2094,7 +2109,7 @@ def _premixed_conv3x3(
         )
         coefficients = coefficients[:, :count]
         if _na_kernel_usable(
-            ROUTING_NA_TRITON, _WEIGHTLESS, convolved, (torch.float16, torch.float32)
+            ROUTING_NA_TRITON, module, convolved, (torch.float16, torch.float32)
         ):
             try:
                 return na_local_triton.routed_sum(
@@ -2103,6 +2118,7 @@ def _premixed_conv3x3(
             except Exception as error:
                 _kernel_failed("routing", error)
                 ROUTING_NA_TRITON = False
+                coefficients = route()[:, :count]
         with torch.autocast(device_type=x.device.type, enabled=False):
             parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
             output = parts[:, 0] + (
@@ -2161,7 +2177,9 @@ class PremixedDynamicGroupConv3x3(nn.Module):
         dtype = torch.float64 if self.experts.dtype == torch.float64 else torch.float32
         with torch.autocast(device_type=x.device.type, enabled=False):
             weight, bias = self.base.equivalent_kernel(dtype)
-        return _premixed_conv3x3(x, weight, bias, self.experts, self.coefficients(x))
+        return _premixed_conv3x3(
+            self, x, weight, bias, self.experts, lambda: self.coefficients(x)
+        )
 
     @torch.no_grad()
     def folded(self) -> PremixedDeployedDynamicConv3x3:
@@ -2184,7 +2202,12 @@ class PremixedDeployedDynamicConv3x3(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return _premixed_conv3x3(
-            x, self.base.weight, self.base.bias, self.experts, self.coefficients(x)
+            self,
+            x,
+            self.base.weight,
+            self.base.bias,
+            self.experts,
+            lambda: self.coefficients(x),
         )
 
 

@@ -22,7 +22,9 @@ tau, FP32 softmax, rounded to the operands' type and applied to the position's o
 The Gram slides: a program takes one column and a segment of SEGMENT rows for one
 head; it sums the first window from its row strips (32 x 32 x 32 tl.dot each), then
 per row adds the entering strip and subtracts the leaving one when the clamped window
-moves. The running sums restart exactly at every segment, which bounds their drift.
+moves. The running sums restart exactly at every segment, which bounds their drift,
+and at any row where a square sum fell below 1 / RESTART of the largest it held in
+the segment: the rounding a large value left behind cannot swamp a small window.
 
 Routing (routing_na): the router's means over the windows at the distinct clamped
 starts, as two passes of sliding window sums (rows, then columns) with FP64 running
@@ -255,10 +257,30 @@ if AVAILABLE:
     def _strip(ptr, channel, row, col0, col_stride, live, channels_first: tl.constexpr):
         """One neighborhood row strip (row: its 64-bit offset): [32 d, 32 columns] when
         channels_first, else [32 columns, 32 d] (zeros where not live)."""
-        pix = row + (col0 + tl.arange(0, 32)) * col_stride
+        pix = row + (col0 + tl.arange(0, 32)).to(tl.int64) * col_stride
         if channels_first:
             return tl.load(ptr + channel[:, None] + pix[None, :], live[None, :], 0)
         return tl.load(ptr + channel[None, :] + pix[:, None], live[:, None], 0)
+
+    @triton.jit
+    def _window_gram(
+        q_ptr, k_ptr, channel, row0, kh, row_stride, col0, col_stride, columns
+    ):
+        """The Gram and the square sums of the window whose rows start at row0,
+        summed from its row strips."""
+        gram = tl.zeros((32, 32), tl.float32)
+        q_square = tl.zeros((32,), tl.float32)
+        k_square = tl.zeros((32,), tl.float32)
+        for r in range(32):
+            live = columns & (r < kh)
+            row = (row0 + r).to(tl.int64) * row_stride
+            qt = _strip(q_ptr, channel, row, col0, col_stride, live, True)
+            k = _strip(k_ptr, channel, row, col0, col_stride, live, False)
+            gram = tl.dot(qt, k, gram)
+            qf, kf = qt.to(tl.float32), k.to(tl.float32)
+            q_square += tl.sum(qf * qf, 1)
+            k_square += tl.sum(kf * kf, 0)
+        return gram, q_square, k_square
 
     @triton.jit
     def _regional_na(
@@ -279,6 +301,7 @@ if AVAILABLE:
         out_row_stride,
         out_col_stride,
         segment: tl.constexpr,
+        restart: tl.constexpr,
     ):
         """q, k and v [B, C, H, W] with one set of strides (views of one depthwise
         output in either memory format), tau [C / 32] FP32, out [B, C, H, W]; heads of
@@ -286,7 +309,7 @@ if AVAILABLE:
         operand = out_ptr.dtype.element_ty
         program, head = tl.program_id(0), tl.program_id(1)
         image = (program // (segments * width)).to(tl.int64)
-        x = program % width
+        x = (program % width).to(tl.int64)
         y0 = program // width % segments * segment
         kh, kw = tl.minimum(height, 32), tl.minimum(width, 32)
         col0 = tl.minimum(tl.maximum(x - 16, 0), width - kw)
@@ -297,18 +320,10 @@ if AVAILABLE:
         columns = tl.arange(0, 32) < kw
         count = (kh * kw).to(tl.float32) * 1e-6
         scale = tl.load(tau_ptr + head) * 1.4426950408889634
-        gram = tl.zeros((32, 32), tl.float32)
-        q_square = tl.zeros((32,), tl.float32)
-        k_square = tl.zeros((32,), tl.float32)
-        for r in range(32):
-            live = columns & (r < kh)
-            row = (row0 + r).to(tl.int64) * row_stride
-            qt = _strip(q_ptr, channel, row, col0, col_stride, live, True)
-            k = _strip(k_ptr, channel, row, col0, col_stride, live, False)
-            gram = tl.dot(qt, k, gram)
-            qf, kf = qt.to(tl.float32), k.to(tl.float32)
-            q_square += tl.sum(qf * qf, 1)
-            k_square += tl.sum(kf * kf, 0)
+        gram, q_square, k_square = _window_gram(
+            q_ptr, k_ptr, channel, row0, kh, row_stride, col0, col_stride, columns
+        )
+        q_peak, k_peak = q_square, k_square
         out = out_ptr + image * out_image_stride + d * out_channel_stride
         for i in range(segment):
             y = y0 + i
@@ -325,9 +340,32 @@ if AVAILABLE:
             gram = tl.dot(qa, ka, gram) - tl.dot(ql, kl)
             qaf, kaf = qa.to(tl.float32), ka.to(tl.float32)
             qlf, klf = ql.to(tl.float32), kl.to(tl.float32)
-            q_square += tl.sum(qaf * qaf, 1) - tl.sum(qlf * qlf, 1)
-            k_square += tl.sum(kaf * kaf, 0) - tl.sum(klf * klf, 0)
+            q_square += tl.sum(qaf * qaf, 1)
+            k_square += tl.sum(kaf * kaf, 0)
+            q_peak = tl.maximum(q_peak, q_square)
+            k_peak = tl.maximum(k_peak, k_square)
+            q_square -= tl.sum(qlf * qlf, 1)
+            k_square -= tl.sum(klf * klf, 0)
             row0 = tl.where(moved, row0 + 1, row0)
+            # The running sums carry rounding of the largest sums they held; once
+            # those are RESTART times today's, the window is summed from scratch.
+            excess = tl.maximum(
+                q_peak - restart * (q_square + count),
+                k_peak - restart * (k_square + count),
+            )
+            if tl.max(excess) > 0:
+                gram, q_square, k_square = _window_gram(
+                    q_ptr,
+                    k_ptr,
+                    channel,
+                    row0,
+                    kh,
+                    row_stride,
+                    col0,
+                    col_stride,
+                    columns,
+                )
+                q_peak, k_peak = q_square, k_square
             q_norm = tl.sqrt(q_square + count)
             k_norm = tl.sqrt(k_square + count)
             logits = gram / (q_norm[:, None] * k_norm[None, :]) * scale
@@ -363,9 +401,11 @@ if AVAILABLE:
     ):
         """parts [B, (K + 1) C, P] (the base, then the experts), coefficients [B, K, P]
         FP32 and out [B, C, P], P = H * W in either memory format."""
-        p = (tl.program_id(0) * block_p + tl.arange(0, block_p)).to(tl.int64)
-        c = (tl.program_id(1) * block_c + tl.arange(0, block_c)).to(tl.int64)
+        # 64-bit: an expert part's offset passes 2^31 on large maps
+        p = tl.program_id(0).to(tl.int64) * block_p + tl.arange(0, block_p)
+        c = tl.program_id(1).to(tl.int64) * block_c + tl.arange(0, block_c)
         image = tl.program_id(2).to(tl.int64)
+        part_stride = channels.to(tl.int64) * part_channel
         live = p < positions
         both = live[:, None] & (c < channels)[None, :]
         part = (
@@ -379,8 +419,10 @@ if AVAILABLE:
             coefficients_ptr + image * coefficient_image + p * coefficient_position
         )
         for e in tl.static_range(experts):
-            weight = tl.load(coefficient + e * coefficient_expert, live, 0)
-            value = tl.load(part + (e + 1) * channels * part_channel, both, 0)
+            weight = tl.load(
+                coefficient + tl.full((), e, tl.int64) * coefficient_expert, live, 0
+            )
+            value = tl.load(part + (e + 1) * part_stride, both, 0)
             acc += weight[:, None] * value.to(tl.float32)
         tl.store(
             out_ptr
@@ -416,7 +458,7 @@ if AVAILABLE:
         # one axis: (plane, lane block) pairs, so B * C may pass 65,535
         blocks = tl.cdiv(lanes, block)
         plane = tl.program_id(0) // blocks
-        lane = (tl.program_id(0) % blocks * block + tl.arange(0, block)).to(tl.int64)
+        lane = (tl.program_id(0) % blocks).to(tl.int64) * block + tl.arange(0, block)
         image, channel = (
             (plane // channels).to(tl.int64),
             (plane % channels).to(tl.int64),
@@ -439,8 +481,9 @@ if AVAILABLE:
             )
 
 
-# rows per regional program: the running Gram restarts exactly every SEGMENT rows
-SEGMENT = 32
+# rows per regional program: the running Gram restarts exactly every SEGMENT rows,
+# and within a segment wherever a square sum fell below 1 / RESTART of its peak
+SEGMENT, RESTART = 32, 64.0
 
 
 def regional_na(
@@ -465,6 +508,7 @@ def regional_na(
             *q.stride(),
             *out.stride(),
             segment=SEGMENT,
+            restart=RESTART,
             num_warps=1,
             num_stages=1,
         )
@@ -480,7 +524,7 @@ def neighborhood_means(x: torch.Tensor, ky: int, kx: int) -> torch.Tensor:
     at every start, B,H-ky+1,W-kx+1,C (channels innermost)."""
     batch, channels, height, width = x.shape
     rows = torch.empty(
-        (batch, channels, height - ky + 1, width), dtype=torch.float32, device=x.device
+        (batch, channels, height - ky + 1, width), dtype=torch.float64, device=x.device
     )
     out = torch.empty(
         (batch, height - ky + 1, width - kx + 1, channels),

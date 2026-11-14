@@ -812,8 +812,9 @@ def test_routing_na_kernel_matches_the_pytorch_form(
     assert actual.dtype == dtype
     layout = torch.channels_last if channels_last else torch.contiguous_format
     assert actual.is_contiguous(memory_format=layout)
-    atol = 2e-3 if dtype == torch.float16 else 1e-5
-    torch.testing.assert_close(actual, expected, rtol=0, atol=atol)
+    # one FP16 step apart at most (the sums' order differs); FP32 to its rounding
+    tolerance = (2**-10, 1e-4) if dtype == torch.float16 else (1e-5, 1e-5)
+    torch.testing.assert_close(actual, expected, rtol=tolerance[0], atol=tolerance[1])
 
 
 @needs_kernel
@@ -824,6 +825,8 @@ def test_routing_na_kernel_stays_off_up_to_96_and_outside_inference(monkeypatch)
     means = _counted(monkeypatch, "neighborhood_means")
     with torch.no_grad():
         conv(x[..., :96, :])
+        conv.train()(x)
+        conv.eval()
         conv.bfloat16()(x.bfloat16())
         conv.double()(x.double())
         conv.half()
@@ -831,6 +834,48 @@ def test_routing_na_kernel_stays_off_up_to_96_and_outside_inference(monkeypatch)
             conv(x)
     conv(x)
     assert not calls and not means
+
+
+# a failure of either routing kernel makes that call the PyTorch form throughout
+@needs_kernel
+@pytest.mark.parametrize("failing", ["routed_sum", "neighborhood_means"])
+def test_a_routing_kernel_failure_gives_that_call_the_pytorch_form(
+    monkeypatch, failing
+):
+    conv = _gpu_routed_conv(128, torch.float16)
+    x = torch.randn(1, 128, 150, 140, device="cuda").half()
+
+    def launch(*_):
+        error = RuntimeError("kernel launch")
+        error.__cause__ = _TritonError("ast.Num")
+        raise error
+
+    monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", True)
+    with torch.no_grad():
+        monkeypatch.setattr(na_local_triton, failing, launch)
+        actual = conv(x)
+        assert not dual_arch.ROUTING_NA_TRITON
+        expected = conv(x)
+    assert torch.equal(actual, expected)
+
+
+# DUAL's own routed parts (3 differences of 128 channels) in channels-first layout:
+# the last part's offsets pass 2**31 from 5,592,406 positions (6.7 GiB of VRAM here)
+@needs_kernel
+def test_routed_sum_addresses_parts_past_2_31():
+    height, width, channels, experts = 2048, 2731, 128, 3
+    assert experts * channels * height * width > 2**31
+    parts = torch.zeros(
+        1, (experts + 1) * channels, height, width, device="cuda", dtype=torch.float16
+    )
+    parts[:, experts * channels :] = 1
+    coefficients = torch.zeros(1, height, width, experts, device="cuda")
+    coefficients[..., -1] = 1
+    out = na_local_triton.routed_sum(
+        parts, coefficients.permute(0, 3, 1, 2), torch.contiguous_format
+    )
+    del parts, coefficients
+    assert bool((out == 1).all())
 
 
 def _routing_failing_with(monkeypatch, error):
@@ -992,7 +1037,13 @@ def test_routing_and_regional_na_in_fp16_on_the_gpu():
         expected = _routing_reference(conv, x)
         actual = conv.cuda().half()(x.cuda().half())
     assert actual.dtype == torch.float16
-    torch.testing.assert_close(actual.double().cpu(), expected, rtol=0, atol=2e-2)
+    # the base and expert parts are FP16 convolution outputs, each rounded once more
+    # before the sum: measured up to 4.4 times the output's FP16 rounding (half a
+    # step at the largest output)
+    rounding = 2.0 ** (expected.abs().max().log2().floor().item() - 11)
+    torch.testing.assert_close(
+        actual.double().cpu(), expected, rtol=0, atol=5 * rounding
+    )
 
     rca = dual_arch.RegionalChannelAttention(128, 4).double().eval()
     rca.theta.data.normal_(0, 1)
@@ -1005,7 +1056,11 @@ def test_routing_and_regional_na_in_fp16_on_the_gpu():
     assert actual.dtype == (
         torch.float16 if dual_arch.REGIONAL_NA_TRITON else torch.float32
     )
-    torch.testing.assert_close(actual.double().cpu(), expected, rtol=0, atol=5e-3)
+    # within twice the FP16 rounding of the largest output
+    rounding = 2.0 ** (expected.abs().max().log2().floor().item() - 11)
+    torch.testing.assert_close(
+        actual.double().cpu(), expected, rtol=0, atol=2 * rounding
+    )
 
 
 def _regional_operands(batch, channels, shape):
@@ -1051,8 +1106,8 @@ def test_regional_na_kernel_matches_the_pytorch_form(
     assert len(calls) == 3
     assert torch.equal(actual, copies)
     # the channels-last build of the kernel may fuse other multiply-adds
-    torch.testing.assert_close(views, actual, rtol=0, atol=1e-3)
-    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=2e-3)
+    torch.testing.assert_close(views, actual, rtol=2**-10, atol=1e-4)
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-10, atol=1e-4)
 
 
 @needs_kernel
@@ -1061,6 +1116,8 @@ def test_regional_na_kernel_stays_off_up_to_16_and_outside_inference(monkeypatch
     calls = _counted(monkeypatch, "regional_na")
     with torch.no_grad():
         rca.mix(*(t[..., :16, :16] for t in (q, k, v)))
+        rca.train().mix(q, k, v)
+        rca.eval()
         rca.float().mix(q.float(), k.float(), v.float())
         rca.bfloat16().mix(q.bfloat16(), k.bfloat16(), v.bfloat16())
         rca.half()
@@ -1098,8 +1155,26 @@ def test_regional_na_kernel_covers_more_programs_than_a_grid_axis_holds():
             )
             expected = (a[0, 0] @ span[2][0, :, y - sy, x - sx]).float()
             torch.testing.assert_close(
-                out[0, :, y, x].float().cpu(), expected, rtol=0, atol=2e-3
+                out[0, :, y, x].float().cpu(), expected, rtol=2**-10, atol=1e-4
             )
+
+
+# one huge q / k value leaving the window inside a row segment: the running sums are
+# restarted, so the kernel stays within FP16 rounding of FP64 and finite
+@needs_kernel
+@pytest.mark.parametrize("hot", [1000.0, 60000.0])
+def test_regional_na_kernel_survives_a_huge_value(hot):
+    rca, (q, k, v) = _regional_operands(1, 32, (64, 40))
+    for t in (q, k, v):
+        t.mul_(0.5)
+    q[0, 3, 10, 20] = k[0, 3, 10, 20] = hot
+    reference = copy.deepcopy(rca).double().cpu()
+    with torch.no_grad():
+        out = rca.mix(q, k, v)
+        q64, k64, v64 = (t.double().cpu() for t in (q, k, v))
+        expected = _regional_reference(reference, q64, k64, v64)
+    assert bool(torch.isfinite(out).all())
+    torch.testing.assert_close(out.double().cpu(), expected, rtol=2**-10, atol=1e-4)
 
 
 def _regional_failing_with(monkeypatch, error):
