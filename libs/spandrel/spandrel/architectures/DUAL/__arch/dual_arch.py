@@ -2140,7 +2140,8 @@ def _premixed_conv3x3(
     weight0: Tensor,
     bias0: Tensor,
     experts: Tensor,
-    route: Callable[[], Tensor],
+    coefficients: Tensor,
+    reroute: Callable[[], Tensor],
 ) -> Tensor:
     """One differentiable mixed kernel per sample, including batch > 1.
 
@@ -2149,11 +2150,12 @@ def _premixed_conv3x3(
     The coefficients sum to zero (softmax - 1/K), so the last expert's term folds into
     the others: base + sum_{k<K} c_k(p) * conv(W_k - W_K), one part fewer; the sum's
     rounding (|sum c_k| ~ 1e-7) times conv_K is far below the parts' own rounding.
-    `route` gives module's coefficients; it is called again when a routing kernel
-    failed, so that call is the PyTorch form throughout.
+    `coefficients` are module's for this call, taken in the caller's context (its
+    autocast state decides the routing form, as at every other site); `reroute`
+    takes them again after a routing kernel failed, so that call is the PyTorch
+    form throughout.
     """
     global ROUTING_NA_TRITON
-    coefficients = route()
     batch, channels, height, width = x.shape
     dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
     if coefficients.shape[-2:] != (1, 1):
@@ -2185,7 +2187,7 @@ def _premixed_conv3x3(
             except Exception as error:
                 _kernel_failed("routing", error)
                 ROUTING_NA_TRITON = False
-                coefficients = route()[:, :count]
+                coefficients = reroute()[:, :count]
         with torch.autocast(device_type=x.device.type, enabled=False):
             parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
             output = parts[:, 0] + (
@@ -2245,7 +2247,13 @@ class PremixedDynamicGroupConv3x3(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             weight, bias = self.base.equivalent_kernel(dtype)
         return _premixed_conv3x3(
-            self, x, weight, bias, self.experts, lambda: self.coefficients(x)
+            self,
+            x,
+            weight,
+            bias,
+            self.experts,
+            self.coefficients(x),
+            lambda: self.coefficients(x),
         )
 
     @torch.no_grad()
@@ -2274,6 +2282,7 @@ class PremixedDeployedDynamicConv3x3(nn.Module):
             self.base.weight,
             self.base.bias,
             self.experts,
+            self.coefficients(x),
             lambda: self.coefficients(x),
         )
 

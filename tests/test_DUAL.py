@@ -1109,27 +1109,27 @@ def _loaded_light(dtype=torch.float16, **kwargs):
     return model.to("cuda", dtype).eval()
 
 
-# on an NVIDIA GPU in FP16 a default model is the five-site model: both kernels run,
-# the output is the explicit model's bit for bit and differs from today's
-@needs_kernel
-def test_a_default_model_on_the_gpu_runs_both_sites_per_position(monkeypatch):
-    image = torch.rand(1, 3, 208, 200, device="cuda").half()
-    regional = _counted(monkeypatch, "regional_na")
-    routed = _counted(monkeypatch, "routed_sum")
-    with torch.no_grad():
-        default = _loaded_light()(image)
-        assert regional and routed
-        explicit = _loaded_light(routing_na=True, regional_na=True)(image)
-        today = _loaded_light(routing_na=False, regional_na=False)(image)
-    assert torch.equal(default, explicit)
-    assert not torch.equal(default, today)
-
-
 def _na5_kernel_calls(monkeypatch):
     return [
         _counted(monkeypatch, name)
         for name in ("regional_na", "routed_sum", "neighborhood_means")
     ]
+
+
+# on an NVIDIA GPU in FP16 a loaded default model is the five-site model: all nine
+# sites run per position (5 regional, 4 routers incl. the last group's FP32-safe one),
+# the output is the explicit model's bit for bit and differs from today's
+@needs_kernel
+def test_a_default_model_on_the_gpu_runs_both_sites_per_position(monkeypatch):
+    image = torch.rand(1, 3, 208, 200, device="cuda").half()
+    regional, routed, means = _na5_kernel_calls(monkeypatch)
+    with torch.no_grad():
+        default = _loaded_light()(image)
+        assert (len(regional), len(routed), len(means)) == (5, 4, 4)
+        explicit = _loaded_light(routing_na=True, regional_na=True)(image)
+        today = _loaded_light(routing_na=False, regional_na=False)(image)
+    assert torch.equal(default, explicit)
+    assert not torch.equal(default, today)
 
 
 # both switches on: the sites go per position together or not at all. FP32 features
@@ -1141,6 +1141,20 @@ def test_a_default_model_in_fp32_on_the_gpu_is_todays_model(monkeypatch):
     default = _loaded_light(torch.float32)
     today = _loaded_light(torch.float32, routing_na=False, regional_na=False)
     with torch.no_grad():
+        assert torch.equal(default(image), today(image))
+    assert not any(calls)
+
+
+# under an outer FP16 autocast every site keeps today's form, the last group's
+# FP32-safe convolution too (it routes before leaving autocast), FP16 and FP32 weights
+@needs_kernel
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_a_default_model_under_autocast_keeps_todays_forms(monkeypatch, dtype):
+    image = torch.rand(1, 3, 208, 200, device="cuda").to(dtype)
+    calls = _na5_kernel_calls(monkeypatch)
+    default = _loaded_light(dtype)
+    today = _loaded_light(dtype, routing_na=False, regional_na=False)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         assert torch.equal(default(image), today(image))
     assert not any(calls)
 

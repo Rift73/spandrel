@@ -42,6 +42,9 @@ class _FP16SafeDynamicConv(PremixedDeployedDynamicConv3x3):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training or x.dtype != torch.float16:
             return super().forward(x)
+        # The route in the caller's context: its autocast state decides the routing
+        # form here as at every other site; only the convolution leaves autocast.
+        coefficients = self.coefficients(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
             return _premixed_conv3x3(
                 self,
@@ -49,6 +52,7 @@ class _FP16SafeDynamicConv(PremixedDeployedDynamicConv3x3):
                 self.base.weight.float(),
                 self.base.bias.float(),
                 self.experts.float(),
+                coefficients,
                 lambda: self.coefficients(x),
             )
 
