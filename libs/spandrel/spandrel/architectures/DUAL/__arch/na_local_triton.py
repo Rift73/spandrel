@@ -309,7 +309,7 @@ if AVAILABLE:
         operand = out_ptr.dtype.element_ty
         program, head = tl.program_id(0), tl.program_id(1)
         image = (program // (segments * width)).to(tl.int64)
-        x = (program % width).to(tl.int64)
+        x = program % width
         y0 = program // width % segments * segment
         kh, kw = tl.minimum(height, 32), tl.minimum(width, 32)
         col0 = tl.minimum(tl.maximum(x - 16, 0), width - kw)
@@ -374,9 +374,12 @@ if AVAILABLE:
             p = tl.exp2(logits - tl.max(logits, 1)[:, None])
             a = (p / tl.sum(p, 1)[:, None]).to(operand).to(tl.float32)
             yc = tl.minimum(y, height - 1).to(tl.int64)
-            v = tl.load(v_ptr + channel + yc * row_stride + x * col_stride)
+            # x stays 32-bit (an int64 x costs registers through col0 and the
+            # strips); its two address products are 64-bit
+            x_wide = x.to(tl.int64)
+            v = tl.load(v_ptr + channel + yc * row_stride + x_wide * col_stride)
             tl.store(
-                out + yc * out_row_stride + x * out_col_stride,
+                out + yc * out_row_stride + x_wide * out_col_stride,
                 tl.sum(a * v.to(tl.float32)[None, :], 1).to(operand),
                 y < height,
             )
@@ -486,6 +489,11 @@ if AVAILABLE:
 # rows per regional program: the running Gram restarts exactly every SEGMENT rows,
 # and within a segment wherever a square sum fell below 1 / RESTART of its peak
 SEGMENT, RESTART = 32, 64.0
+# Registers per thread of the one-warp regional programs: at 168 twelve programs fit
+# an SM's 65,536 registers; the restart path lets the compiler take 218, and from 176
+# up the kernel is 9-15 % slower (2x DUAL Light, 960x540, RTX 5090). At 168 it spills
+# a few registers and runs at the speed it had before the restart test.
+REGIONAL_REGISTERS = 168
 
 
 def regional_na(
@@ -513,6 +521,7 @@ def regional_na(
             restart=RESTART,
             num_warps=1,
             num_stages=1,
+            maxnreg=REGIONAL_REGISTERS,
         )
     return out
 
