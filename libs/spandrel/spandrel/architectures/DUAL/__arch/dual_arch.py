@@ -29,6 +29,10 @@ differentiable SDPA path supports training. spandrel: eager CUDA inference
 runs NA as one Triton kernel (na_triton.py, chaiNNer-C's TensorRT plugin
 kernel) when Triton imports, and the SDPA path otherwise; the local and the
 retrieval NA likewise run as Triton kernels (na_local_triton.py).
+spandrel: routing_na and regional_na (default False) give the two remaining
+sites their neighborhood forms: the group convolutions' experts are routed per
+position from the mean over its clamped 96x96 neighborhood, and the regional
+channel attention is computed per position over its clamped 32x32 neighborhood.
 
 Dependencies: PyTorch. (spandrel: the traiNNer registration and the optional
 Triton direct attention of the original file are not bundled; see below.) No
@@ -590,6 +594,31 @@ def _kernel_failed(name: str, error: Exception) -> None:
 
 # Attention elements per SDPA call before tiled local/retrieval NA splits tiles.
 _NA_ELEMENT_CAP = 2**27
+# Neighborhood sides of routing_na and regional_na.
+_ROUTING_REACH, _REGIONAL_REACH = 96, 32
+
+
+def _neighborhood_rows(rows: range, k: int, length: int) -> range:
+    """The map rows that the clamped k-row neighborhoods of `rows` cover."""
+
+    def start(p: int) -> int:
+        return min(max(p - k // 2, 0), length - k)
+
+    return range(start(rows.start), start(rows.stop - 1) + k)
+
+
+def _neighborhood_sum(z: Tensor, ky: int, kx: int, rows: range, height: int) -> Tensor:
+    """Sums over each position's clamped ky x kx neighborhood (start = clamp(p - k // 2,
+    0, L - k) per axis) for the map rows `rows` of a map `height` rows tall.
+
+    z is (N, len(span), W) and holds the rows span = _neighborhood_rows(rows, ky, height).
+    """
+    first = _neighborhood_rows(rows, ky, height).start
+    sums = F.avg_pool2d(z, (ky, 1), 1, divisor_override=1)
+    sums = F.avg_pool2d(sums, (1, kx), 1, divisor_override=1)
+    starts = torch.arange(rows.start, rows.stop, device=z.device) - ky // 2
+    sums = sums.index_select(-2, starts.clamp(0, height - ky) - first)
+    return F.pad(sums, (kx // 2, kx - 1 - kx // 2), mode="replicate")
 
 
 @dataclass
@@ -1522,6 +1551,8 @@ class RegionalChannelAttention(nn.Module):
         self.project = nn.Conv2d(channels, channels, 1, bias=False)
         self.theta = nn.Parameter(torch.zeros(heads))
         self.apply(_init_weights)  # noqa: SLF001 - same new-module initialization
+        # DUAL sets this from its regional_na switch; see _mix_na.
+        self.regional_na = False
 
     def channel_attention(self, q: Tensor, k: Tensor, count: Tensor) -> Tensor:
         """(..., heads, d, tokens) -> (..., heads, d, d), FP32 or FP64.
@@ -1637,10 +1668,54 @@ class RegionalChannelAttention(nn.Module):
             result = out if result is None else result + out
         return result
 
+    def _mix_na(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """spandrel: regional_na's per-position form. Each position's channel attention
+        (Gram, lengths + count * 1e-6, cosine * tau, softmax) comes from its own clamped
+        32x32 neighborhood and is applied to its own v, in the dtypes of
+        channel_attention and _class_core. The b*d*d*H*W Gram field is never whole:
+        one head and one band of rows at a time, under _NA_ELEMENT_CAP elements."""
+        b, c, h, w = q.shape
+        d = c // self.heads
+        ky, kx = min(_REGIONAL_REACH, h), min(_REGIONAL_REACH, w)
+        dtype = calculation_dtype(q.dtype)
+        band = max(1, _NA_ELEMENT_CAP // (b * d * d * w) - ky + 1)
+        out = torch.empty(b, c, h, w, device=q.device, dtype=dtype)
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            tau = self.theta.to(dtype).clamp(max=math.log(100)).exp()
+            for head in range(self.heads):
+                channels = slice(head * d, (head + 1) * d)
+                for first in range(0, h, band):
+                    rows = range(first, min(first + band, h))
+                    span = _neighborhood_rows(rows, ky, h)
+                    qh = q[:, channels, span.start : span.stop].to(dtype)
+                    kh = k[:, channels, span.start : span.stop].to(dtype)
+
+                    def box(
+                        t: Tensor, rows: range = rows, span: range = span
+                    ) -> Tensor:
+                        sums = _neighborhood_sum(
+                            t.reshape(-1, len(span), w), ky, kx, rows, h
+                        )
+                        return sums.reshape(*t.shape[:-2], len(rows), w)
+
+                    q_norm = (box(qh.square()) + ky * kx * 1e-6).sqrt()
+                    k_norm = (box(kh.square()) + ky * kx * 1e-6).sqrt()
+                    gram = box(qh[:, :, None] * kh[:, None])
+                    cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
+                    a = (cosine * tau[head]).softmax(2)
+                    vh = v[:, channels, rows.start : rows.stop]
+                    o = (a.to(v.dtype) * vh[:, None]).sum(2)
+                    out[:, channels, rows.start : rows.stop] = o.to(dtype)
+        return out
+
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """Blend four class outputs without an H*W*d*d matrix field."""
         check = self.core_checkpoint and self.training and torch.is_grad_enabled()
         h, w = q.shape[-2:]
+        # Up to 16 positions per axis every class has one window holding the whole
+        # map, and the hats sum to 1: the blend is then the per-position form.
+        if self.regional_na and (h > 16 or w > 16):
+            return self._mix_na(q, k, v)
         # spandrel: one zero-padded copy serves all four classes, which crop their
         # window grids from it; q and k are read in the calculation dtype anyway.
         dtype = calculation_dtype(q.dtype)
@@ -1881,13 +1956,34 @@ class DynamicRouter(nn.Module):
         self.fc1 = nn.Linear(channels, channels // 4, device=device, dtype=dtype)
         self.fc2 = nn.Linear(channels // 4, experts, device=device, dtype=dtype)
         nn.init.zeros_(self.fc2.bias)
+        # DUAL sets this from its routing_na switch: (B, K, H, W) coefficients, each
+        # position routed from the mean over its clamped 96x96 neighborhood.
+        self.routing_na = False
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = (
             torch.float64 if self.fc1.weight.dtype == torch.float64 else torch.float32
         )
+        batch, _, height, width = x.shape
+        # Up to 96 positions per axis the neighborhood is the whole map.
+        na = self.routing_na and (height > _ROUTING_REACH or width > _ROUTING_REACH)
         with torch.autocast(device_type=x.device.type, enabled=False):
-            pooled = x.mean((2, 3), dtype=dtype)
+            if na:
+                ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
+                sums = _neighborhood_sum(
+                    x.to(dtype).reshape(-1, height, width),
+                    ky,
+                    kx,
+                    range(height),
+                    height,
+                )
+                pooled = (
+                    (sums / (ky * kx))
+                    .reshape(batch, self.channels, height, width)
+                    .permute(0, 2, 3, 1)
+                )
+            else:
+                pooled = x.mean((2, 3), dtype=dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)
             hidden = F.gelu(
                 F.linear(normalized, self.fc1.weight.to(dtype), self.fc1.bias.to(dtype))
@@ -1895,15 +1991,43 @@ class DynamicRouter(nn.Module):
             logits = F.linear(
                 hidden, self.fc2.weight.to(dtype), self.fc2.bias.to(dtype)
             )
-            return (logits.softmax(-1) - 1.0 / self.num_experts)[:, :, None, None]
+            coefficients = logits.softmax(-1) - 1.0 / self.num_experts
+            if na:
+                return coefficients.permute(0, 3, 1, 2)
+            return coefficients[:, :, None, None]
 
 
 def _premixed_conv3x3(
     x: Tensor, weight0: Tensor, bias0: Tensor, experts: Tensor, coefficients: Tensor
 ) -> Tensor:
-    """One differentiable mixed kernel per sample, including batch > 1."""
+    """One differentiable mixed kernel per sample, including batch > 1.
+
+    spandrel: per-position coefficients (B, K, H, W) of routing_na mix the experts'
+    outputs instead, base + sum_k c_k(p) * conv_k, summed in the calculation dtype.
+    """
     batch, channels, height, width = x.shape
     dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
+    if coefficients.shape[-2:] != (1, 1):
+        count = experts.shape[0]
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            weight = torch.cat(
+                (
+                    weight0.to(dtype),
+                    experts.to(dtype).reshape(count * channels, channels, 3, 3),
+                )
+            )
+            bias = torch.cat(
+                (bias0.to(dtype), bias0.new_zeros(count * channels, dtype=dtype))
+            )
+        convolved = F.conv2d(
+            x, weight.to(experts.dtype), bias.to(experts.dtype), padding=1
+        )
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
+            output = parts[:, 0] + (
+                coefficients[:, :, None].to(dtype) * parts[:, 1:]
+            ).sum(1)
+        return output.to(convolved.dtype).contiguous(memory_format=_layers_layout(x))
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
             experts.reshape(experts.shape[0], -1).to(dtype)
@@ -2103,6 +2227,8 @@ class DUAL(nn.Module):
         context_overlap: bool | None = None,
         local_na: bool = True,
         retrieval_na: bool = True,
+        routing_na: bool = False,
+        regional_na: bool = False,
         g_window: int = 16,
         norm: Literal["token"] = "token",
         c_pos_bias: str = "rfb",
@@ -2120,7 +2246,12 @@ class DUAL(nn.Module):
         if type(pixel_unshuffle) is not bool:
             raise ValueError("pixel_unshuffle must be a bool")
         context_na = _resolve_context_na(context_na, context_overlap, default=True)
-        for name, value in (("local_na", local_na), ("retrieval_na", retrieval_na)):
+        for name, value in (
+            ("local_na", local_na),
+            ("retrieval_na", retrieval_na),
+            ("routing_na", routing_na),
+            ("regional_na", regional_na),
+        ):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be a bool")
         if local_na and qk != "dot":
@@ -2175,6 +2306,8 @@ class DUAL(nn.Module):
         self.context_na = context_na
         self.local_na = local_na
         self.retrieval_na = retrieval_na
+        self.routing_na = routing_na
+        self.regional_na = regional_na
         self.unshuffle = pixel_unshuffle
         self.internal_scale = scale * (2 if pixel_unshuffle else 1)
         self.selected_original_indices = selected
@@ -2228,6 +2361,7 @@ class DUAL(nn.Module):
                     group.layers[index], core_checkpoint=dual_core_checkpoint
                 )
                 group.layers[index].attention.context_na = context_na
+                group.layers[index].dual.regional_na = regional_na
         for group, indices in zip(self.groups, selected, strict=True):
             group.layers = nn.ModuleList(group.layers[i] for i in indices)
         if self.unshuffle:
@@ -2265,6 +2399,7 @@ class DUAL(nn.Module):
                         self.get_submodule(name), dynamic_experts
                     ),
                 )
+                self.get_submodule(name).router.routing_na = routing_na
 
     @property
     def context_overlap(self) -> bool:

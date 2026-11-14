@@ -201,6 +201,10 @@ class DUALArch(Architecture[DUAL]):
             # every DUAL's); the retrieval's need nothing
             local_na=qk == "dot",
             retrieval_na=True,
+            # per-position routing and regional attention change the output of
+            # models trained without them: off unless the caller selects them
+            routing_na=False,
+            regional_na=False,
             g_window=g_window,
             c_pos_bias=c_pos_bias,
             rfb_rank=rfb_rank,

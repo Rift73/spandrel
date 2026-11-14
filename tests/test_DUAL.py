@@ -710,3 +710,203 @@ def test_other_local_na_kernel_failures_are_raised(monkeypatch):
     with torch.no_grad(), pytest.raises(torch.OutOfMemoryError):
         attention.pre_gate_core(x)
     assert dual_arch.LOCAL_NA_TRITON
+
+
+def _routed_conv(channels=32, experts=4):
+    source = torch.nn.Conv2d(channels, channels, 3, padding=1)
+    base = dual_arch.EDBBReparamConv3x3(source)
+    conv = dual_arch.PremixedDynamicGroupConv3x3(base, experts).double().eval()
+    conv.experts.data.normal_(0, 0.05)
+    for parameter in conv.router.parameters():
+        parameter.data.normal_(0, 0.3)
+    return conv
+
+
+def _routing_reference(conv, x, reach=96):
+    """FP64, one position at a time: the router reads the mean over the position's
+    clamped neighborhood; the output is base + sum_k c_k(p) * conv_k."""
+    channels, height, width = x.shape[1:]
+    ky, kx = min(reach, height), min(reach, width)
+    router = conv.router
+    weight, bias = conv.base.equivalent_kernel(torch.float64)
+    out = torch.nn.functional.conv2d(x, weight, bias, padding=1)
+    experts = [
+        torch.nn.functional.conv2d(x, e.reshape(channels, channels, 3, 3), padding=1)
+        for e in conv.experts
+    ]
+    for y in range(height):
+        for z in range(width):
+            sy = min(max(y - ky // 2, 0), height - ky)
+            sz = min(max(z - kx // 2, 0), width - kx)
+            pooled = x[:, :, sy : sy + ky, sz : sz + kx].mean((2, 3))
+            normalized = torch.nn.functional.layer_norm(pooled, (channels,))
+            hidden = torch.nn.functional.gelu(router.fc1(normalized))
+            c = router.fc2(hidden).softmax(-1) - 1 / router.num_experts
+            for e, expert in enumerate(experts):
+                out[:, :, y, z] += c[:, e, None] * expert[:, :, y, z]
+    return out
+
+
+# above 96 positions on one or both axes, batch 2, the folded convolution too
+@pytest.mark.parametrize("shape", [(100, 7), (5, 130), (99, 98)])
+def test_routing_na_matches_a_per_position_reference(shape):
+    torch.manual_seed(0)
+    conv = _routed_conv()
+    conv.router.routing_na = True
+    x = torch.randn(2, 32, *shape, dtype=torch.float64)
+    with torch.no_grad():
+        expected = _routing_reference(conv, x)
+        torch.testing.assert_close(conv(x), expected, rtol=0, atol=1e-10)
+        folded = conv.folded()
+        assert folded.router.routing_na
+        torch.testing.assert_close(folded(x), expected, rtol=0, atol=1e-10)
+
+
+def test_routing_na_keeps_the_image_routing_up_to_96():
+    torch.manual_seed(0)
+    conv = _routed_conv().float()
+    x = torch.randn(2, 32, 96, 80).contiguous(memory_format=torch.channels_last)
+    with torch.no_grad():
+        expected = conv(x)
+        conv.router.routing_na = True
+        assert torch.equal(conv(x), expected)
+
+
+def _regional_reference(rca, q, k, v, reach=32):
+    """FP64, one position at a time: channel_attention over the position's clamped
+    neighborhood, applied to its own v."""
+    batch, channels, height, width = q.shape
+    heads, d = rca.heads, channels // rca.heads
+    ky, kx = min(reach, height), min(reach, width)
+    out = torch.empty_like(q)
+    count = torch.tensor(float(ky * kx), dtype=torch.float64)
+    for y in range(height):
+        for z in range(width):
+            sy = min(max(y - ky // 2, 0), height - ky)
+            sz = min(max(z - kx // 2, 0), width - kx)
+
+            def part(t, sy=sy, sz=sz):
+                return t[:, :, sy : sy + ky, sz : sz + kx].reshape(batch, heads, d, -1)
+
+            a = rca.channel_attention(part(q), part(k), count)
+            own = v[:, :, y, z].reshape(batch, heads, d, 1)
+            out[:, :, y, z] = (a @ own).reshape(batch, channels)
+    return out
+
+
+# above 16 positions on one or both axes, non-square, below and above the 32-wide
+# neighborhood, batch 2; with a small cap every head runs in bands of a few rows
+@pytest.mark.parametrize("bands", [False, True])
+@pytest.mark.parametrize("shape", [(17, 16), (12, 40), (37, 20)])
+def test_regional_na_matches_a_per_position_reference(monkeypatch, shape, bands):
+    if bands:
+        monkeypatch.setattr(dual_arch, "_NA_ELEMENT_CAP", 2 * 32 * 32 * 20 * 34)
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(64, 2).double().eval()
+    rca.theta.data.normal_(0, 1)
+    rca.regional_na = True
+    q, k, v = torch.randn(3, 2, 64, *shape, dtype=torch.float64).unbind(0)
+    with torch.no_grad():
+        actual = rca.mix(q, k, v)
+        expected = _regional_reference(rca, q, k, v)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-10)
+
+
+def test_regional_na_keeps_the_blend_up_to_16():
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(64, 2).eval()
+    rca.theta.data.normal_(0, 1)
+    for shape in ((16, 16), (16, 5), (9, 16)):
+        q, k, v = torch.randn(3, 2, 64, *shape).unbind(0)
+        with torch.no_grad():
+            rca.regional_na = False
+            expected = rca.mix(q, k, v)
+            rca.regional_na = True
+            assert torch.equal(rca.mix(q, k, v), expected)
+
+
+# the condition of mix's shortcut: the four-class blend equals the per-position form
+# up to 16 positions per axis, and not beyond
+def test_the_blend_is_the_per_position_form_up_to_16():
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(64, 2).double().eval()
+    rca.theta.data.normal_(0, 1)
+    for shape, equal in (((16, 16), True), ((16, 9), True), ((17, 16), False)):
+        q, k, v = torch.randn(3, 1, 64, *shape, dtype=torch.float64).unbind(0)
+        with torch.no_grad():
+            blend = rca.mix(q, k, v)
+            error = (_regional_reference(rca, q, k, v) - blend).abs().max().item()
+        assert (error < 1e-12) is equal, (shape, error)
+
+
+def _na5_sites(model):
+    return [
+        m.routing_na if isinstance(m, dual_arch.DynamicRouter) else m.regional_na
+        for m in model.modules()
+        if isinstance(m, (dual_arch.DynamicRouter, dual_arch.RegionalChannelAttention))
+    ]
+
+
+def test_routing_and_regional_na_are_off_by_default_and_on_loading():
+    on = _small(routing_na=True, regional_na=True)
+    # two groups: two routers, four context layers
+    assert _na5_sites(on) == [True] * 6
+    for source in (dual_light(2), on):
+        model = DUALArch().load(source.state_dict()).model
+        assert not model.routing_na and not model.regional_na
+        sites = _na5_sites(model)
+        assert sites and not any(sites)
+    assert not any(_na5_sites(dual_light(2)))
+    with pytest.raises(ValueError, match="routing_na must be a bool"):
+        _small(routing_na=1)
+
+
+# switched off, the model is today's model: both switches on above both neighborhoods
+# change the output, and switched back off it is bit-identical again
+def test_routing_and_regional_na_off_is_todays_model():
+    torch.manual_seed(0)
+    model = _small(scale=2).eval()
+    for name, parameter in model.named_parameters():
+        if name.endswith("conv.experts"):
+            parameter.data.normal_(0, 0.02)
+    on = _small(scale=2, routing_na=True, regional_na=True).eval()
+    on.load_state_dict(model.state_dict())
+    image = torch.rand(2, 3, 101, 40)
+    with torch.no_grad():
+        expected = model(image)
+        changed = on(image)
+        for m in on.modules():
+            if isinstance(m, dual_arch.DynamicRouter):
+                m.routing_na = False
+            if isinstance(m, dual_arch.RegionalChannelAttention):
+                m.regional_na = False
+        assert torch.equal(on(image), expected)
+    assert (changed - expected).abs().max() > 1e-4
+
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+# FP16 features, batch 2, non-square: the router and the channel attention calculate
+# in FP32 and stay within FP16 rounding of the FP64 references
+@needs_cuda
+def test_routing_and_regional_na_in_fp16_on_the_gpu():
+    torch.manual_seed(0)
+    conv = _routed_conv(128)
+    conv.router.routing_na = True
+    x = torch.randn(2, 128, 120, 97, dtype=torch.float64)
+    with torch.no_grad():
+        expected = _routing_reference(conv, x)
+        actual = conv.cuda().half()(x.cuda().half())
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual.double().cpu(), expected, rtol=0, atol=2e-2)
+
+    rca = dual_arch.RegionalChannelAttention(128, 4).double().eval()
+    rca.theta.data.normal_(0, 1)
+    rca.regional_na = True
+    q, k, v = torch.randn(3, 2, 128, 40, 37, dtype=torch.float64).unbind(0)
+    with torch.no_grad():
+        expected = _regional_reference(rca, q, k, v)
+        actual = rca.cuda().half().mix(*(t.cuda().half() for t in (q, k, v)))
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.double().cpu(), expected, rtol=0, atol=5e-3)
