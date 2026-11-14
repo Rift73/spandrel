@@ -2007,6 +2007,24 @@ class DynamicRouter(nn.Module):
         # position routed from the mean over its clamped 96x96 neighborhood.
         self.routing_na = False
 
+    def _neighborhood_means_triton(
+        self, x: Tensor, ky: int, kx: int, dtype: torch.dtype
+    ) -> Tensor | None:
+        """spandrel: _neighborhood_means from the Triton window sums for FP16 / FP32
+        features and an FP32 router; None where they do not run or failed, which
+        switches ROUTING_NA_TRITON off for good."""
+        global ROUTING_NA_TRITON
+        if dtype != torch.float32 or not _na_kernel_usable(
+            ROUTING_NA_TRITON, self, x, (torch.float16, torch.float32)
+        ):
+            return None
+        try:
+            return na_local_triton.neighborhood_means(x, ky, kx)
+        except Exception as error:
+            _kernel_failed("routing", error)
+            ROUTING_NA_TRITON = False
+            return None
+
     def forward(self, x: Tensor) -> Tensor:
         dtype = (
             torch.float64 if self.fc1.weight.dtype == torch.float64 else torch.float32
@@ -2014,11 +2032,13 @@ class DynamicRouter(nn.Module):
         batch, _, height, width = x.shape
         # Up to 96 positions per axis the neighborhood is the whole map.
         na = self.routing_na and (height > _ROUTING_REACH or width > _ROUTING_REACH)
+        # one mean per distinct window; positions sharing one share its route
+        ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
+        pooled = self._neighborhood_means_triton(x, ky, kx, dtype) if na else None
         with torch.autocast(device_type=x.device.type, enabled=False):
             if na:
-                # one mean per distinct window; positions sharing one share its route
-                ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
-                pooled = _neighborhood_means(x, ky, kx, dtype)
+                if pooled is None:
+                    pooled = _neighborhood_means(x, ky, kx, dtype)
             else:
                 pooled = x.mean((2, 3), dtype=dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)

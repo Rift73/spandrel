@@ -799,12 +799,16 @@ def test_routing_na_kernel_matches_the_pytorch_form(
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last)
     calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
     with torch.no_grad():
         actual = conv(x)
-        assert len(calls) == 1
+        coefficients = conv.router(x)
+        assert len(calls) == 1 and len(means) == 2
         monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", False)
         expected = conv(x)
-    assert len(calls) == 1
+        expected_coefficients = conv.router(x)
+    assert len(calls) == 1 and len(means) == 2
+    torch.testing.assert_close(coefficients, expected_coefficients, rtol=0, atol=1e-6)
     assert actual.dtype == dtype
     layout = torch.channels_last if channels_last else torch.contiguous_format
     assert actual.is_contiguous(memory_format=layout)
@@ -817,6 +821,7 @@ def test_routing_na_kernel_stays_off_up_to_96_and_outside_inference(monkeypatch)
     conv = _gpu_routed_conv(32, torch.float16)
     x = torch.randn(1, 32, 97, 40, device="cuda").half()
     calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
     with torch.no_grad():
         conv(x[..., :96, :])
         conv.bfloat16()(x.bfloat16())
@@ -825,7 +830,7 @@ def test_routing_na_kernel_stays_off_up_to_96_and_outside_inference(monkeypatch)
         with torch.autocast("cuda", torch.float16):
             conv(x)
     conv(x)
-    assert not calls
+    assert not calls and not means
 
 
 def _routing_failing_with(monkeypatch, error):
@@ -835,6 +840,7 @@ def _routing_failing_with(monkeypatch, error):
     monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", True)
     monkeypatch.setattr(dual_arch, "_na_kernel_usable", lambda *_: True)
     monkeypatch.setattr(na_local_triton, "routed_sum", launch)
+    monkeypatch.setattr(na_local_triton, "neighborhood_means", launch)
     conv = _routed_conv().float()
     conv.router.routing_na = True
     return conv, torch.randn(1, 32, 100, 20)

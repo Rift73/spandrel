@@ -24,9 +24,10 @@ head; it sums the first window from its row strips (32 x 32 x 32 tl.dot each), t
 per row adds the entering strip and subtracts the leaving one when the clamped window
 moves. The running sums restart exactly at every segment, which bounds their drift.
 
-Routing (_premixed_conv3x3 with routing_na's per-position coefficients): the base
-part plus the coefficient-weighted expert parts of the wide convolution's output,
-summed in FP32 in one pass and written in the parts' type.
+Routing (routing_na): the router's means over the windows at the distinct clamped
+starts, as two passes of sliding window sums (rows, then columns) with FP64 running
+sums; and the base part plus the coefficient-weighted expert parts of the wide
+convolution's output, summed in FP32 in one pass and written in the parts' type.
 
 The image-sized count is on the launch grid's first axis (CUDA caps the others at
 65,535 programs). Triton is optional: without it, AVAILABLE is False and the PyTorch
@@ -390,6 +391,53 @@ if AVAILABLE:
             both,
         )
 
+    @triton.jit
+    def _window_sums(
+        in_ptr,
+        out_ptr,
+        steps: tl.int32,
+        lanes: tl.int32,
+        channels: tl.int32,
+        window: tl.int32,
+        scale: tl.float32,
+        in_image,
+        in_channel,
+        in_lane,
+        in_step,
+        out_image,
+        out_channel,
+        out_lane,
+        out_step,
+        block: tl.constexpr,
+    ):
+        """Sums of `window` consecutive steps for every lane of one (image, channel)
+        plane, at the steps - window + 1 starts, times scale: an FP64 running sum adds
+        the entering step and subtracts the leaving one."""
+        # one axis: (plane, lane block) pairs, so B * C may pass 65,535
+        blocks = tl.cdiv(lanes, block)
+        plane = tl.program_id(0) // blocks
+        lane = (tl.program_id(0) % blocks * block + tl.arange(0, block)).to(tl.int64)
+        image, channel = (
+            (plane // channels).to(tl.int64),
+            (plane % channels).to(tl.int64),
+        )
+        live = lane < lanes
+        source = in_ptr + image * in_image + channel * in_channel + lane * in_lane
+        target = out_ptr + image * out_image + channel * out_channel + lane * out_lane
+        running = tl.zeros((block,), tl.float64)
+        for step in range(steps):
+            at = step.to(tl.int64)
+            running += tl.load(source + at * in_step, live, 0).to(tl.float64)
+            leaving = tl.load(
+                source + (at - window) * in_step, live & (step >= window), 0
+            )
+            running -= leaving.to(tl.float64)
+            tl.store(
+                target + (at - window + 1) * out_step,
+                (running * scale).to(out_ptr.dtype.element_ty),
+                live & (step >= window - 1),
+            )
+
 
 # rows per regional program: the running Gram restarts exactly every SEGMENT rows
 SEGMENT = 32
@@ -419,6 +467,64 @@ def regional_na(
             segment=SEGMENT,
             num_warps=1,
             num_stages=1,
+        )
+    return out
+
+
+# lanes per window-sum program
+WINDOW_LANES = 128
+
+
+def neighborhood_means(x: torch.Tensor, ky: int, kx: int) -> torch.Tensor:
+    """x B,C,H,W (FP16 or FP32, any strides) to its FP32 means over the ky x kx windows
+    at every start, B,H-ky+1,W-kx+1,C (channels innermost)."""
+    batch, channels, height, width = x.shape
+    rows = torch.empty(
+        (batch, channels, height - ky + 1, width), dtype=torch.float32, device=x.device
+    )
+    out = torch.empty(
+        (batch, height - ky + 1, width - kx + 1, channels),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    with torch.cuda.device(x.device):
+        # rows: lanes are the columns, steps the rows
+        _window_sums[(triton.cdiv(width, WINDOW_LANES) * batch * channels,)](
+            x,
+            rows,
+            height,
+            width,
+            channels,
+            ky,
+            1.0,
+            x.stride(0),
+            x.stride(1),
+            x.stride(3),
+            x.stride(2),
+            rows.stride(0),
+            rows.stride(1),
+            rows.stride(3),
+            rows.stride(2),
+            block=WINDOW_LANES,
+        )
+        # columns: lanes are the rows of the row sums, steps the columns
+        _window_sums[(triton.cdiv(height - ky + 1, WINDOW_LANES) * batch * channels,)](
+            rows,
+            out,
+            width,
+            height - ky + 1,
+            channels,
+            kx,
+            1.0 / (ky * kx),
+            rows.stride(0),
+            rows.stride(1),
+            rows.stride(2),
+            rows.stride(3),
+            out.stride(0),
+            out.stride(3),
+            out.stride(1),
+            out.stride(2),
+            block=WINDOW_LANES,
         )
     return out
 
