@@ -1091,7 +1091,7 @@ def test_a_default_model_on_the_cpu_is_todays_model(monkeypatch):
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def _loaded_light(**kwargs):
+def _loaded_light(dtype=torch.float16, **kwargs):
     """A 2x DUAL Light with nonzero expert kernels, loaded as spandrel loads it."""
     torch.manual_seed(0)
     source = dual_light(2)
@@ -1106,7 +1106,7 @@ def _loaded_light(**kwargs):
             m, dual_arch.RegionalChannelAttention
         ):
             m.regional_na = kwargs["regional_na"]
-    return model.cuda().eval().half()
+    return model.to("cuda", dtype).eval()
 
 
 # on an NVIDIA GPU in FP16 a default model is the five-site model: both kernels run,
@@ -1123,6 +1123,59 @@ def test_a_default_model_on_the_gpu_runs_both_sites_per_position(monkeypatch):
         today = _loaded_light(routing_na=False, regional_na=False)(image)
     assert torch.equal(default, explicit)
     assert not torch.equal(default, today)
+
+
+def _na5_kernel_calls(monkeypatch):
+    return [
+        _counted(monkeypatch, name)
+        for name in ("regional_na", "routed_sum", "neighborhood_means")
+    ]
+
+
+# both switches on: the sites go per position together or not at all. FP32 features
+# (the regional kernel's are FP16) keep today's forms at both sites
+@needs_kernel
+def test_a_default_model_in_fp32_on_the_gpu_is_todays_model(monkeypatch):
+    image = torch.rand(1, 3, 208, 200, device="cuda")
+    calls = _na5_kernel_calls(monkeypatch)
+    default = _loaded_light(torch.float32)
+    today = _loaded_light(torch.float32, routing_na=False, regional_na=False)
+    with torch.no_grad():
+        assert torch.equal(default(image), today(image))
+    assert not any(calls)
+
+
+# the joint rule relies on DUAL's regional heads being the kernel's 32 channels
+def test_every_duals_regional_heads_are_32_channels():
+    regions = [
+        m
+        for m in dual_light(2).modules()
+        if isinstance(m, dual_arch.RegionalChannelAttention)
+    ]
+    assert regions and all(m.channels // m.heads == 32 for m in regions)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        DUAL(embed_dim=48, depths=(4, 4), layer_indices=((0, 1, 2, 5), (2, 3, 4, 5)))
+
+
+# with the regional site switched off, the routing site's own conditions decide: FP32
+# features on the GPU route per position
+@needs_kernel
+def test_routing_alone_routes_per_position_in_fp32(monkeypatch):
+    def model(**kwargs):
+        torch.manual_seed(0)
+        net = dual_light(2, regional_na=False, **kwargs)
+        for name, parameter in net.named_parameters():
+            if name.endswith("conv.experts"):
+                parameter.data.normal_(0, 0.02)
+        return net.cuda().eval()
+
+    image = torch.rand(1, 3, 208, 200, device="cuda")
+    regional, routed, means = _na5_kernel_calls(monkeypatch)
+    with torch.no_grad():
+        alone = model()(image)
+        assert routed and means and not regional
+        today = model(routing_na=False)(image)
+    assert not torch.equal(alone, today)
 
 
 # training mode and ROCm take today's forms at both sites (no kernel, today's output)

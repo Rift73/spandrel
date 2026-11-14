@@ -1598,6 +1598,9 @@ class RegionalChannelAttention(nn.Module):
         # DUAL sets this from its regional_na switch: the per-position form (_mix_na)
         # where its kernel runs (_na_path_available), the blend elsewhere.
         self.regional_na = False
+        # The feature dtypes that form may run for; DUAL narrows it so that its two
+        # sites take their per-position forms together (see DUAL.__init__).
+        self.na_kernel_dtypes: tuple[torch.dtype, ...] = (torch.float16,)
 
     def channel_attention(self, q: Tensor, k: Tensor, count: Tensor) -> Tensor:
         """(..., heads, d, tokens) -> (..., heads, d, d), FP32 or FP64.
@@ -1820,7 +1823,7 @@ class RegionalChannelAttention(nn.Module):
             self.regional_na
             and (h > 16 or w > 16)
             and q.shape[1] // self.heads == 32
-            and _na_path_available(self, q)
+            and _na_path_available(self, q, self.na_kernel_dtypes)
         ):
             return self._mix_na(q, k, v)
         # spandrel: one zero-padded copy serves all four classes, which crop their
@@ -2067,6 +2070,12 @@ class DynamicRouter(nn.Module):
         # (_na_path_available), (B, K, H, W) coefficients, each position routed from
         # the mean over its clamped 96x96 neighborhood; the image routing elsewhere.
         self.routing_na = False
+        # The feature dtypes that form may run for; DUAL narrows it so that its two
+        # sites take their per-position forms together (see DUAL.__init__).
+        self.na_kernel_dtypes: tuple[torch.dtype, ...] = (
+            torch.float16,
+            torch.float32,
+        )
 
     def _neighborhood_means_triton(
         self, x: Tensor, ky: int, kx: int, dtype: torch.dtype
@@ -2095,7 +2104,7 @@ class DynamicRouter(nn.Module):
         na = (
             self.routing_na
             and (height > _ROUTING_REACH or width > _ROUTING_REACH)
-            and _na_path_available(self, x, (torch.float16, torch.float32))
+            and _na_path_available(self, x, self.na_kernel_dtypes)
         )
         # one mean per distinct window; positions sharing one share its route
         ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
@@ -2562,6 +2571,17 @@ class DUAL(nn.Module):
                     ),
                 )
                 self.get_submodule(name).router.routing_na = routing_na
+        # spandrel: with both switches on, the two sites take their per-position forms
+        # together or not at all, so the routers take theirs only for the features
+        # the regional kernel serves: FP16 (its heads are always 32 channels here,
+        # embed_dim // 32 heads). Every site sees the trunk's features (the last
+        # group's FP32 convolution routes from them too), and device and mode are the
+        # call's, so one forward decides alike at every site. With one switch on,
+        # that site's own conditions decide.
+        if routing_na and regional_na:
+            for module in self.modules():
+                if isinstance(module, DynamicRouter):
+                    module.na_kernel_dtypes = (torch.float16,)
 
     @property
     def context_overlap(self) -> bool:
