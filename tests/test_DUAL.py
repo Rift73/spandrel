@@ -749,7 +749,9 @@ def _routing_reference(conv, x, reach=96):
 
 # above 96 positions on one or both axes, batch 2, the folded convolution too
 @pytest.mark.parametrize("shape", [(100, 7), (5, 130), (99, 98)])
-def test_routing_na_matches_a_per_position_reference(shape):
+def test_routing_na_matches_a_per_position_reference(monkeypatch, shape):
+    # the per-position form outside its kernels' devices, as the gate would allow it
+    monkeypatch.setattr(dual_arch, "_na_path_available", lambda *_: True)
     torch.manual_seed(0)
     conv = _routed_conv()
     conv.router.routing_na = True
@@ -975,6 +977,8 @@ def _regional_reference(rca, q, k, v, reach=32):
 @pytest.mark.parametrize("bands", [False, True])
 @pytest.mark.parametrize("shape", [(17, 16), (12, 40), (37, 20)])
 def test_regional_na_matches_a_per_position_reference(monkeypatch, shape, bands):
+    # the per-position form outside its kernel's devices, as the gate would allow it
+    monkeypatch.setattr(dual_arch, "_na_path_available", lambda *_: True)
     if bands:
         monkeypatch.setattr(dual_arch, "_NA_ELEMENT_CAP", 2 * 32 * 32 * 20 * 34)
     torch.manual_seed(0)
@@ -992,6 +996,7 @@ def test_regional_na_matches_a_per_position_reference(monkeypatch, shape, bands)
 # and of 10 columns, equal to the unbanded form (to FP64 rounding) and to the per-position reference
 @pytest.mark.parametrize("shape", [(20, 75), (37, 70)])
 def test_regional_na_bands_columns_below_one_row(monkeypatch, shape):
+    monkeypatch.setattr(dual_arch, "_na_path_available", lambda *_: True)
     torch.manual_seed(0)
     rca = dual_arch.RegionalChannelAttention(64, 2).double().eval()
     rca.theta.data.normal_(0, 1)
@@ -1045,44 +1050,96 @@ def _na5_sites(model):
     ]
 
 
-def test_routing_and_regional_na_are_off_by_default_and_on_loading():
-    on = _small(routing_na=True, regional_na=True)
+def test_routing_and_regional_na_are_on_by_default_and_on_loading():
+    off = _small(routing_na=False, regional_na=False)
     # two groups: two routers, four context layers
-    assert _na5_sites(on) == [True] * 6
-    for source in (dual_light(2), on):
+    assert _na5_sites(off) == [False] * 6
+    for source in (dual_light(2), off):
         model = DUALArch().load(source.state_dict()).model
-        assert not model.routing_na and not model.regional_na
+        assert model.routing_na and model.regional_na
         sites = _na5_sites(model)
-        assert sites and not any(sites)
-    assert not any(_na5_sites(dual_light(2)))
+        assert sites and all(sites)
+    assert all(_na5_sites(dual_light(2)))
     with pytest.raises(ValueError, match="routing_na must be a bool"):
         _small(routing_na=1)
 
 
-# switched off, the model is today's model: both switches on above both neighborhoods
-# change the output, and switched back off it is bit-identical again
-def test_routing_and_regional_na_off_is_todays_model():
+def _routed_model(**kwargs):
     torch.manual_seed(0)
-    model = _small(scale=2).eval()
+    model = _small(scale=2, **kwargs).eval()
     for name, parameter in model.named_parameters():
         if name.endswith("conv.experts"):
             parameter.data.normal_(0, 0.02)
-    on = _small(scale=2, routing_na=True, regional_na=True).eval()
-    on.load_state_dict(model.state_dict())
+    return model
+
+
+# on the CPU (no kernels) a default model is today's model bit for bit; where the
+# per-position forms run, they change the output, and switched off it is today's again
+def test_a_default_model_on_the_cpu_is_todays_model(monkeypatch):
+    model = _routed_model(routing_na=False, regional_na=False)
+    default = _routed_model()
     image = torch.rand(2, 3, 101, 40)
     with torch.no_grad():
         expected = model(image)
-        changed = on(image)
-        for m in on.modules():
-            if isinstance(m, dual_arch.DynamicRouter):
-                m.routing_na = False
-            if isinstance(m, dual_arch.RegionalChannelAttention):
-                m.regional_na = False
-        assert torch.equal(on(image), expected)
+        assert torch.equal(default(image), expected)
+        monkeypatch.setattr(dual_arch, "_na_path_available", lambda *_: True)
+        changed = default(image)
+        assert torch.equal(model(image), expected)
     assert (changed - expected).abs().max() > 1e-4
 
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+def _loaded_light(**kwargs):
+    """A 2x DUAL Light with nonzero expert kernels, loaded as spandrel loads it."""
+    torch.manual_seed(0)
+    source = dual_light(2)
+    for name, parameter in source.named_parameters():
+        if name.endswith("conv.experts"):
+            parameter.data.normal_(0, 0.02)
+    model = DUALArch().load(source.state_dict()).model
+    for m in model.modules():
+        if "routing_na" in kwargs and isinstance(m, dual_arch.DynamicRouter):
+            m.routing_na = kwargs["routing_na"]
+        if "regional_na" in kwargs and isinstance(
+            m, dual_arch.RegionalChannelAttention
+        ):
+            m.regional_na = kwargs["regional_na"]
+    return model.cuda().eval().half()
+
+
+# on an NVIDIA GPU in FP16 a default model is the five-site model: both kernels run,
+# the output is the explicit model's bit for bit and differs from today's
+@needs_kernel
+def test_a_default_model_on_the_gpu_runs_both_sites_per_position(monkeypatch):
+    image = torch.rand(1, 3, 208, 200, device="cuda").half()
+    regional = _counted(monkeypatch, "regional_na")
+    routed = _counted(monkeypatch, "routed_sum")
+    with torch.no_grad():
+        default = _loaded_light()(image)
+        assert regional and routed
+        explicit = _loaded_light(routing_na=True, regional_na=True)(image)
+        today = _loaded_light(routing_na=False, regional_na=False)(image)
+    assert torch.equal(default, explicit)
+    assert not torch.equal(default, today)
+
+
+# training mode and ROCm take today's forms at both sites (no kernel, today's output)
+@needs_kernel
+def test_training_and_rocm_keep_todays_forms(monkeypatch):
+    image = torch.rand(1, 3, 208, 200, device="cuda").half()
+    regional = _counted(monkeypatch, "regional_na")
+    routed = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    default, today = _loaded_light(), _loaded_light(routing_na=False, regional_na=False)
+    with torch.no_grad():
+        assert torch.equal(default.train()(image), today.train()(image))
+        default.eval()
+        today.eval()
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+        assert torch.equal(default(image), today(image))
+    assert not regional and not routed and not means
 
 
 # FP16 features, batch 2, non-square: the router and the channel attention calculate

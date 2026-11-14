@@ -29,12 +29,13 @@ differentiable SDPA path supports training. spandrel: eager CUDA inference
 runs NA as one Triton kernel (na_triton.py, chaiNNer-C's TensorRT plugin
 kernel) when Triton imports, and the SDPA path otherwise; the local and the
 retrieval NA likewise run as Triton kernels (na_local_triton.py).
-spandrel: routing_na and regional_na (default False) give the two remaining
-sites their neighborhood forms: the group convolutions' experts are routed per
+spandrel: routing_na and regional_na (default True) give the two remaining
+sites their neighborhood forms where their Triton kernels run (eager inference on
+NVIDIA GPUs, na_local_triton.py): the group convolutions' experts are routed per
 position from the mean over its clamped 96x96 neighborhood, and the regional
-channel attention is computed per position over its clamped 32x32 neighborhood
-(eager CUDA inference runs the regional form and the routed sum of expert parts
-as Triton kernels, na_local_triton.py).
+channel attention is computed per position over its clamped 32x32 neighborhood.
+Elsewhere (CPU, ROCm, training, export) the two sites keep today's image routing
+and four-grid blend, as when switched off (_na_path_available).
 
 Dependencies: PyTorch. (spandrel: the traiNNer registration and the optional
 Triton direct attention of the original file are not bundled; see below.) No
@@ -588,6 +589,17 @@ def _na_kernel_usable(
         and _eager_inference(module)
         and plain_inference(x, module)
     )
+
+
+def _na_path_available(
+    module: nn.Module, x: Tensor, dtypes: tuple[torch.dtype, ...] = (torch.float16,)
+) -> bool:
+    """Whether a routing_na / regional_na site takes its per-position form in this
+    call: where its Triton kernels can run (_na_kernel_usable with Triton importable),
+    whether or not a kernel then refuses the input or fails (the per-position PyTorch
+    form runs then). Elsewhere (CPU, ROCm, training, export, other dtypes) the site
+    keeps today's form, as with the switch off."""
+    return _na_kernel_usable(na_local_triton.AVAILABLE, module, x, dtypes)
 
 
 def _kernel_failed(name: str, error: Exception) -> None:
@@ -1583,7 +1595,8 @@ class RegionalChannelAttention(nn.Module):
         self.project = nn.Conv2d(channels, channels, 1, bias=False)
         self.theta = nn.Parameter(torch.zeros(heads))
         self.apply(_init_weights)  # noqa: SLF001 - same new-module initialization
-        # DUAL sets this from its regional_na switch; see _mix_na.
+        # DUAL sets this from its regional_na switch: the per-position form (_mix_na)
+        # where its kernel runs (_na_path_available), the blend elsewhere.
         self.regional_na = False
 
     def channel_attention(self, q: Tensor, k: Tensor, count: Tensor) -> Tensor:
@@ -1803,7 +1816,12 @@ class RegionalChannelAttention(nn.Module):
         h, w = q.shape[-2:]
         # Up to 16 positions per axis every class has one window holding the whole
         # map, and the hats sum to 1: the blend is then the per-position form.
-        if self.regional_na and (h > 16 or w > 16):
+        if (
+            self.regional_na
+            and (h > 16 or w > 16)
+            and q.shape[1] // self.heads == 32
+            and _na_path_available(self, q)
+        ):
             return self._mix_na(q, k, v)
         # spandrel: one zero-padded copy serves all four classes, which crop their
         # window grids from it; q and k are read in the calculation dtype anyway.
@@ -2045,8 +2063,9 @@ class DynamicRouter(nn.Module):
         self.fc1 = nn.Linear(channels, channels // 4, device=device, dtype=dtype)
         self.fc2 = nn.Linear(channels // 4, experts, device=device, dtype=dtype)
         nn.init.zeros_(self.fc2.bias)
-        # DUAL sets this from its routing_na switch: (B, K, H, W) coefficients, each
-        # position routed from the mean over its clamped 96x96 neighborhood.
+        # DUAL sets this from its routing_na switch: where the routing kernels run
+        # (_na_path_available), (B, K, H, W) coefficients, each position routed from
+        # the mean over its clamped 96x96 neighborhood; the image routing elsewhere.
         self.routing_na = False
 
     def _neighborhood_means_triton(
@@ -2073,7 +2092,11 @@ class DynamicRouter(nn.Module):
         )
         batch, _, height, width = x.shape
         # Up to 96 positions per axis the neighborhood is the whole map.
-        na = self.routing_na and (height > _ROUTING_REACH or width > _ROUTING_REACH)
+        na = (
+            self.routing_na
+            and (height > _ROUTING_REACH or width > _ROUTING_REACH)
+            and _na_path_available(self, x, (torch.float16, torch.float32))
+        )
         # one mean per distinct window; positions sharing one share its route
         ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
         pooled = self._neighborhood_means_triton(x, ky, kx, dtype) if na else None
@@ -2366,8 +2389,8 @@ class DUAL(nn.Module):
         context_overlap: bool | None = None,
         local_na: bool = True,
         retrieval_na: bool = True,
-        routing_na: bool = False,
-        regional_na: bool = False,
+        routing_na: bool = True,
+        regional_na: bool = True,
         g_window: int = 16,
         norm: Literal["token"] = "token",
         c_pos_bias: str = "rfb",
