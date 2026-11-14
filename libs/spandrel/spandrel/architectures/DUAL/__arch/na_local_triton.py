@@ -24,6 +24,10 @@ head; it sums the first window from its row strips (32 x 32 x 32 tl.dot each), t
 per row adds the entering strip and subtracts the leaving one when the clamped window
 moves. The running sums restart exactly at every segment, which bounds their drift.
 
+Routing (_premixed_conv3x3 with routing_na's per-position coefficients): the base
+part plus the coefficient-weighted expert parts of the wide convolution's output,
+summed in FP32 in one pass and written in the parts' type.
+
 The image-sized count is on the launch grid's first axis (CUDA caps the others at
 65,535 programs). Triton is optional: without it, AVAILABLE is False and the PyTorch
 path runs.
@@ -336,6 +340,56 @@ if AVAILABLE:
                 y < height,
             )
 
+    @triton.jit
+    def _routed_sum(
+        parts_ptr,
+        coefficients_ptr,
+        out_ptr,
+        positions: tl.int32,
+        channels: tl.int32,
+        part_image,
+        part_channel,
+        part_position,
+        coefficient_image,
+        coefficient_expert,
+        coefficient_position,
+        out_image,
+        out_channel,
+        out_position,
+        experts: tl.constexpr,
+        block_p: tl.constexpr,
+        block_c: tl.constexpr,
+    ):
+        """parts [B, (K + 1) C, P] (the base, then the experts), coefficients [B, K, P]
+        FP32 and out [B, C, P], P = H * W in either memory format."""
+        p = (tl.program_id(0) * block_p + tl.arange(0, block_p)).to(tl.int64)
+        c = (tl.program_id(1) * block_c + tl.arange(0, block_c)).to(tl.int64)
+        image = tl.program_id(2).to(tl.int64)
+        live = p < positions
+        both = live[:, None] & (c < channels)[None, :]
+        part = (
+            parts_ptr
+            + image * part_image
+            + p[:, None] * part_position
+            + c[None, :] * part_channel
+        )
+        acc = tl.load(part, both, 0).to(tl.float32)
+        coefficient = (
+            coefficients_ptr + image * coefficient_image + p * coefficient_position
+        )
+        for e in tl.static_range(experts):
+            weight = tl.load(coefficient + e * coefficient_expert, live, 0)
+            value = tl.load(part + (e + 1) * channels * part_channel, both, 0)
+            acc += weight[:, None] * value.to(tl.float32)
+        tl.store(
+            out_ptr
+            + image * out_image
+            + p[:, None] * out_position
+            + c[None, :] * out_channel,
+            acc.to(out_ptr.dtype.element_ty),
+            both,
+        )
+
 
 # rows per regional program: the running Gram restarts exactly every SEGMENT rows
 SEGMENT = 32
@@ -365,6 +419,54 @@ def regional_na(
             segment=SEGMENT,
             num_warps=1,
             num_stages=1,
+        )
+    return out
+
+
+# positions x channels per routing program
+ROUTED_P, ROUTED_C = 64, 32
+
+
+def routed_sum(
+    parts: torch.Tensor, coefficients: torch.Tensor, layout: torch.memory_format
+) -> torch.Tensor:
+    """parts B,(K+1)*C,H,W (the base, then the experts; FP16 or FP32) and FP32
+    coefficients B,K,H,W, each with its H and W flattening to one stride, to
+    base + sum_k c_k * expert_k B,C,H,W in the parts' type and the given layout."""
+    batch, total, height, width = parts.shape
+    experts = coefficients.shape[1]
+    channels = total // (experts + 1)
+    out = torch.empty(
+        (batch, channels, height, width),
+        dtype=parts.dtype,
+        device=parts.device,
+        memory_format=layout,
+    )
+    grid = (
+        triton.cdiv(height * width, ROUTED_P),
+        triton.cdiv(channels, ROUTED_C),
+        batch,
+    )
+    with torch.cuda.device(parts.device):
+        _routed_sum[grid](
+            parts,
+            coefficients,
+            out,
+            height * width,
+            channels,
+            parts.stride(0),
+            parts.stride(1),
+            parts.stride(3),
+            coefficients.stride(0),
+            coefficients.stride(1),
+            coefficients.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(3),
+            experts=experts,
+            block_p=ROUTED_P,
+            block_c=ROUTED_C,
+            num_warps=4,
         )
     return out
 

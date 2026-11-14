@@ -772,6 +772,93 @@ def test_routing_na_keeps_the_image_routing_up_to_96():
         assert torch.equal(conv(x), expected)
 
 
+def _gpu_routed_conv(channels, dtype):
+    torch.manual_seed(0)
+    conv = _routed_conv(channels).to("cuda", dtype)
+    conv.router.routing_na = True
+    return conv
+
+
+# batch 2, non-square, above 96 positions on one or both axes, partial position and
+# channel blocks; FP16 and the FP32 of the last group's convolution; both layouts
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "shape", "dtype", "channels_last"),
+    [
+        (2, 128, (100, 7), torch.float16, False),
+        (1, 64, (97, 130), torch.float16, True),
+        (2, 48, (130, 99), torch.float16, False),
+        (1, 128, (101, 120), torch.float32, False),
+    ],
+)
+def test_routing_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, channels, shape, dtype, channels_last
+):
+    conv = _gpu_routed_conv(channels, dtype)
+    x = torch.randn(batch, channels, *shape, device="cuda", dtype=dtype)
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last)
+    calls = _counted(monkeypatch, "routed_sum")
+    with torch.no_grad():
+        actual = conv(x)
+        assert len(calls) == 1
+        monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", False)
+        expected = conv(x)
+    assert len(calls) == 1
+    assert actual.dtype == dtype
+    layout = torch.channels_last if channels_last else torch.contiguous_format
+    assert actual.is_contiguous(memory_format=layout)
+    atol = 2e-3 if dtype == torch.float16 else 1e-5
+    torch.testing.assert_close(actual, expected, rtol=0, atol=atol)
+
+
+@needs_kernel
+def test_routing_na_kernel_stays_off_up_to_96_and_outside_inference(monkeypatch):
+    conv = _gpu_routed_conv(32, torch.float16)
+    x = torch.randn(1, 32, 97, 40, device="cuda").half()
+    calls = _counted(monkeypatch, "routed_sum")
+    with torch.no_grad():
+        conv(x[..., :96, :])
+        conv.bfloat16()(x.bfloat16())
+        conv.double()(x.double())
+        conv.half()
+        with torch.autocast("cuda", torch.float16):
+            conv(x)
+    conv(x)
+    assert not calls
+
+
+def _routing_failing_with(monkeypatch, error):
+    def launch(*_):
+        raise error
+
+    monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", True)
+    monkeypatch.setattr(dual_arch, "_na_kernel_usable", lambda *_: True)
+    monkeypatch.setattr(na_local_triton, "routed_sum", launch)
+    conv = _routed_conv().float()
+    conv.router.routing_na = True
+    return conv, torch.randn(1, 32, 100, 20)
+
+
+def test_a_triton_failure_switches_to_the_routing_na_pytorch_form(monkeypatch):
+    error = RuntimeError("kernel launch")
+    error.__cause__ = _TritonError("ast.Num")
+    conv, x = _routing_failing_with(monkeypatch, error)
+    with torch.no_grad():
+        actual = conv(x)
+        assert not dual_arch.ROUTING_NA_TRITON
+        assert torch.equal(actual, conv(x))
+
+
+def test_other_routing_na_kernel_failures_are_raised(monkeypatch):
+    conv, x = _routing_failing_with(
+        monkeypatch, torch.OutOfMemoryError("CUDA out of memory")
+    )
+    with torch.no_grad(), pytest.raises(torch.OutOfMemoryError):
+        conv(x)
+    assert dual_arch.ROUTING_NA_TRITON
+
+
 def _regional_reference(rca, q, k, v, reach=32):
     """FP64, one position at a time: channel_attention over the position's clamped
     neighborhood, applied to its own v."""
