@@ -908,5 +908,134 @@ def test_routing_and_regional_na_in_fp16_on_the_gpu():
     with torch.no_grad():
         expected = _regional_reference(rca, q, k, v)
         actual = rca.cuda().half().mix(*(t.cuda().half() for t in (q, k, v)))
-    assert actual.dtype == torch.float32
+    # the Triton kernel writes FP16, the PyTorch form FP32 holding FP16 values
+    assert actual.dtype == (
+        torch.float16 if dual_arch.REGIONAL_NA_TRITON else torch.float32
+    )
     torch.testing.assert_close(actual.double().cpu(), expected, rtol=0, atol=5e-3)
+
+
+def _regional_operands(batch, channels, shape):
+    """q, k and v as the depthwise convolution leaves them: chunks of one tensor."""
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(channels, channels // 32)
+    rca.theta.data.normal_(0, 1)
+    rca.regional_na = True
+    qkv = torch.randn(batch, 3 * channels, *shape, device="cuda").half()
+    return rca.cuda().eval().half(), qkv.chunk(3, dim=1)
+
+
+# batch 2, non-square, above 16 positions on one or both axes, below and above the
+# 32-wide neighborhood, partial row segments; chunk views and contiguous copies in
+# both memory formats
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "shape"),
+    [
+        (2, 128, (70, 41)),
+        (1, 64, (17, 16)),
+        (1, 64, (12, 40)),
+        (2, 64, (37, 20)),
+        (1, 32, (100, 7)),
+    ],
+)
+def test_regional_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, channels, shape
+):
+    rca, (q, k, v) = _regional_operands(batch, channels, shape)
+    calls = _counted(monkeypatch, "regional_na")
+    with torch.no_grad():
+        actual = rca.mix(q, k, v)
+        copies = rca.mix(q.contiguous(), k.contiguous(), v.contiguous())
+        channels_last = torch.cat((q, k, v), 1).contiguous(
+            memory_format=torch.channels_last
+        )
+        assert channels_last.chunk(3, 1)[0].stride(1) == 1
+        views = rca.mix(*channels_last.chunk(3, 1))
+        assert len(calls) == 3
+        monkeypatch.setattr(dual_arch, "REGIONAL_NA_TRITON", False)
+        expected = rca.mix(q, k, v)
+    assert len(calls) == 3
+    assert torch.equal(actual, copies)
+    # the channels-last build of the kernel may fuse other multiply-adds
+    torch.testing.assert_close(views, actual, rtol=0, atol=1e-3)
+    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=2e-3)
+
+
+@needs_kernel
+def test_regional_na_kernel_stays_off_up_to_16_and_outside_inference(monkeypatch):
+    rca, (q, k, v) = _regional_operands(1, 64, (20, 18))
+    calls = _counted(monkeypatch, "regional_na")
+    with torch.no_grad():
+        rca.mix(*(t[..., :16, :16] for t in (q, k, v)))
+        rca.float().mix(q.float(), k.float(), v.float())
+        rca.bfloat16().mix(q.bfloat16(), k.bfloat16(), v.bfloat16())
+        rca.half()
+        with torch.autocast("cuda", torch.float16):
+            rca.mix(q, k, v)
+    rca.mix(q, k, v)
+    assert not calls
+    # heads of 64 channels keep the PyTorch form
+    wide = dual_arch.RegionalChannelAttention(128, 2).cuda().eval().half()
+    wide.regional_na = True
+    with torch.no_grad():
+        wide.mix(q.repeat(1, 2, 1, 1), k.repeat(1, 2, 1, 1), v.repeat(1, 2, 1, 1))
+    assert not calls
+
+
+# 2,056 x 1,024 positions in 65 row segments per column are 66,560 programs, past the
+# 65,535 a second grid axis holds; the positions checked are the last programs' (the
+# last segment of the last columns) and others across the map, against FP64.
+@needs_kernel
+def test_regional_na_kernel_covers_more_programs_than_a_grid_axis_holds():
+    height, width = _GRID_SIDE, 1024
+    rca, (q, k, v) = _regional_operands(1, 32, (height, width))
+    reference = copy.deepcopy(rca).double().cpu()
+    with torch.no_grad():
+        out = rca.mix(q, k, v)
+        for y, x in ((2055, 1023), (2054, 1022), (2049, 1000), (0, 0), (1031, 517)):
+            sy, sx = min(max(y - 16, 0), height - 32), min(max(x - 16, 0), width - 32)
+            span = [
+                t[:, :, sy : sy + 32, sx : sx + 32].double().cpu() for t in (q, k, v)
+            ]
+            a = reference.channel_attention(
+                span[0].reshape(1, 1, 32, 1024),
+                span[1].reshape(1, 1, 32, 1024),
+                torch.tensor(1024.0, dtype=torch.float64),
+            )
+            expected = (a[0, 0] @ span[2][0, :, y - sy, x - sx]).float()
+            torch.testing.assert_close(
+                out[0, :, y, x].float().cpu(), expected, rtol=0, atol=2e-3
+            )
+
+
+def _regional_failing_with(monkeypatch, error):
+    def launch(*_):
+        raise error
+
+    monkeypatch.setattr(dual_arch, "REGIONAL_NA_TRITON", True)
+    monkeypatch.setattr(dual_arch, "_na_kernel_usable", lambda *_: True)
+    monkeypatch.setattr(na_local_triton, "regional_na", launch)
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(64, 2).eval()
+    rca.regional_na = True
+    return rca, torch.randn(3, 1, 64, 20, 18).unbind(0)
+
+
+def test_a_triton_failure_switches_to_the_regional_na_pytorch_form(monkeypatch):
+    error = RuntimeError("kernel launch")
+    error.__cause__ = _TritonError("ast.Num")
+    rca, (q, k, v) = _regional_failing_with(monkeypatch, error)
+    with torch.no_grad():
+        actual = rca.mix(q, k, v)
+        assert not dual_arch.REGIONAL_NA_TRITON
+        assert torch.equal(actual, rca.mix(q, k, v))
+
+
+def test_other_regional_na_kernel_failures_are_raised(monkeypatch):
+    rca, (q, k, v) = _regional_failing_with(
+        monkeypatch, torch.OutOfMemoryError("CUDA out of memory")
+    )
+    with torch.no_grad(), pytest.raises(torch.OutOfMemoryError):
+        rca.mix(q, k, v)
+    assert dual_arch.REGIONAL_NA_TRITON

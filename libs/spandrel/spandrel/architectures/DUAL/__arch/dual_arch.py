@@ -32,7 +32,8 @@ retrieval NA likewise run as Triton kernels (na_local_triton.py).
 spandrel: routing_na and regional_na (default False) give the two remaining
 sites their neighborhood forms: the group convolutions' experts are routed per
 position from the mean over its clamped 96x96 neighborhood, and the regional
-channel attention is computed per position over its clamped 32x32 neighborhood.
+channel attention is computed per position over its clamped 32x32 neighborhood
+(in eager CUDA inference as a Triton kernel, na_local_triton.py).
 
 Dependencies: PyTorch. (spandrel: the traiNNer registration and the optional
 Triton direct attention of the original file are not bundled; see below.) No
@@ -557,12 +558,13 @@ def _na_triton_usable(module: nn.Module, x: Tensor, dim: int) -> bool:
     )
 
 
-# spandrel: eager CUDA inference runs the local and the retrieval neighborhood
-# attention as Triton kernels (na_local_triton.py) when Triton imports; a kernel that
-# fails to compile or launch turns its switch off for the rest of the process, and the
-# PyTorch path runs instead.
+# spandrel: eager CUDA inference runs the local, the retrieval and the regional
+# neighborhood attention as Triton kernels (na_local_triton.py) when Triton imports; a
+# kernel that fails to compile or launch turns its switch off for the rest of the
+# process, and the PyTorch path runs instead.
 LOCAL_NA_TRITON = na_local_triton.AVAILABLE
 RETRIEVAL_NA_TRITON = na_local_triton.AVAILABLE
+REGIONAL_NA_TRITON = na_local_triton.AVAILABLE
 _WEIGHTLESS = nn.Module().eval()
 
 
@@ -1668,6 +1670,22 @@ class RegionalChannelAttention(nn.Module):
             result = out if result is None else result + out
         return result
 
+    def _regional_na_triton(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor | None:
+        """spandrel: _mix_na from the Triton kernel, reading q, k and v where the
+        depthwise convolution wrote them, to FP16 in their memory format (the PyTorch
+        form rounds its product with v to FP16 too); None when the kernel failed, which
+        switches REGIONAL_NA_TRITON off for good."""
+        global REGIONAL_NA_TRITON
+        if not q.stride() == k.stride() == v.stride():
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        tau = self.theta.float().clamp(max=math.log(100)).exp()
+        try:
+            return na_local_triton.regional_na(q, k, v, tau)
+        except Exception as error:
+            _kernel_failed("regional", error)
+            REGIONAL_NA_TRITON = False
+            return None
+
     def _mix_na(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """spandrel: regional_na's per-position form. Each position's channel attention
         (Gram, lengths + count * 1e-6, cosine * tau, softmax) comes from its own clamped
@@ -1676,6 +1694,10 @@ class RegionalChannelAttention(nn.Module):
         one head and one band of rows at a time, under _NA_ELEMENT_CAP elements."""
         b, c, h, w = q.shape
         d = c // self.heads
+        if d == 32 and _na_kernel_usable(REGIONAL_NA_TRITON, self, q):
+            out = self._regional_na_triton(q, k, v)
+            if out is not None:
+                return out
         ky, kx = min(_REGIONAL_REACH, h), min(_REGIONAL_REACH, w)
         dtype = calculation_dtype(q.dtype)
         band = max(1, _NA_ELEMENT_CAP // (b * d * d * w) - ky + 1)

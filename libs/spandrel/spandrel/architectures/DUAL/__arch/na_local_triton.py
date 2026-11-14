@@ -15,6 +15,15 @@ start = clamp(y // 2 - K // 2, 0, Hc - K) + [0, K), K = min(48, Hc) per axis, no
 bias; Q is scaled by the head's tau (rounded to the operands' type) and the logits by
 log(Ky * Kx) / (log(1024) * sqrt(32)).
 
+Regional (RegionalChannelAttention._mix_na, regional_na): position (y, x) and head h
+take the 32 x 32 channel attention of the clamped Ky x Kx neighborhood, K = min(32, L)
+per axis: Gram and lengths (+ Ky * Kx * 1e-6) in FP32 from the FP16 q and k, cosine *
+tau, FP32 softmax, rounded to the operands' type and applied to the position's own v.
+The Gram slides: a program takes one column and a segment of SEGMENT rows for one
+head; it sums the first window from its row strips (32 x 32 x 32 tl.dot each), then
+per row adds the entering strip and subtracts the leaving one when the clamped window
+moves. The running sums restart exactly at every segment, which bounds their drift.
+
 The image-sized count is on the launch grid's first axis (CUDA caps the others at
 65,535 programs). Triton is optional: without it, AVAILABLE is False and the PyTorch
 path runs.
@@ -236,6 +245,128 @@ if AVAILABLE:
             (acc / denominator[:, None]).to(operand),
             stored[:, None],
         )
+
+    @triton.jit
+    def _strip(ptr, channel, row, col0, col_stride, live, channels_first: tl.constexpr):
+        """One neighborhood row strip (row: its 64-bit offset): [32 d, 32 columns] when
+        channels_first, else [32 columns, 32 d] (zeros where not live)."""
+        pix = row + (col0 + tl.arange(0, 32)) * col_stride
+        if channels_first:
+            return tl.load(ptr + channel[:, None] + pix[None, :], live[None, :], 0)
+        return tl.load(ptr + channel[None, :] + pix[:, None], live[:, None], 0)
+
+    @triton.jit
+    def _regional_na(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        tau_ptr,
+        out_ptr,
+        height: tl.int32,
+        width: tl.int32,
+        segments: tl.int32,
+        image_stride,
+        channel_stride,
+        row_stride,
+        col_stride,
+        out_image_stride,
+        out_channel_stride,
+        out_row_stride,
+        out_col_stride,
+        segment: tl.constexpr,
+    ):
+        """q, k and v [B, C, H, W] with one set of strides (views of one depthwise
+        output in either memory format), tau [C / 32] FP32, out [B, C, H, W]; heads of
+        32, one 16-bit type."""
+        operand = out_ptr.dtype.element_ty
+        program, head = tl.program_id(0), tl.program_id(1)
+        image = (program // (segments * width)).to(tl.int64)
+        x = program % width
+        y0 = program // width % segments * segment
+        kh, kw = tl.minimum(height, 32), tl.minimum(width, 32)
+        col0 = tl.minimum(tl.maximum(x - 16, 0), width - kw)
+        row0 = tl.minimum(tl.maximum(y0 - 16, 0), height - kh)
+        # 64-bit: offsets pass 2^31 on large maps
+        d = (head * 32 + tl.arange(0, 32)).to(tl.int64)
+        channel = image * image_stride + d * channel_stride
+        columns = tl.arange(0, 32) < kw
+        count = (kh * kw).to(tl.float32) * 1e-6
+        scale = tl.load(tau_ptr + head) * 1.4426950408889634
+        gram = tl.zeros((32, 32), tl.float32)
+        q_square = tl.zeros((32,), tl.float32)
+        k_square = tl.zeros((32,), tl.float32)
+        for r in range(32):
+            live = columns & (r < kh)
+            row = (row0 + r).to(tl.int64) * row_stride
+            qt = _strip(q_ptr, channel, row, col0, col_stride, live, True)
+            k = _strip(k_ptr, channel, row, col0, col_stride, live, False)
+            gram = tl.dot(qt, k, gram)
+            qf, kf = qt.to(tl.float32), k.to(tl.float32)
+            q_square += tl.sum(qf * qf, 1)
+            k_square += tl.sum(kf * kf, 0)
+        out = out_ptr + image * out_image_stride + d * out_channel_stride
+        for i in range(segment):
+            y = y0 + i
+            moved = (tl.minimum(tl.maximum(y - 16, 0), height - kh) > row0) & (
+                y < height
+            )
+            live = columns & moved
+            entering = (row0 + kh).to(tl.int64) * row_stride
+            leaving = row0.to(tl.int64) * row_stride
+            qa = _strip(q_ptr, channel, entering, col0, col_stride, live, True)
+            ka = _strip(k_ptr, channel, entering, col0, col_stride, live, False)
+            ql = _strip(q_ptr, channel, leaving, col0, col_stride, live, True)
+            kl = _strip(k_ptr, channel, leaving, col0, col_stride, live, False)
+            gram = tl.dot(qa, ka, gram) - tl.dot(ql, kl)
+            qaf, kaf = qa.to(tl.float32), ka.to(tl.float32)
+            qlf, klf = ql.to(tl.float32), kl.to(tl.float32)
+            q_square += tl.sum(qaf * qaf, 1) - tl.sum(qlf * qlf, 1)
+            k_square += tl.sum(kaf * kaf, 0) - tl.sum(klf * klf, 0)
+            row0 = tl.where(moved, row0 + 1, row0)
+            q_norm = tl.sqrt(q_square + count)
+            k_norm = tl.sqrt(k_square + count)
+            logits = gram / (q_norm[:, None] * k_norm[None, :]) * scale
+            p = tl.exp2(logits - tl.max(logits, 1)[:, None])
+            a = (p / tl.sum(p, 1)[:, None]).to(operand).to(tl.float32)
+            yc = tl.minimum(y, height - 1).to(tl.int64)
+            v = tl.load(v_ptr + channel + yc * row_stride + x * col_stride)
+            tl.store(
+                out + yc * out_row_stride + x * out_col_stride,
+                tl.sum(a * v.to(tl.float32)[None, :], 1).to(operand),
+                y < height,
+            )
+
+
+# rows per regional program: the running Gram restarts exactly every SEGMENT rows
+SEGMENT = 32
+
+
+def regional_na(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tau: torch.Tensor
+) -> torch.Tensor:
+    """q, k and v B,C,H,W (heads of 32; one set of strides, one 16-bit type) and tau
+    heads (FP32) to the regional attention output B,C,H,W, channels-last when q is."""
+    batch, channels, height, width = q.shape
+    layout = torch.channels_last if q.stride(1) == 1 else torch.contiguous_format
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device, memory_format=layout)
+    segments = triton.cdiv(height, SEGMENT)
+    with torch.cuda.device(q.device):
+        _regional_na[(batch * segments * width, channels // 32)](
+            q,
+            k,
+            v,
+            tau,
+            out,
+            height,
+            width,
+            segments,
+            *q.stride(),
+            *out.stride(),
+            segment=SEGMENT,
+            num_warps=1,
+            num_stages=1,
+        )
+    return out
 
 
 def local_na(
