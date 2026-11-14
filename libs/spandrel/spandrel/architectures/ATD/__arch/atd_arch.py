@@ -325,7 +325,7 @@ class AC_MSA(nn.Module):
         # classify features into groups based on similarity map (sim)
         tk_id = torch.argmax(sim, dim=-1, keepdim=False)
         # sort features by type
-        _x_sort_values, x_sort_indices = torch.sort(tk_id, dim=-1, stable=False)
+        _x_sort_values, x_sort_indices = torch.sort(tk_id, dim=-1)
         x_sort_indices_reverse = index_reverse(x_sort_indices)
         shuffled_qkv = feature_shuffle(qkv, x_sort_indices)  # b, n, c3
         pad_n = ng * gs - n
