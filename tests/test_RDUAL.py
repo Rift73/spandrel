@@ -474,23 +474,19 @@ def _counted(monkeypatch, name):
     return calls
 
 
-# RDUAL has its own router and regional attention: the per-position forms DUAL runs
-# by default on NVIDIA GPUs never reach it, so none of their kernels launch
+# RDUAL has its own regional attention: the per-position form DUAL runs by default on
+# NVIDIA GPUs never reaches it, so its kernel never launches
 @needs_kernel
 def test_rdual_runs_none_of_duals_per_position_forms(monkeypatch):
-    calls = [
-        _counted(monkeypatch, name)
-        for name in ("regional_na", "routed_sum", "neighborhood_means")
-    ]
+    calls = _counted(monkeypatch, "regional_na")
     model = _model(scale=2).cuda().eval()
-    assert not any(hasattr(m, "routing_na") for m in model.modules())
     assert not any(hasattr(m, "regional_na") for m in model.modules())
     with torch.inference_mode():
         run_clip(model, torch.rand(1, 2, 3, 208, 200, device="cuda"))
         run_clip(
             model.bfloat16(), torch.rand(1, 1, 3, 208, 200, device="cuda").bfloat16()
         )
-    assert not any(calls)
+    assert not calls
 
 
 def _local_attention(channels):

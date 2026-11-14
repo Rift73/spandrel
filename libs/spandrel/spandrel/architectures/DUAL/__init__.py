@@ -42,18 +42,13 @@ class _FP16SafeDynamicConv(PremixedDeployedDynamicConv3x3):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training or x.dtype != torch.float16:
             return super().forward(x)
-        # The route in the caller's context: its autocast state decides the routing
-        # form here as at every other site; only the convolution leaves autocast.
-        coefficients = self.coefficients(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
             return _premixed_conv3x3(
-                self,
                 x.float(),
                 self.base.weight.float(),
                 self.base.bias.float(),
                 self.experts.float(),
-                coefficients,
-                lambda: self.coefficients(x),
+                self.coefficients(x),
             )
 
 
@@ -206,9 +201,8 @@ class DUALArch(Architecture[DUAL]):
             # every DUAL's); the retrieval's need nothing
             local_na=qk == "dot",
             retrieval_na=True,
-            # per-position routing and regional attention where their kernels run
-            # (eager inference on NVIDIA GPUs); today's forms elsewhere
-            routing_na=True,
+            # per-position regional attention where its kernel runs (eager FP16
+            # inference on NVIDIA GPUs); today's four-grid blend elsewhere
             regional_na=True,
             g_window=g_window,
             c_pos_bias=c_pos_bias,

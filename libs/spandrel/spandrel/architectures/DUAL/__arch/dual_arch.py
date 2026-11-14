@@ -29,13 +29,10 @@ differentiable SDPA path supports training. spandrel: eager CUDA inference
 runs NA as one Triton kernel (na_triton.py, chaiNNer-C's TensorRT plugin
 kernel) when Triton imports, and the SDPA path otherwise; the local and the
 retrieval NA likewise run as Triton kernels (na_local_triton.py).
-spandrel: routing_na and regional_na (default True) give the two remaining
-sites their neighborhood forms where their Triton kernels run (eager inference on
-NVIDIA GPUs, na_local_triton.py): the group convolutions' experts are routed per
-position from the mean over its clamped 96x96 neighborhood, and the regional
-channel attention is computed per position over its clamped 32x32 neighborhood.
-Elsewhere (CPU, ROCm, training, export) the two sites keep today's image routing
-and four-grid blend, as when switched off (_na_path_available).
+spandrel: regional_na (default True) computes the regional channel attention per
+position over its clamped 32x32 neighborhood where its Triton kernel runs (eager
+FP16 inference on NVIDIA GPUs, na_local_triton.py); elsewhere (CPU, ROCm, training,
+export) it keeps today's four-grid blend, as when switched off (_na_path_available).
 
 Dependencies: PyTorch. (spandrel: the traiNNer registration and the optional
 Triton direct attention of the original file are not bundled; see below.) No
@@ -53,7 +50,6 @@ from __future__ import annotations
 import logging
 import math
 import warnings
-from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
@@ -562,44 +558,36 @@ def _na_triton_usable(module: nn.Module, x: Tensor, dim: int) -> bool:
 
 
 # spandrel: eager CUDA inference runs the local, the retrieval and the regional
-# neighborhood attention and routing_na's sum of expert parts as Triton kernels
-# (na_local_triton.py) when Triton imports; a kernel that fails to compile or launch
-# turns its switch off for the rest of the process, and the PyTorch path runs instead.
+# neighborhood attention as Triton kernels (na_local_triton.py) when Triton imports; a
+# kernel that fails to compile or launch turns its switch off for the rest of the
+# process, and the PyTorch path runs instead.
 LOCAL_NA_TRITON = na_local_triton.AVAILABLE
 RETRIEVAL_NA_TRITON = na_local_triton.AVAILABLE
 REGIONAL_NA_TRITON = na_local_triton.AVAILABLE
-ROUTING_NA_TRITON = na_local_triton.AVAILABLE
 _WEIGHTLESS = nn.Module().eval()
 
 
-def _na_kernel_usable(
-    enabled: bool,
-    module: nn.Module,
-    x: Tensor,
-    dtypes: tuple[torch.dtype, ...] = (torch.float16,),
-) -> bool:
-    """Whether a local / retrieval / regional / routing kernel may run: plain eager
-    inference (no tracing, export, compile, gradients, autocast or dispatch mode) on
-    an NVIDIA GPU with features of one of `dtypes` (FP16 unless stated)."""
+def _na_kernel_usable(enabled: bool, module: nn.Module, x: Tensor) -> bool:
+    """Whether a local / retrieval / regional NA kernel may run: plain eager inference
+    (no tracing, export, compile, gradients, autocast or dispatch mode) on an NVIDIA GPU
+    with FP16 features."""
     return (
         enabled
         and x.is_cuda
         and torch.version.hip is None
-        and x.dtype in dtypes
+        and x.dtype == torch.float16
         and _eager_inference(module)
         and plain_inference(x, module)
     )
 
 
-def _na_path_available(
-    module: nn.Module, x: Tensor, dtypes: tuple[torch.dtype, ...] = (torch.float16,)
-) -> bool:
-    """Whether a routing_na / regional_na site takes its per-position form in this
-    call: where its Triton kernels can run (_na_kernel_usable with Triton importable),
-    whether or not a kernel then refuses the input or fails (the per-position PyTorch
-    form runs then). Elsewhere (CPU, ROCm, training, export, other dtypes) the site
-    keeps today's form, as with the switch off."""
-    return _na_kernel_usable(na_local_triton.AVAILABLE, module, x, dtypes)
+def _na_path_available(module: nn.Module, x: Tensor) -> bool:
+    """Whether the regional_na site takes its per-position form in this call: where
+    its Triton kernel can run (_na_kernel_usable with Triton importable), whether or
+    not the kernel then fails (the per-position PyTorch form runs then). Elsewhere
+    (CPU, ROCm, training, export, other dtypes) the site keeps today's blend, as with
+    the switch off."""
+    return _na_kernel_usable(na_local_triton.AVAILABLE, module, x)
 
 
 def _kernel_failed(name: str, error: Exception) -> None:
@@ -616,8 +604,8 @@ def _kernel_failed(name: str, error: Exception) -> None:
 
 # Attention elements per SDPA call before tiled local/retrieval NA splits tiles.
 _NA_ELEMENT_CAP = 2**27
-# Neighborhood sides of routing_na and regional_na.
-_ROUTING_REACH, _REGIONAL_REACH = 96, 32
+# Neighborhood side of regional_na.
+_REGIONAL_REACH = 32
 
 
 def _neighborhood_rows(rows: range, k: int, length: int) -> range:
@@ -645,24 +633,6 @@ def _neighborhood_sum(
         starts = torch.arange(part.start, part.stop, device=z.device) - k // 2
         sums = sums.index_select(axis - 2, starts.clamp(0, length - k) - first)
     return sums
-
-
-def _neighborhood_means(x: Tensor, ky: int, kx: int, dtype: torch.dtype) -> Tensor:
-    """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
-    column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype.
-    Differences of FP64 cumulative sums along each axis, one pass per axis whatever
-    the window (FP32 running sums over a whole row would lose digits)."""
-    height, width = x.shape[-2:]
-    sums = F.pad(x.to(torch.float64).cumsum(2), (0, 0, 1, 0))
-    sums = sums[:, :, ky:] - sums[:, :, : height - ky + 1]
-    sums = F.pad(sums.cumsum(3), (1, 0))
-    sums = sums[..., kx:] - sums[..., : width - kx + 1]
-    return (sums / (ky * kx)).to(dtype).permute(0, 2, 3, 1)
-
-
-def _neighborhood_starts(length: int, k: int, device: torch.device) -> Tensor:
-    """Each position's clamped neighborhood start: clamp(p - k // 2, 0, length - k)."""
-    return (torch.arange(length, device=device) - k // 2).clamp(0, length - k)
 
 
 @dataclass
@@ -1598,9 +1568,6 @@ class RegionalChannelAttention(nn.Module):
         # DUAL sets this from its regional_na switch: the per-position form (_mix_na)
         # where its kernel runs (_na_path_available), the blend elsewhere.
         self.regional_na = False
-        # The feature dtypes that form may run for; DUAL narrows it so that its two
-        # sites take their per-position forms together (see DUAL.__init__).
-        self.na_kernel_dtypes: tuple[torch.dtype, ...] = (torch.float16,)
 
     def channel_attention(self, q: Tensor, k: Tensor, count: Tensor) -> Tensor:
         """(..., heads, d, tokens) -> (..., heads, d, d), FP32 or FP64.
@@ -1823,7 +1790,7 @@ class RegionalChannelAttention(nn.Module):
             self.regional_na
             and (h > 16 or w > 16)
             and q.shape[1] // self.heads == 32
-            and _na_path_available(self, q, self.na_kernel_dtypes)
+            and _na_path_available(self, q)
         ):
             return self._mix_na(q, k, v)
         # spandrel: one zero-padded copy serves all four classes, which crop their
@@ -2066,55 +2033,13 @@ class DynamicRouter(nn.Module):
         self.fc1 = nn.Linear(channels, channels // 4, device=device, dtype=dtype)
         self.fc2 = nn.Linear(channels // 4, experts, device=device, dtype=dtype)
         nn.init.zeros_(self.fc2.bias)
-        # DUAL sets this from its routing_na switch: where the routing kernels run
-        # (_na_path_available), (B, K, H, W) coefficients, each position routed from
-        # the mean over its clamped 96x96 neighborhood; the image routing elsewhere.
-        self.routing_na = False
-        # The feature dtypes that form may run for; DUAL narrows it so that its two
-        # sites take their per-position forms together (see DUAL.__init__).
-        self.na_kernel_dtypes: tuple[torch.dtype, ...] = (
-            torch.float16,
-            torch.float32,
-        )
-
-    def _neighborhood_means_triton(
-        self, x: Tensor, ky: int, kx: int, dtype: torch.dtype
-    ) -> Tensor | None:
-        """spandrel: _neighborhood_means from the Triton window sums for FP16 / FP32
-        features and an FP32 router; None where they do not run or failed, which
-        switches ROUTING_NA_TRITON off for good."""
-        global ROUTING_NA_TRITON
-        if dtype != torch.float32 or not _na_kernel_usable(
-            ROUTING_NA_TRITON, self, x, (torch.float16, torch.float32)
-        ):
-            return None
-        try:
-            return na_local_triton.neighborhood_means(x, ky, kx)
-        except Exception as error:
-            _kernel_failed("routing", error)
-            ROUTING_NA_TRITON = False
-            return None
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = (
             torch.float64 if self.fc1.weight.dtype == torch.float64 else torch.float32
         )
-        batch, _, height, width = x.shape
-        # Up to 96 positions per axis the neighborhood is the whole map.
-        na = (
-            self.routing_na
-            and (height > _ROUTING_REACH or width > _ROUTING_REACH)
-            and _na_path_available(self, x, self.na_kernel_dtypes)
-        )
-        # one mean per distinct window; positions sharing one share its route
-        ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
-        pooled = self._neighborhood_means_triton(x, ky, kx, dtype) if na else None
         with torch.autocast(device_type=x.device.type, enabled=False):
-            if na:
-                if pooled is None:
-                    pooled = _neighborhood_means(x, ky, kx, dtype)
-            else:
-                pooled = x.mean((2, 3), dtype=dtype)
+            pooled = x.mean((2, 3), dtype=dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)
             hidden = F.gelu(
                 F.linear(normalized, self.fc1.weight.to(dtype), self.fc1.bias.to(dtype))
@@ -2122,78 +2047,15 @@ class DynamicRouter(nn.Module):
             logits = F.linear(
                 hidden, self.fc2.weight.to(dtype), self.fc2.bias.to(dtype)
             )
-            coefficients = logits.softmax(-1) - 1.0 / self.num_experts
-            if na:
-                rows = _neighborhood_starts(height, ky, x.device)
-                columns = _neighborhood_starts(width, kx, x.device)
-                return (
-                    coefficients.index_select(1, rows)
-                    .index_select(2, columns)
-                    .permute(0, 3, 1, 2)
-                )
-            return coefficients[:, :, None, None]
+            return (logits.softmax(-1) - 1.0 / self.num_experts)[:, :, None, None]
 
 
 def _premixed_conv3x3(
-    module: nn.Module,
-    x: Tensor,
-    weight0: Tensor,
-    bias0: Tensor,
-    experts: Tensor,
-    coefficients: Tensor,
-    reroute: Callable[[], Tensor],
+    x: Tensor, weight0: Tensor, bias0: Tensor, experts: Tensor, coefficients: Tensor
 ) -> Tensor:
-    """One differentiable mixed kernel per sample, including batch > 1.
-
-    spandrel: per-position coefficients (B, K, H, W) of routing_na mix the experts'
-    outputs instead, base + sum_k c_k(p) * conv_k, summed in the calculation dtype.
-    The coefficients sum to zero (softmax - 1/K), so the last expert's term folds into
-    the others: base + sum_{k<K} c_k(p) * conv(W_k - W_K), one part fewer; the sum's
-    rounding (|sum c_k| ~ 1e-7) times conv_K is far below the parts' own rounding.
-    `coefficients` are module's for this call, taken in the caller's context (its
-    autocast state decides the routing form, as at every other site); `reroute`
-    takes them again after a routing kernel failed, so that call is the PyTorch
-    form throughout.
-    """
-    global ROUTING_NA_TRITON
+    """One differentiable mixed kernel per sample, including batch > 1."""
     batch, channels, height, width = x.shape
     dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
-    if coefficients.shape[-2:] != (1, 1):
-        count = experts.shape[0] - 1
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            kernels = experts.to(dtype).reshape(count + 1, channels, channels, 3, 3)
-            weight = torch.cat(
-                (
-                    weight0.to(dtype),
-                    (kernels[:-1] - kernels[-1]).reshape(
-                        count * channels, channels, 3, 3
-                    ),
-                )
-            )
-            bias = torch.cat(
-                (bias0.to(dtype), bias0.new_zeros(count * channels, dtype=dtype))
-            )
-        convolved = F.conv2d(
-            x, weight.to(experts.dtype), bias.to(experts.dtype), padding=1
-        )
-        coefficients = coefficients[:, :count]
-        if _na_kernel_usable(
-            ROUTING_NA_TRITON, module, convolved, (torch.float16, torch.float32)
-        ) and na_local_triton.routed_sum_fits(batch, channels):
-            try:
-                return na_local_triton.routed_sum(
-                    convolved, coefficients.float(), _layers_layout(x)
-                )
-            except Exception as error:
-                _kernel_failed("routing", error)
-                ROUTING_NA_TRITON = False
-                coefficients = reroute()[:, :count]
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
-            output = parts[:, 0] + (
-                coefficients[:, :, None].to(dtype) * parts[:, 1:]
-            ).sum(1)
-        return output.to(convolved.dtype).contiguous(memory_format=_layers_layout(x))
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
             experts.reshape(experts.shape[0], -1).to(dtype)
@@ -2246,15 +2108,7 @@ class PremixedDynamicGroupConv3x3(nn.Module):
         dtype = torch.float64 if self.experts.dtype == torch.float64 else torch.float32
         with torch.autocast(device_type=x.device.type, enabled=False):
             weight, bias = self.base.equivalent_kernel(dtype)
-        return _premixed_conv3x3(
-            self,
-            x,
-            weight,
-            bias,
-            self.experts,
-            self.coefficients(x),
-            lambda: self.coefficients(x),
-        )
+        return _premixed_conv3x3(x, weight, bias, self.experts, self.coefficients(x))
 
     @torch.no_grad()
     def folded(self) -> PremixedDeployedDynamicConv3x3:
@@ -2277,13 +2131,7 @@ class PremixedDeployedDynamicConv3x3(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return _premixed_conv3x3(
-            self,
-            x,
-            self.base.weight,
-            self.base.bias,
-            self.experts,
-            self.coefficients(x),
-            lambda: self.coefficients(x),
+            x, self.base.weight, self.base.bias, self.experts, self.coefficients(x)
         )
 
 
@@ -2407,7 +2255,6 @@ class DUAL(nn.Module):
         context_overlap: bool | None = None,
         local_na: bool = True,
         retrieval_na: bool = True,
-        routing_na: bool = True,
         regional_na: bool = True,
         g_window: int = 16,
         norm: Literal["token"] = "token",
@@ -2429,7 +2276,6 @@ class DUAL(nn.Module):
         for name, value in (
             ("local_na", local_na),
             ("retrieval_na", retrieval_na),
-            ("routing_na", routing_na),
             ("regional_na", regional_na),
         ):
             if type(value) is not bool:
@@ -2486,7 +2332,6 @@ class DUAL(nn.Module):
         self.context_na = context_na
         self.local_na = local_na
         self.retrieval_na = retrieval_na
-        self.routing_na = routing_na
         self.regional_na = regional_na
         self.unshuffle = pixel_unshuffle
         self.internal_scale = scale * (2 if pixel_unshuffle else 1)
@@ -2579,18 +2424,6 @@ class DUAL(nn.Module):
                         self.get_submodule(name), dynamic_experts
                     ),
                 )
-                self.get_submodule(name).router.routing_na = routing_na
-        # spandrel: with both switches on, the two sites take their per-position forms
-        # together or not at all, so the routers take theirs only for the features
-        # the regional kernel serves: FP16 (its heads are always 32 channels here,
-        # embed_dim // 32 heads). Every site sees the trunk's features (the last
-        # group's FP32 convolution routes from them too), and device and mode are the
-        # call's, so one forward decides alike at every site. With one switch on,
-        # that site's own conditions decide.
-        if routing_na and regional_na:
-            for module in self.modules():
-                if isinstance(module, DynamicRouter):
-                    module.na_kernel_dtypes = (torch.float16,)
 
     @property
     def context_overlap(self) -> bool:
