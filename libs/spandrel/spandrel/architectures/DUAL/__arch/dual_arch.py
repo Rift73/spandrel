@@ -2145,7 +2145,7 @@ def _premixed_conv3x3(
         coefficients = coefficients[:, :count]
         if _na_kernel_usable(
             ROUTING_NA_TRITON, module, convolved, (torch.float16, torch.float32)
-        ):
+        ) and na_local_triton.routed_sum_fits(batch, channels):
             try:
                 return na_local_triton.routed_sum(
                     convolved, coefficients.float(), _layers_layout(x)

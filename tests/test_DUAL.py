@@ -878,6 +878,44 @@ def test_routed_sum_addresses_parts_past_2_31():
     assert bool((out == 1).all())
 
 
+# 65,536 images pass the 65,535 programs of routed_sum's batch axis: the PyTorch sum
+@needs_kernel
+def test_routed_sum_is_not_launched_past_the_batch_axis(monkeypatch):
+    torch.manual_seed(0)
+    conv = _routed_conv(16, 2).to("cuda", torch.float16)
+    conv.router.routing_na = True
+    x = torch.randn(65_536, 16, 97, 1, device="cuda").half()
+    calls = _counted(monkeypatch, "routed_sum")
+    with torch.no_grad():
+        actual = conv(x)
+        assert not calls and dual_arch.ROUTING_NA_TRITON
+        monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", False)
+        # the means kernel still ran above: within one FP16 step of the PyTorch form
+        expected = conv(x)
+    torch.testing.assert_close(actual, expected, rtol=2**-10, atol=1e-4)
+    assert na_local_triton.routed_sum_fits(65_535, 128)
+    assert not na_local_triton.routed_sum_fits(65_536, 128)
+    assert not na_local_triton.routed_sum_fits(1, 65_535 * 32 + 1)
+
+
+# FP32 features of large magnitude: the row sums are kept in FP64, so every window
+# mean is within two FP32 steps of FP64 (FP32 row sums gave 3.1e-7 relative)
+@needs_kernel
+def test_neighborhood_means_keep_fp32_rounding_on_large_features():
+    torch.manual_seed(0)
+    x = torch.randn(1, 2, 1000, 200, device="cuda") * 1000
+    with torch.no_grad():
+        actual = na_local_triton.neighborhood_means(x, 96, 96).double()
+        # FP64 window sums from cumulative sums along each axis
+        sums = torch.nn.functional.pad(x.double().cumsum(2), (0, 0, 1, 0))
+        sums = torch.nn.functional.pad(
+            (sums[:, :, 96:] - sums[:, :, :-96]).cumsum(3), (1, 0)
+        )
+        expected = ((sums[..., 96:] - sums[..., :-96]) / 96**2).permute(0, 2, 3, 1)
+    error = (actual - expected).abs().amax(-1) / expected.abs().amax(-1)
+    assert error.max().item() < 2 * 2**-24
+
+
 def _routing_failing_with(monkeypatch, error):
     def launch(*_):
         raise error
@@ -1197,6 +1235,24 @@ def test_regional_na_kernel_survives_a_huge_value(hot):
         expected = _regional_reference(reference, q64, k64, v64)
     assert bool(torch.isfinite(out).all())
     torch.testing.assert_close(out.double().cpu(), expected, rtol=2**-10, atol=1e-4)
+
+
+# an inf or a NaN in q or in k: the non-finite outputs are the PyTorch form's, so the
+# rows after the value left the window are finite again
+@needs_kernel
+@pytest.mark.parametrize("which", [0, 1])
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_regional_na_kernel_recovers_after_a_non_finite_value(
+    monkeypatch, which, value
+):
+    rca, operands = _regional_operands(1, 32, (64, 40))
+    operands[which][0, 3, 10, 20] = value
+    with torch.no_grad():
+        actual = rca.mix(*operands)
+        monkeypatch.setattr(dual_arch, "REGIONAL_NA_TRITON", False)
+        expected = rca.mix(*operands)
+    assert not bool(torch.isfinite(expected).all())
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
 
 
 def _regional_failing_with(monkeypatch, error):

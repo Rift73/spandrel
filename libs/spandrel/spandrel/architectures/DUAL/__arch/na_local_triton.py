@@ -351,9 +351,11 @@ if AVAILABLE:
             # those are RESTART times today's, the window is summed from scratch.
             # One reduction per vector (q and k sums sit in different layouts; an
             # elementwise maximum of the two would convert one of them every row).
-            q_excess = tl.max(q_peak - restart * (q_square + count))
-            k_excess = tl.max(k_peak - restart * (k_square + count))
-            if tl.maximum(q_excess, k_excess) > 0:
+            # The test is negated so that a non-finite sum restarts too: once an inf
+            # or NaN has left the window, its rows are finite again.
+            q_held = tl.min((q_peak <= restart * (q_square + count)).to(tl.int32))
+            k_held = tl.min((k_peak <= restart * (k_square + count)).to(tl.int32))
+            if q_held * k_held == 0:
                 gram, q_square, k_square = _window_gram(
                     q_ptr,
                     k_ptr,
@@ -575,6 +577,14 @@ def neighborhood_means(x: torch.Tensor, ky: int, kx: int) -> torch.Tensor:
 
 # positions x channels per routing program
 ROUTED_P, ROUTED_C = 64, 32
+# CUDA's limit on a launch grid's second and third axes
+GRID_AXIS = 65_535
+
+
+def routed_sum_fits(batch: int, channels: int) -> bool:
+    """Whether routed_sum's grid holds this batch (third axis) and channel count
+    (second axis)."""
+    return batch <= GRID_AXIS and -(-channels // ROUTED_C) <= GRID_AXIS
 
 
 def routed_sum(
