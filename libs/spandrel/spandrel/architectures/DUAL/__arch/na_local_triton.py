@@ -349,11 +349,11 @@ if AVAILABLE:
             row0 = tl.where(moved, row0 + 1, row0)
             # The running sums carry rounding of the largest sums they held; once
             # those are RESTART times today's, the window is summed from scratch.
-            excess = tl.maximum(
-                q_peak - restart * (q_square + count),
-                k_peak - restart * (k_square + count),
-            )
-            if tl.max(excess) > 0:
+            # One reduction per vector (q and k sums sit in different layouts; an
+            # elementwise maximum of the two would convert one of them every row).
+            q_excess = tl.max(q_peak - restart * (q_square + count))
+            k_excess = tl.max(k_peak - restart * (k_square + count))
+            if tl.maximum(q_excess, k_excess) > 0:
                 gram, q_square, k_square = _window_gram(
                     q_ptr,
                     k_ptr,
