@@ -950,6 +950,28 @@ def test_regional_na_matches_a_per_position_reference(monkeypatch, shape, bands)
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-10)
 
 
+# a cap below one row's neighborhood rows across the whole width: bands of single rows
+# and of 10 columns, equal to the unbanded form (to FP64 rounding) and to the per-position reference
+@pytest.mark.parametrize("shape", [(20, 75), (37, 70)])
+def test_regional_na_bands_columns_below_one_row(monkeypatch, shape):
+    torch.manual_seed(0)
+    rca = dual_arch.RegionalChannelAttention(64, 2).double().eval()
+    rca.theta.data.normal_(0, 1)
+    rca.regional_na = True
+    q, k, v = torch.randn(3, 2, 64, *shape, dtype=torch.float64).unbind(0)
+    ky = min(32, shape[0])
+    cap = 2 * 32 * 32 * ky * (32 + 9)
+    assert cap // (2 * 32 * 32 * shape[1]) - ky + 1 < 1
+    with torch.no_grad():
+        whole = rca.mix(q, k, v)
+        monkeypatch.setattr(dual_arch, "_NA_ELEMENT_CAP", cap)
+        banded = rca.mix(q, k, v)
+        expected = _regional_reference(rca, q, k, v)
+    # FP64: the bands change only the batching of the same sums
+    torch.testing.assert_close(banded, whole, rtol=0, atol=1e-12)
+    torch.testing.assert_close(banded, expected, rtol=0, atol=1e-10)
+
+
 def test_regional_na_keeps_the_blend_up_to_16():
     torch.manual_seed(0)
     rca = dual_arch.RegionalChannelAttention(64, 2).eval()

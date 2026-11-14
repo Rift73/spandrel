@@ -617,18 +617,22 @@ def _neighborhood_rows(rows: range, k: int, length: int) -> range:
     return range(start(rows.start), start(rows.stop - 1) + k)
 
 
-def _neighborhood_sum(z: Tensor, ky: int, kx: int, rows: range, height: int) -> Tensor:
+def _neighborhood_sum(
+    z: Tensor, ky: int, kx: int, rows: range, height: int, cols: range, width: int
+) -> Tensor:
     """Sums over each position's clamped ky x kx neighborhood (start = clamp(p - k // 2,
-    0, L - k) per axis) for the map rows `rows` of a map `height` rows tall.
+    0, L - k) per axis) for the rows `rows` and columns `cols` of a height x width map.
 
-    z is (N, len(span), W) and holds the rows span = _neighborhood_rows(rows, ky, height).
+    z is (N, len(row span), len(column span)) and holds the spans
+    _neighborhood_rows(rows, ky, height) and _neighborhood_rows(cols, kx, width).
     """
-    first = _neighborhood_rows(rows, ky, height).start
     sums = F.avg_pool2d(z, (ky, 1), 1, divisor_override=1)
     sums = F.avg_pool2d(sums, (1, kx), 1, divisor_override=1)
-    starts = torch.arange(rows.start, rows.stop, device=z.device) - ky // 2
-    sums = sums.index_select(-2, starts.clamp(0, height - ky) - first)
-    return F.pad(sums, (kx // 2, kx - 1 - kx // 2), mode="replicate")
+    for axis, (part, k, length) in enumerate(((rows, ky, height), (cols, kx, width))):
+        first = _neighborhood_rows(part, k, length).start
+        starts = torch.arange(part.start, part.stop, device=z.device) - k // 2
+        sums = sums.index_select(axis - 2, starts.clamp(0, length - k) - first)
+    return sums
 
 
 def _neighborhood_means(x: Tensor, ky: int, kx: int, dtype: torch.dtype) -> Tensor:
@@ -1717,7 +1721,9 @@ class RegionalChannelAttention(nn.Module):
         (Gram, lengths + count * 1e-6, cosine * tau, softmax) comes from its own clamped
         32x32 neighborhood and is applied to its own v, in the dtypes of
         channel_attention and _class_core. The b*d*d*H*W Gram field is never whole:
-        one head and one band of rows at a time, under _NA_ELEMENT_CAP elements."""
+        one head and one band of rows at a time, under _NA_ELEMENT_CAP elements; where
+        one row's neighborhood rows already pass it, bands of single rows and of
+        columns."""
         b, c, h, w = q.shape
         d = c // self.heads
         if d == 32 and _na_kernel_usable(REGIONAL_NA_TRITON, self, q):
@@ -1726,7 +1732,11 @@ class RegionalChannelAttention(nn.Module):
                 return out
         ky, kx = min(_REGIONAL_REACH, h), min(_REGIONAL_REACH, w)
         dtype = calculation_dtype(q.dtype)
-        band = max(1, _NA_ELEMENT_CAP // (b * d * d * w) - ky + 1)
+        band = _NA_ELEMENT_CAP // (b * d * d * w) - ky + 1
+        columns = w
+        if band < 1:
+            band = 1
+            columns = max(1, _NA_ELEMENT_CAP // (b * d * d * ky) - kx + 1)
         out = torch.empty(b, c, h, w, device=q.device, dtype=dtype)
         with torch.autocast(device_type=q.device.type, enabled=False):
             tau = self.theta.to(dtype).clamp(max=math.log(100)).exp()
@@ -1735,31 +1745,56 @@ class RegionalChannelAttention(nn.Module):
                 for first in range(0, h, band):
                     rows = range(first, min(first + band, h))
                     span = _neighborhood_rows(rows, ky, h)
-                    qh = q[:, channels, span.start : span.stop].to(dtype)
-                    kh = k[:, channels, span.start : span.stop].to(dtype)
+                    for left in range(0, w, columns):
+                        cols = range(left, min(left + columns, w))
+                        reach = _neighborhood_rows(cols, kx, w)
+                        qh = q[
+                            :,
+                            channels,
+                            span.start : span.stop,
+                            reach.start : reach.stop,
+                        ].to(dtype)
+                        kh = k[
+                            :,
+                            channels,
+                            span.start : span.stop,
+                            reach.start : reach.stop,
+                        ].to(dtype)
 
-                    def box(
-                        t: Tensor, rows: range = rows, span: range = span
-                    ) -> Tensor:
-                        sums = _neighborhood_sum(
-                            t.reshape(-1, len(span), w), ky, kx, rows, h
+                        def box(
+                            t: Tensor,
+                            rows: range = rows,
+                            span: range = span,
+                            cols: range = cols,
+                            reach: range = reach,
+                        ) -> Tensor:
+                            sums = _neighborhood_sum(
+                                t.reshape(-1, len(span), len(reach)),
+                                ky,
+                                kx,
+                                rows,
+                                h,
+                                cols,
+                                w,
+                            )
+                            return sums.reshape(*t.shape[:-2], len(rows), len(cols))
+
+                        q_norm = (box(qh.square()) + ky * kx * 1e-6).sqrt()
+                        k_norm = (box(kh.square()) + ky * kx * 1e-6).sqrt()
+                        gram = box(qh[:, :, None] * kh[:, None])
+                        cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
+                        a = (cosine * tau[head]).softmax(2)
+                        vh = v[
+                            :, channels, rows.start : rows.stop, cols.start : cols.stop
+                        ]
+                        # a matrix product per position, as _class_core's
+                        o = (
+                            a.to(v.dtype).permute(0, 3, 4, 1, 2)
+                            @ vh.permute(0, 2, 3, 1)[..., None]
                         )
-                        return sums.reshape(*t.shape[:-2], len(rows), w)
-
-                    q_norm = (box(qh.square()) + ky * kx * 1e-6).sqrt()
-                    k_norm = (box(kh.square()) + ky * kx * 1e-6).sqrt()
-                    gram = box(qh[:, :, None] * kh[:, None])
-                    cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
-                    a = (cosine * tau[head]).softmax(2)
-                    vh = v[:, channels, rows.start : rows.stop]
-                    # a matrix product per position, as _class_core's
-                    o = (
-                        a.to(v.dtype).permute(0, 3, 4, 1, 2)
-                        @ vh.permute(0, 2, 3, 1)[..., None]
-                    )
-                    out[:, channels, rows.start : rows.stop] = (
-                        o[..., 0].permute(0, 3, 1, 2).to(dtype)
-                    )
+                        out[
+                            :, channels, rows.start : rows.stop, cols.start : cols.stop
+                        ] = o[..., 0].permute(0, 3, 1, 2).to(dtype)
         return out
 
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
