@@ -712,6 +712,244 @@ def test_other_local_na_kernel_failures_are_raised(monkeypatch):
     assert dual_arch.LOCAL_NA_TRITON
 
 
+def _routed_conv(channels=32, experts=4):
+    source = torch.nn.Conv2d(channels, channels, 3, padding=1)
+    base = dual_arch.EDBBReparamConv3x3(source)
+    conv = dual_arch.PremixedDynamicGroupConv3x3(base, experts).double().eval()
+    conv.experts.data.normal_(0, 0.05)
+    for parameter in conv.router.parameters():
+        parameter.data.normal_(0, 0.3)
+    return conv
+
+
+def _routing_reference(conv, x, reach=96):
+    """FP64, one position at a time: the router reads the mean over the position's
+    clamped neighborhood; the output is base + sum_k c_k(p) * conv_k."""
+    channels, height, width = x.shape[1:]
+    ky, kx = min(reach, height), min(reach, width)
+    router = conv.router
+    weight, bias = conv.base.equivalent_kernel(torch.float64)
+    out = torch.nn.functional.conv2d(x, weight, bias, padding=1)
+    experts = [
+        torch.nn.functional.conv2d(x, e.reshape(channels, channels, 3, 3), padding=1)
+        for e in conv.experts
+    ]
+    for y in range(height):
+        for z in range(width):
+            sy = min(max(y - ky // 2, 0), height - ky)
+            sz = min(max(z - kx // 2, 0), width - kx)
+            pooled = x[:, :, sy : sy + ky, sz : sz + kx].mean((2, 3))
+            normalized = torch.nn.functional.layer_norm(pooled, (channels,))
+            hidden = torch.nn.functional.gelu(router.fc1(normalized))
+            c = router.fc2(hidden).softmax(-1) - 1 / router.num_experts
+            for e, expert in enumerate(experts):
+                out[:, :, y, z] += c[:, e, None] * expert[:, :, y, z]
+    return out
+
+
+# above 96 positions on one or both axes, batch 2, the folded convolution too
+@pytest.mark.parametrize("shape", [(100, 7), (5, 130), (99, 98)])
+def test_routing_na_matches_a_per_position_reference(monkeypatch, shape):
+    # the per-position form outside its kernels' devices, as the gate would allow it
+    monkeypatch.setattr(dual_arch, "_na_path_available", lambda *_: True)
+    torch.manual_seed(0)
+    conv = _routed_conv()
+    conv.router.routing_na = True
+    x = torch.randn(2, 32, *shape, dtype=torch.float64)
+    with torch.no_grad():
+        expected = _routing_reference(conv, x)
+        torch.testing.assert_close(conv(x), expected, rtol=0, atol=1e-10)
+        folded = conv.folded()
+        assert folded.router.routing_na
+        torch.testing.assert_close(folded(x), expected, rtol=0, atol=1e-10)
+
+
+def test_routing_na_keeps_the_image_routing_up_to_96():
+    torch.manual_seed(0)
+    conv = _routed_conv().float()
+    x = torch.randn(2, 32, 96, 80).contiguous(memory_format=torch.channels_last)
+    with torch.no_grad():
+        expected = conv(x)
+        conv.router.routing_na = True
+        assert torch.equal(conv(x), expected)
+
+
+def _gpu_routed_conv(channels, dtype):
+    torch.manual_seed(0)
+    conv = _routed_conv(channels).to("cuda", dtype)
+    conv.router.routing_na = True
+    return conv
+
+
+# batch 2, non-square, above 96 positions on one or both axes, partial position and
+# channel blocks; FP16 and the FP32 of the last group's convolution; both layouts
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "shape", "dtype", "channels_last"),
+    [
+        (2, 128, (100, 7), torch.float16, False),
+        (1, 64, (97, 130), torch.float16, True),
+        (2, 48, (130, 99), torch.float16, False),
+        (1, 128, (101, 120), torch.float32, False),
+    ],
+)
+def test_routing_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, channels, shape, dtype, channels_last
+):
+    conv = _gpu_routed_conv(channels, dtype)
+    x = torch.randn(batch, channels, *shape, device="cuda", dtype=dtype)
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last)
+    calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    with torch.no_grad():
+        actual = conv(x)
+        coefficients = conv.router(x)
+        assert len(calls) == 1 and len(means) == 2
+        monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", False)
+        expected = conv(x)
+        expected_coefficients = conv.router(x)
+    assert len(calls) == 1 and len(means) == 2
+    torch.testing.assert_close(coefficients, expected_coefficients, rtol=0, atol=1e-6)
+    assert actual.dtype == dtype
+    layout = torch.channels_last if channels_last else torch.contiguous_format
+    assert actual.is_contiguous(memory_format=layout)
+    # one FP16 step apart at most (the sums' order differs); FP32 to its rounding
+    tolerance = (2**-10, 1e-4) if dtype == torch.float16 else (1e-5, 1e-5)
+    torch.testing.assert_close(actual, expected, rtol=tolerance[0], atol=tolerance[1])
+
+
+@needs_kernel
+def test_routing_na_kernel_stays_off_up_to_96_and_outside_inference(monkeypatch):
+    conv = _gpu_routed_conv(32, torch.float16)
+    x = torch.randn(1, 32, 97, 40, device="cuda").half()
+    calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    with torch.no_grad():
+        conv(x[..., :96, :])
+        conv.train()(x)
+        conv.eval()
+        conv.bfloat16()(x.bfloat16())
+        conv.double()(x.double())
+        conv.half()
+        with torch.autocast("cuda", torch.float16):
+            conv(x)
+    conv(x)
+    assert not calls and not means
+
+
+# a failure of either routing kernel makes that call the PyTorch form throughout
+@needs_kernel
+@pytest.mark.parametrize("failing", ["routed_sum", "neighborhood_means"])
+def test_a_routing_kernel_failure_gives_that_call_the_pytorch_form(
+    monkeypatch, failing
+):
+    conv = _gpu_routed_conv(128, torch.float16)
+    x = torch.randn(1, 128, 150, 140, device="cuda").half()
+
+    def launch(*_):
+        error = RuntimeError("kernel launch")
+        error.__cause__ = _TritonError("ast.Num")
+        raise error
+
+    monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", True)
+    with torch.no_grad():
+        monkeypatch.setattr(na_local_triton, failing, launch)
+        actual = conv(x)
+        assert not dual_arch.ROUTING_NA_TRITON
+        expected = conv(x)
+    assert torch.equal(actual, expected)
+
+
+# DUAL's own routed parts (3 differences of 128 channels) in channels-first layout:
+# the last part's offsets pass 2**31 from 5,592,406 positions (6.7 GiB of VRAM here)
+@needs_kernel
+def test_routed_sum_addresses_parts_past_2_31():
+    height, width, channels, experts = 2048, 2731, 128, 3
+    assert experts * channels * height * width > 2**31
+    parts = torch.zeros(
+        1, (experts + 1) * channels, height, width, device="cuda", dtype=torch.float16
+    )
+    parts[:, experts * channels :] = 1
+    coefficients = torch.zeros(1, height, width, experts, device="cuda")
+    coefficients[..., -1] = 1
+    out = na_local_triton.routed_sum(
+        parts, coefficients.permute(0, 3, 1, 2), torch.contiguous_format
+    )
+    del parts, coefficients
+    assert bool((out == 1).all())
+
+
+# 65,536 images pass the 65,535 programs of routed_sum's batch axis: the PyTorch sum
+@needs_kernel
+def test_routed_sum_is_not_launched_past_the_batch_axis(monkeypatch):
+    torch.manual_seed(0)
+    conv = _routed_conv(16, 2).to("cuda", torch.float16)
+    conv.router.routing_na = True
+    x = torch.randn(65_536, 16, 97, 1, device="cuda").half()
+    calls = _counted(monkeypatch, "routed_sum")
+    with torch.no_grad():
+        actual = conv(x)
+        assert not calls and dual_arch.ROUTING_NA_TRITON
+        monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", False)
+        # the means kernel still ran above: within one FP16 step of the PyTorch form
+        expected = conv(x)
+    torch.testing.assert_close(actual, expected, rtol=2**-10, atol=1e-4)
+    assert na_local_triton.routed_sum_fits(65_535, 128)
+    assert not na_local_triton.routed_sum_fits(65_536, 128)
+    assert not na_local_triton.routed_sum_fits(1, 65_535 * 32 + 1)
+
+
+# FP32 features of large magnitude: the row sums are kept in FP64, so every window
+# mean is within two FP32 steps of FP64 (FP32 row sums gave 3.1e-7 relative)
+@needs_kernel
+def test_neighborhood_means_keep_fp32_rounding_on_large_features():
+    torch.manual_seed(0)
+    x = torch.randn(1, 2, 1000, 200, device="cuda") * 1000
+    with torch.no_grad():
+        actual = na_local_triton.neighborhood_means(x, 96, 96).double()
+        # FP64 window sums from cumulative sums along each axis
+        sums = torch.nn.functional.pad(x.double().cumsum(2), (0, 0, 1, 0))
+        sums = torch.nn.functional.pad(
+            (sums[:, :, 96:] - sums[:, :, :-96]).cumsum(3), (1, 0)
+        )
+        expected = ((sums[..., 96:] - sums[..., :-96]) / 96**2).permute(0, 2, 3, 1)
+    error = (actual - expected).abs().amax(-1) / expected.abs().amax(-1)
+    assert error.max().item() < 2 * 2**-24
+
+
+def _routing_failing_with(monkeypatch, error):
+    def launch(*_):
+        raise error
+
+    monkeypatch.setattr(dual_arch, "ROUTING_NA_TRITON", True)
+    monkeypatch.setattr(dual_arch, "_na_kernel_usable", lambda *_: True)
+    monkeypatch.setattr(na_local_triton, "routed_sum", launch)
+    monkeypatch.setattr(na_local_triton, "neighborhood_means", launch)
+    conv = _routed_conv().float()
+    conv.router.routing_na = True
+    return conv, torch.randn(1, 32, 100, 20)
+
+
+def test_a_triton_failure_switches_to_the_routing_na_pytorch_form(monkeypatch):
+    error = RuntimeError("kernel launch")
+    error.__cause__ = _TritonError("ast.Num")
+    conv, x = _routing_failing_with(monkeypatch, error)
+    with torch.no_grad():
+        actual = conv(x)
+        assert not dual_arch.ROUTING_NA_TRITON
+        assert torch.equal(actual, conv(x))
+
+
+def test_other_routing_na_kernel_failures_are_raised(monkeypatch):
+    conv, x = _routing_failing_with(
+        monkeypatch, torch.OutOfMemoryError("CUDA out of memory")
+    )
+    with torch.no_grad(), pytest.raises(torch.OutOfMemoryError):
+        conv(x)
+    assert dual_arch.ROUTING_NA_TRITON
+
+
 def _regional_reference(rca, q, k, v, reach=32):
     """FP64, one position at a time: channel_attention over the position's clamped
     neighborhood, applied to its own v."""
@@ -804,35 +1042,42 @@ def test_the_blend_is_the_per_position_form_up_to_16():
         assert (error < 1e-12) is equal, (shape, error)
 
 
-def _regional_sites(model):
+def _na5_sites(model):
     return [
-        m.regional_na
+        m.routing_na if isinstance(m, dual_arch.DynamicRouter) else m.regional_na
         for m in model.modules()
-        if isinstance(m, dual_arch.RegionalChannelAttention)
+        if isinstance(m, (dual_arch.DynamicRouter, dual_arch.RegionalChannelAttention))
     ]
 
 
-def test_regional_na_is_on_by_default_and_on_loading():
-    off = _small(regional_na=False)
-    # two groups, four context layers
-    assert _regional_sites(off) == [False] * 4
+def test_routing_and_regional_na_are_on_by_default_and_on_loading():
+    off = _small(routing_na=False, regional_na=False)
+    # two groups: two routers, four context layers
+    assert _na5_sites(off) == [False] * 6
     for source in (dual_light(2), off):
         model = DUALArch().load(source.state_dict()).model
-        assert model.regional_na
-        sites = _regional_sites(model)
+        assert model.routing_na and model.regional_na
+        sites = _na5_sites(model)
         assert sites and all(sites)
-    assert all(_regional_sites(dual_light(2)))
-    with pytest.raises(ValueError, match="regional_na must be a bool"):
-        _small(regional_na=1)
+    assert all(_na5_sites(dual_light(2)))
+    with pytest.raises(ValueError, match="routing_na must be a bool"):
+        _small(routing_na=1)
 
 
-# on the CPU (no kernel) a default model is today's model bit for bit; where the
-# per-position form runs, it changes the output, and switched off it is today's again
-def test_a_default_model_on_the_cpu_is_todays_model(monkeypatch):
+def _routed_model(**kwargs):
     torch.manual_seed(0)
-    model = _small(scale=2, regional_na=False).eval()
-    default = _small(scale=2).eval()
-    default.load_state_dict(model.state_dict())
+    model = _small(scale=2, **kwargs).eval()
+    for name, parameter in model.named_parameters():
+        if name.endswith("conv.experts"):
+            parameter.data.normal_(0, 0.02)
+    return model
+
+
+# on the CPU (no kernels) a default model is today's model bit for bit; where the
+# per-position forms run, they change the output, and switched off it is today's again
+def test_a_default_model_on_the_cpu_is_todays_model(monkeypatch):
+    model = _routed_model(routing_na=False, regional_na=False)
+    default = _routed_model()
     image = torch.rand(2, 3, 101, 40)
     with torch.no_grad():
         expected = model(image)
@@ -840,17 +1085,23 @@ def test_a_default_model_on_the_cpu_is_todays_model(monkeypatch):
         monkeypatch.setattr(dual_arch, "_na_path_available", lambda *_: True)
         changed = default(image)
         assert torch.equal(model(image), expected)
-    assert not torch.equal(changed, expected)
+    assert (changed - expected).abs().max() > 1e-4
 
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
 def _loaded_light(dtype=torch.float16, **kwargs):
-    """A 2x DUAL Light loaded as spandrel loads it."""
+    """A 2x DUAL Light with nonzero expert kernels, loaded as spandrel loads it."""
     torch.manual_seed(0)
-    model = DUALArch().load(dual_light(2).state_dict()).model
+    source = dual_light(2)
+    for name, parameter in source.named_parameters():
+        if name.endswith("conv.experts"):
+            parameter.data.normal_(0, 0.02)
+    model = DUALArch().load(source.state_dict()).model
     for m in model.modules():
+        if "routing_na" in kwargs and isinstance(m, dual_arch.DynamicRouter):
+            m.routing_na = kwargs["routing_na"]
         if "regional_na" in kwargs and isinstance(
             m, dual_arch.RegionalChannelAttention
         ):
@@ -858,51 +1109,57 @@ def _loaded_light(dtype=torch.float16, **kwargs):
     return model.to("cuda", dtype).eval()
 
 
-# on an NVIDIA GPU in FP16 a loaded default model runs its five regional sites per
-# position: the output is the explicit model's bit for bit and differs from today's
+def _na5_kernel_calls(monkeypatch):
+    return [
+        _counted(monkeypatch, name)
+        for name in ("regional_na", "routed_sum", "neighborhood_means")
+    ]
+
+
+# on an NVIDIA GPU in FP16 a loaded default model is the five-site model: all nine
+# sites run per position (5 regional, 4 routers incl. the last group's FP32-safe one),
+# the output is the explicit model's bit for bit and differs from today's
 @needs_kernel
-def test_a_default_model_on_the_gpu_runs_the_regional_sites_per_position(
-    monkeypatch,
-):
+def test_a_default_model_on_the_gpu_runs_both_sites_per_position(monkeypatch):
     image = torch.rand(1, 3, 208, 200, device="cuda").half()
-    regional = _counted(monkeypatch, "regional_na")
+    regional, routed, means = _na5_kernel_calls(monkeypatch)
     with torch.no_grad():
         default = _loaded_light()(image)
-        assert len(regional) == 5
-        explicit = _loaded_light(regional_na=True)(image)
-        today = _loaded_light(regional_na=False)(image)
+        assert (len(regional), len(routed), len(means)) == (5, 4, 4)
+        explicit = _loaded_light(routing_na=True, regional_na=True)(image)
+        today = _loaded_light(routing_na=False, regional_na=False)(image)
     assert torch.equal(default, explicit)
     assert not torch.equal(default, today)
 
 
-# FP32 features (the kernel's are FP16) keep today's blend
+# both switches on: the sites go per position together or not at all. FP32 features
+# (the regional kernel's are FP16) keep today's forms at both sites
 @needs_kernel
 def test_a_default_model_in_fp32_on_the_gpu_is_todays_model(monkeypatch):
     image = torch.rand(1, 3, 208, 200, device="cuda")
-    calls = _counted(monkeypatch, "regional_na")
+    calls = _na5_kernel_calls(monkeypatch)
     default = _loaded_light(torch.float32)
-    today = _loaded_light(torch.float32, regional_na=False)
+    today = _loaded_light(torch.float32, routing_na=False, regional_na=False)
     with torch.no_grad():
         assert torch.equal(default(image), today(image))
-    assert not calls
+    assert not any(calls)
 
 
-# under an outer FP16 autocast every regional site keeps today's blend, with FP16
-# and with FP32 weights
+# under an outer FP16 autocast every site keeps today's form, the last group's
+# FP32-safe convolution too (it routes before leaving autocast), FP16 and FP32 weights
 @needs_kernel
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_a_default_model_under_autocast_keeps_todays_forms(monkeypatch, dtype):
     image = torch.rand(1, 3, 208, 200, device="cuda").to(dtype)
-    calls = _counted(monkeypatch, "regional_na")
+    calls = _na5_kernel_calls(monkeypatch)
     default = _loaded_light(dtype)
-    today = _loaded_light(dtype, regional_na=False)
+    today = _loaded_light(dtype, routing_na=False, regional_na=False)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         assert torch.equal(default(image), today(image))
-    assert not calls
+    assert not any(calls)
 
 
-# the regional kernel serves heads of 32 channels, and every DUAL's regional heads
-# have 32 channels
+# the joint rule relies on DUAL's regional heads being the kernel's 32 channels
 def test_every_duals_regional_heads_are_32_channels():
     regions = [
         m
@@ -914,26 +1171,64 @@ def test_every_duals_regional_heads_are_32_channels():
         DUAL(embed_dim=48, depths=(4, 4), layer_indices=((0, 1, 2, 5), (2, 3, 4, 5)))
 
 
-# training mode and ROCm take today's blend (no kernel, today's output)
+# with the regional site switched off, the routing site's own conditions decide: FP32
+# features on the GPU route per position
+@needs_kernel
+def test_routing_alone_routes_per_position_in_fp32(monkeypatch):
+    def model(**kwargs):
+        torch.manual_seed(0)
+        net = dual_light(2, regional_na=False, **kwargs)
+        for name, parameter in net.named_parameters():
+            if name.endswith("conv.experts"):
+                parameter.data.normal_(0, 0.02)
+        return net.cuda().eval()
+
+    image = torch.rand(1, 3, 208, 200, device="cuda")
+    regional, routed, means = _na5_kernel_calls(monkeypatch)
+    with torch.no_grad():
+        alone = model()(image)
+        assert routed and means and not regional
+        today = model(routing_na=False)(image)
+    assert not torch.equal(alone, today)
+
+
+# training mode and ROCm take today's forms at both sites (no kernel, today's output)
 @needs_kernel
 def test_training_and_rocm_keep_todays_forms(monkeypatch):
     image = torch.rand(1, 3, 208, 200, device="cuda").half()
     regional = _counted(monkeypatch, "regional_na")
-    default, today = _loaded_light(), _loaded_light(regional_na=False)
+    routed = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    default, today = _loaded_light(), _loaded_light(routing_na=False, regional_na=False)
     with torch.no_grad():
         assert torch.equal(default.train()(image), today.train()(image))
         default.eval()
         today.eval()
         monkeypatch.setattr(torch.version, "hip", "7.0")
         assert torch.equal(default(image), today(image))
-    assert not regional
+    assert not regional and not routed and not means
 
 
-# FP16 features, batch 2, non-square: the channel attention calculates in FP32 and
-# stays within FP16 rounding of the FP64 reference
+# FP16 features, batch 2, non-square: the router and the channel attention calculate
+# in FP32 and stay within FP16 rounding of the FP64 references
 @needs_cuda
-def test_regional_na_in_fp16_on_the_gpu():
+def test_routing_and_regional_na_in_fp16_on_the_gpu():
     torch.manual_seed(0)
+    conv = _routed_conv(128)
+    conv.router.routing_na = True
+    x = torch.randn(2, 128, 120, 97, dtype=torch.float64)
+    with torch.no_grad():
+        expected = _routing_reference(conv, x)
+        actual = conv.cuda().half()(x.cuda().half())
+    assert actual.dtype == torch.float16
+    # the base and expert parts are FP16 convolution outputs, each rounded once more
+    # before the sum: measured up to 4.4 times the output's FP16 rounding (half a
+    # step at the largest output)
+    rounding = 2.0 ** (expected.abs().max().log2().floor().item() - 11)
+    torch.testing.assert_close(
+        actual.double().cpu(), expected, rtol=0, atol=5 * rounding
+    )
+
     rca = dual_arch.RegionalChannelAttention(128, 4).double().eval()
     rca.theta.data.normal_(0, 1)
     rca.regional_na = True
