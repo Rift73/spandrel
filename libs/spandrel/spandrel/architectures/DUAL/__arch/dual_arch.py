@@ -620,33 +620,6 @@ _NA_ELEMENT_CAP = 2**27
 _ROUTING_REACH, _REGIONAL_REACH = 96, 32
 
 
-def _neighborhood_rows(rows: range, k: int, length: int) -> range:
-    """The map rows that the clamped k-row neighborhoods of `rows` cover."""
-
-    def start(p: int) -> int:
-        return min(max(p - k // 2, 0), length - k)
-
-    return range(start(rows.start), start(rows.stop - 1) + k)
-
-
-def _neighborhood_sum(
-    z: Tensor, ky: int, kx: int, rows: range, height: int, cols: range, width: int
-) -> Tensor:
-    """Sums over each position's clamped ky x kx neighborhood (start = clamp(p - k // 2,
-    0, L - k) per axis) for the rows `rows` and columns `cols` of a height x width map.
-
-    z is (N, len(row span), len(column span)) and holds the spans
-    _neighborhood_rows(rows, ky, height) and _neighborhood_rows(cols, kx, width).
-    """
-    sums = F.avg_pool2d(z, (ky, 1), 1, divisor_override=1)
-    sums = F.avg_pool2d(sums, (1, kx), 1, divisor_override=1)
-    for axis, (part, k, length) in enumerate(((rows, ky, height), (cols, kx, width))):
-        first = _neighborhood_rows(part, k, length).start
-        starts = torch.arange(part.start, part.stop, device=z.device) - k // 2
-        sums = sums.index_select(axis - 2, starts.clamp(0, length - k) - first)
-    return sums
-
-
 @dataclass
 class NAGeometry:
     """Tiled neighborhood indices; tiles of one class share one mask.
@@ -1718,82 +1691,17 @@ class RegionalChannelAttention(nn.Module):
         """spandrel: regional_na's per-position form. Each position's channel attention
         (Gram, lengths + count * 1e-6, cosine * tau, softmax) comes from its own clamped
         32x32 neighborhood and is applied to its own v, in the dtypes of
-        channel_attention and _class_core. The b*d*d*H*W Gram field is never whole:
-        one head and one band of rows at a time, under _NA_ELEMENT_CAP elements; where
-        one row's neighborhood rows already pass it, bands of single rows and of
-        columns."""
-        b, c, h, w = q.shape
-        d = c // self.heads
-        if d == 32 and _na_kernel_usable(REGIONAL_NA_TRITON, self, q):
+        channel_attention and _class_core: the Triton kernel where it runs, else
+        na_local_triton.plain_regional_na in bands under _NA_ELEMENT_CAP elements."""
+        if q.shape[1] // self.heads == 32 and _na_kernel_usable(
+            REGIONAL_NA_TRITON, self, q
+        ):
             out = self._regional_na_triton(q, k, v)
             if out is not None:
                 return out
-        ky, kx = min(_REGIONAL_REACH, h), min(_REGIONAL_REACH, w)
-        dtype = calculation_dtype(q.dtype)
-        band = _NA_ELEMENT_CAP // (b * d * d * w) - ky + 1
-        columns = w
-        if band < 1:
-            band = 1
-            columns = max(1, _NA_ELEMENT_CAP // (b * d * d * ky) - kx + 1)
-        out = torch.empty(b, c, h, w, device=q.device, dtype=dtype)
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            tau = self.theta.to(dtype).clamp(max=math.log(100)).exp()
-            for head in range(self.heads):
-                channels = slice(head * d, (head + 1) * d)
-                for first in range(0, h, band):
-                    rows = range(first, min(first + band, h))
-                    span = _neighborhood_rows(rows, ky, h)
-                    for left in range(0, w, columns):
-                        cols = range(left, min(left + columns, w))
-                        reach = _neighborhood_rows(cols, kx, w)
-                        qh = q[
-                            :,
-                            channels,
-                            span.start : span.stop,
-                            reach.start : reach.stop,
-                        ].to(dtype)
-                        kh = k[
-                            :,
-                            channels,
-                            span.start : span.stop,
-                            reach.start : reach.stop,
-                        ].to(dtype)
-
-                        def box(
-                            t: Tensor,
-                            rows: range = rows,
-                            span: range = span,
-                            cols: range = cols,
-                            reach: range = reach,
-                        ) -> Tensor:
-                            sums = _neighborhood_sum(
-                                t.reshape(-1, len(span), len(reach)),
-                                ky,
-                                kx,
-                                rows,
-                                h,
-                                cols,
-                                w,
-                            )
-                            return sums.reshape(*t.shape[:-2], len(rows), len(cols))
-
-                        q_norm = (box(qh.square()) + ky * kx * 1e-6).sqrt()
-                        k_norm = (box(kh.square()) + ky * kx * 1e-6).sqrt()
-                        gram = box(qh[:, :, None] * kh[:, None])
-                        cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
-                        a = (cosine * tau[head]).softmax(2)
-                        vh = v[
-                            :, channels, rows.start : rows.stop, cols.start : cols.stop
-                        ]
-                        # a matrix product per position, as _class_core's
-                        o = (
-                            a.to(v.dtype).permute(0, 3, 4, 1, 2)
-                            @ vh.permute(0, 2, 3, 1)[..., None]
-                        )
-                        out[
-                            :, channels, rows.start : rows.stop, cols.start : cols.stop
-                        ] = o[..., 0].permute(0, 3, 1, 2).to(dtype)
-        return out
+        return na_local_triton.plain_regional_na(
+            q, k, v, self.heads, self.theta, _REGIONAL_REACH, _NA_ELEMENT_CAP
+        )
 
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """Blend four class outputs without an H*W*d*d matrix field."""

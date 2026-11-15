@@ -101,6 +101,13 @@ Contents:
     training, export) and on maps of at most 96 positions per axis, the image
     routing runs as with the switch off. No parameter or key changes.
 
+    spandrel: regional_na (default False) gives the regional channel attention
+    DUAL's per-position form under the same gate: each position's channel
+    attention (Gram, lengths + count * 1e-6, cosine * tau, softmax) comes from
+    its own clamped 32x32 neighborhood and is applied to its own v. With both
+    switches on, a call takes both per-position forms or neither. Maps of at
+    most 16 positions per axis keep the blend. No parameter or key changes.
+
 Execution:
     Eager execution, evaluation, CPU and export use SDPA throughout.
     prepare_for_compile() selects the training paths: for BF16 or FP16 it
@@ -1403,6 +1410,11 @@ def hat_weights(
     return (1 - ((t.to(dtype) - 15.5).abs() / 16)).to(dtype)
 
 
+# spandrel: regional_na's neighborhood side, and the elements per band of its PyTorch
+# form (the form after a kernel failure: about 6 FP32 fields of this size at once).
+_REGIONAL_REACH, _REGIONAL_ELEMENT_CAP = 32, 2**24
+
+
 class RegionalChannelAttention(nn.Module):
     """Channel attention over four offset grids of 32x32 regions.
 
@@ -1422,6 +1434,9 @@ class RegionalChannelAttention(nn.Module):
         self.project = nn.Conv2d(channels, channels, 1, bias=False)
         self.theta = nn.Parameter(torch.zeros(heads))
         self.apply(_init_weights)
+        # spandrel: RDUAL sets this from its regional_na switch: where
+        # _na_forms_available holds, the per-position form (_mix_na).
+        self.regional_na = False
 
     def channel_attention(self, q: Tensor, k: Tensor, count: Tensor) -> Tensor:
         """(..., heads, d, tokens) -> (..., heads, d, d), FP32 or FP64.
@@ -1477,8 +1492,32 @@ class RegionalChannelAttention(nn.Module):
             wx = hat_weights(w, sx, device=q.device, dtype=a.dtype)
             return o * wy[None, None, :, None] * wx[None, None, None, :]
 
+    def _mix_na(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """spandrel: regional_na's per-position form, DUAL's: its regional kernel while
+        NA_TRITON is on for BF16 q, k and v (the depthwise output under run_clip /
+        run_window's autocast), rounded to BF16 as the projection's autocast rounds
+        the blend; else na_local_triton.plain_regional_na in FP32."""
+        if NA_TRITON and q.dtype == torch.bfloat16:
+            if not q.stride() == k.stride() == v.stride():
+                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            tau = self.theta.float().clamp(max=math.log(100)).exp()
+            return na_local_triton.regional_na(q, k, v, tau)
+        return na_local_triton.plain_regional_na(
+            q, k, v, self.heads, self.theta, _REGIONAL_REACH, _REGIONAL_ELEMENT_CAP
+        )
+
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """Blend four class outputs without an H*W*d*d matrix field."""
+        h, w = q.shape[-2:]
+        # spandrel: up to 16 positions per axis every class has one window holding the
+        # whole map, and the hats sum to 1: the blend is then the per-position form.
+        if (
+            self.regional_na
+            and (h > 16 or w > 16)
+            and q.shape[1] // self.heads == 32
+            and _na_forms_available(self, q)
+        ):
+            return self._mix_na(q, k, v)
         result = None
         for sy, sx in ((0, 0), (0, 16), (16, 0), (16, 16)):
             out = self._class_core(q, k, v, sy, sx)
@@ -1731,9 +1770,11 @@ class EDBBReparamConv3x3(nn.Module):
 _ROUTING_REACH = 96
 
 
-def _routing_na_available(module: nn.Module, x: Tensor) -> bool:
-    """Whether a routed convolution takes routing_na's per-position form in this call,
-    decided in the caller's context: eager inference on an NVIDIA GPU with Triton
+def _na_forms_available(module: nn.Module, x: Tensor) -> bool:
+    """Whether a routed convolution (routing_na) or a regional channel attention
+    (regional_na, x = its q) takes its per-position form in this call, decided in the
+    caller's context, so that one call takes both or neither: eager inference on an
+    NVIDIA GPU with Triton
     importable, the convolution running in BF16 (the precision of RDUAL's kernels,
     which run_clip and run_window give the trunk by autocast: FP32 or BF16 features;
     autocast leaves FP64 alone, which keeps the image routing). Whether NA_TRITON then
@@ -1776,7 +1817,7 @@ class DynamicRouter(nn.Module):
         self.fc2 = nn.Linear(channels // 4, experts, device=device, dtype=dtype)
         nn.init.zeros_(self.fc2.bias)
         # spandrel: RDUAL sets this from its routing_na switch: where
-        # _routing_na_available holds, (B, K, H, W) coefficients, each position
+        # _na_forms_available holds, (B, K, H, W) coefficients, each position
         # routed from the mean over its clamped 96x96 neighborhood.
         self.routing_na = False
 
@@ -1789,7 +1830,7 @@ class DynamicRouter(nn.Module):
         na = (
             self.routing_na
             and (height > _ROUTING_REACH or width > _ROUTING_REACH)
-            and _routing_na_available(self, x)
+            and _na_forms_available(self, x)
         )
         # one mean per distinct window; positions sharing one share its route
         ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
@@ -4538,6 +4579,7 @@ class RDUAL(nn.Module):
         local_na: bool = True,
         retrieval_na: bool = True,
         routing_na: bool = True,
+        regional_na: bool = False,
     ) -> None:
         super().__init__()
         if type(use_checkpoint) is not bool:
@@ -4546,6 +4588,7 @@ class RDUAL(nn.Module):
             ("local_na", local_na),
             ("retrieval_na", retrieval_na),
             ("routing_na", routing_na),
+            ("regional_na", regional_na),
         ):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be a bool")
@@ -4569,6 +4612,7 @@ class RDUAL(nn.Module):
         self.local_na = local_na
         self.retrieval_na = retrieval_na
         self.routing_na = routing_na
+        self.regional_na = regional_na
         self.register_buffer(
             "mean", torch.tensor((0.4488, 0.4371, 0.4040)).view(1, 3, 1, 1)
         )
@@ -4603,6 +4647,7 @@ class RDUAL(nn.Module):
                 group.layers[index].attention.local_na = local_na
             for index in (2, 5):
                 group.layers[index] = DualContextLayer(group.layers[index])
+                group.layers[index].dual.regional_na = regional_na
                 group.layers[index].attention.attn_type = attn_type
                 group.layers[index].attention.require_hybrid = self.require_hybrid
         for group, indices in zip(self.groups, _INDICES, strict=True):

@@ -476,14 +476,14 @@ def _counted(monkeypatch, name):
     return calls
 
 
-# RDUAL has its own regional attention: the per-position form DUAL runs by default on
-# NVIDIA GPUs never reaches it, so its kernel never launches; the routing kernels do
+# regional_na is off by default: the regional kernel never launches, the routing
+# kernels do
 @needs_kernel
-def test_rdual_runs_none_of_duals_regional_forms(monkeypatch):
+def test_by_default_rdual_runs_no_regional_kernel(monkeypatch):
     regional = _counted(monkeypatch, "regional_na")
     routed = _counted(monkeypatch, "routed_sum")
     model = _model(scale=2).cuda().eval()
-    assert not any(hasattr(m, "regional_na") for m in model.modules())
+    assert not any(m.regional_na for m in _regionals(model))
     with torch.inference_mode():
         run_clip(model, torch.rand(1, 2, 3, 208, 200, device="cuda"))
         run_clip(
@@ -660,7 +660,7 @@ def _routing_reference(conv, x, reach=96):
 @pytest.mark.parametrize("shape", [(100, 7), (5, 130), (99, 98)])
 def test_routing_na_matches_a_per_position_reference(monkeypatch, shape):
     # the per-position form outside its kernels' devices, as the gate would allow it
-    monkeypatch.setattr(rdual_arch, "_routing_na_available", lambda *_: True)
+    monkeypatch.setattr(rdual_arch, "_na_forms_available", lambda *_: True)
     torch.manual_seed(0)
     conv = _routed_conv()
     conv.router.routing_na = True
@@ -674,7 +674,7 @@ def test_routing_na_matches_a_per_position_reference(monkeypatch, shape):
 
 
 def test_routing_na_keeps_the_image_routing_up_to_96(monkeypatch):
-    monkeypatch.setattr(rdual_arch, "_routing_na_available", lambda *_: True)
+    monkeypatch.setattr(rdual_arch, "_na_forms_available", lambda *_: True)
     torch.manual_seed(0)
     conv = _routed_conv().float()
     x = torch.randn(2, 32, 96, 80).contiguous(memory_format=torch.channels_last)
@@ -892,3 +892,198 @@ def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch, fa
             router.routing_na = False
         image, _ = run_window(model, frames, 2)
     assert not torch.equal(image, expected)
+
+
+def _regionals(model: RDUAL):
+    return [
+        m for m in model.modules() if isinstance(m, rdual_arch.RegionalChannelAttention)
+    ]
+
+
+def test_regional_na_is_off_by_default_and_on_loading():
+    default = _regionals(_model(scale=2))
+    assert default and not any(m.regional_na for m in default)
+    model = RDUALArch().load(_model(scale=2).state_dict()).model
+    assert not model.regional_na
+    assert not any(m.regional_na for m in _regionals(model))
+    on = _model(scale=2, regional_na=True)
+    assert on.regional_na and all(m.regional_na for m in _regionals(on))
+    with pytest.raises(ValueError, match="regional_na must be a bool"):
+        _model(scale=2, regional_na=1)
+
+
+def _regional_attention():
+    torch.manual_seed(0)
+    rca = rdual_arch.RegionalChannelAttention(64, 2).eval()
+    rca.theta.data.normal_(0, 1)
+    rca.regional_na = True
+    return rca
+
+
+def _regional_reference(rca, q, k, v, reach=32):
+    """FP64, one position at a time: channel_attention over the clamped neighborhood
+    of each position, applied to its own v."""
+    batch, channels, height, width = q.shape
+    heads, d = rca.heads, channels // rca.heads
+    ky, kx = min(reach, height), min(reach, width)
+    out = torch.empty_like(q)
+    count = torch.tensor(float(ky * kx), dtype=torch.float64)
+    for y in range(height):
+        for z in range(width):
+            sy = min(max(y - ky // 2, 0), height - ky)
+            sz = min(max(z - kx // 2, 0), width - kx)
+
+            def part(t, sy=sy, sz=sz):
+                return t[:, :, sy : sy + ky, sz : sz + kx].reshape(batch, heads, d, -1)
+
+            a = rca.channel_attention(part(q), part(k), count)
+            own = v[:, :, y, z].reshape(batch, heads, d, 1)
+            out[:, :, y, z] = (a @ own).reshape(batch, channels)
+    return out
+
+
+# above 16 positions on one or both axes, non-square, below and above the 32-wide
+# neighborhood, batch 2; with a small cap every head runs in bands of a few rows
+@pytest.mark.parametrize("bands", [False, True])
+@pytest.mark.parametrize("shape", [(17, 16), (12, 40), (37, 20)])
+def test_regional_na_matches_a_per_position_reference(monkeypatch, shape, bands):
+    # the per-position form outside its kernel's devices, as the gate would allow it
+    monkeypatch.setattr(rdual_arch, "_na_forms_available", lambda *_: True)
+    if bands:
+        monkeypatch.setattr(rdual_arch, "_REGIONAL_ELEMENT_CAP", 2 * 32 * 32 * 20 * 34)
+    rca = _regional_attention().double()
+    q, k, v = torch.randn(3, 2, 64, *shape, dtype=torch.float64).unbind(0)
+    with torch.no_grad():
+        actual = rca.mix(q, k, v)
+        expected = _regional_reference(rca, q, k, v)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-10)
+
+
+def test_regional_na_keeps_the_blend_up_to_16(monkeypatch):
+    monkeypatch.setattr(rdual_arch, "_na_forms_available", lambda *_: True)
+    rca = _regional_attention()
+    for shape in ((16, 16), (16, 5), (9, 16)):
+        q, k, v = torch.randn(3, 2, 64, *shape).unbind(0)
+        with torch.no_grad():
+            rca.regional_na = False
+            expected = rca.mix(q, k, v)
+            rca.regional_na = True
+            assert torch.equal(rca.mix(q, k, v), expected)
+
+
+def _gpu_regional(channels=128):
+    torch.manual_seed(0)
+    rca = rdual_arch.RegionalChannelAttention(channels, channels // 32).cuda().eval()
+    rca.theta.data.normal_(0, 1)
+    rca.regional_na = True
+    return rca
+
+
+# RDUAL's precision (FP32 weights under BF16 autocast: q, k and v are BF16); batch 2,
+# non-square, above 16 on one or both axes, partial 32-row segments, both layouts
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "shape", "channels_last"),
+    [(2, (40, 37), False), (1, (17, 200), True), (1, (100, 9), False)],
+)
+def test_regional_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, shape, channels_last
+):
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    rca = _gpu_regional()
+    x = torch.randn(batch, 128, *shape, device="cuda")
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last)
+    calls = _counted(monkeypatch, "regional_na")
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+        actual = rca(x)
+        assert len(calls) == 1
+        monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+        expected = rca(x)
+    assert len(calls) == 1
+    # the kernel rounds the blend to BF16, as the projection's autocast does
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=2e-3)
+
+
+# up to 16, training, gradients, FP32, FP16 (autocast or weights), FP64 under BF16
+# autocast: the blend, bit for bit, and no launch
+@needs_kernel
+def test_regional_na_stays_off_up_to_16_and_outside_bf16_inference(monkeypatch):
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    rca = _gpu_regional()
+    x = torch.randn(1, 128, 40, 30, device="cuda")
+    calls = _counted(monkeypatch, "regional_na")
+    bf16 = partial(torch.autocast, "cuda", torch.bfloat16)
+    fp16 = partial(torch.autocast, "cuda", torch.float16)
+
+    def blend(rca, x, context):
+        with context():
+            rca.regional_na = True
+            actual = rca(x)
+            rca.regional_na = False
+            expected = rca(x)
+        rca.regional_na = True
+        return torch.equal(actual, expected)
+
+    with torch.no_grad():
+        assert blend(rca, x[..., :16, :16], bf16)
+        assert blend(rca.train(), x, bf16)
+        rca.eval()
+        assert blend(rca, x, nullcontext)
+        assert blend(rca, x, fp16)
+        assert blend(rca.half(), x.half(), nullcontext)
+        assert blend(rca.double(), x.double(), bf16)
+        rca.float()
+    assert blend(rca, x, bf16)
+    assert not calls
+
+
+# both switches on: one call takes both per-position forms (BF16 run_window) or neither
+# (FP32, bit for bit the switches off)
+@needs_kernel
+def test_routing_and_regional_na_take_their_forms_together(monkeypatch):
+    model = _routed_model()
+    for m in _regionals(model):
+        m.regional_na = True
+    frames = torch.rand(1, 2, 3, 208, 200, device="cuda")
+    routed = _counted(monkeypatch, "routed_sum")
+    regional = _counted(monkeypatch, "regional_na")
+    with torch.inference_mode():
+        run_window(model, frames, 2)
+        assert routed and regional
+        routed.clear()
+        regional.clear()
+        both, _ = model.infer_window(frames, 2)
+        assert not routed and not regional
+        for router in _routers(model):
+            router.routing_na = False
+        for m in _regionals(model):
+            m.regional_na = False
+        off, _ = model.infer_window(frames, 2)
+    assert torch.equal(both, off)
+
+
+# a failing regional kernel makes run_window fall back to the PyTorch paths (NA_TRITON
+# off), which take both per-position forms too
+@needs_kernel
+def test_a_regional_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
+    model = _routed_model()
+    for m in _regionals(model):
+        m.regional_na = True
+    frames = torch.rand(1, 2, 3, 208, 200, device="cuda")
+    model.temporal.backend = "reference"
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+    with torch.inference_mode():
+        expected, _ = run_window(model, frames, 2)
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+
+    def launch(*_):
+        error = RuntimeError("kernel launch")
+        error.__cause__ = _TritonError("ast.Num")
+        raise error
+
+    monkeypatch.setattr(na_local_triton, "regional_na", launch)
+    with torch.inference_mode():
+        actual, _ = run_window(model, frames, 2)
+    assert not rdual_arch.NA_TRITON
+    assert torch.equal(actual, expected)

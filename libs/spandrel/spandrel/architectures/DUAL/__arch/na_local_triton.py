@@ -499,8 +499,9 @@ REGIONAL_REGISTERS = 168
 def regional_na(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tau: torch.Tensor
 ) -> torch.Tensor:
-    """q, k and v B,C,H,W (heads of 32; one set of strides, one 16-bit type) and tau
-    heads (FP32) to the regional attention output B,C,H,W, channels-last when q is."""
+    """q, k and v B,C,H,W (heads of 32; one set of strides, one 16-bit type: FP16 or
+    BF16) and tau heads (FP32) to the regional attention output B,C,H,W in that type,
+    channels-last when q is."""
     batch, channels, height, width = q.shape
     layout = torch.channels_last if q.stride(1) == 1 else torch.contiguous_format
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device, memory_format=layout)
@@ -701,6 +702,117 @@ def plain_routed_sum(
             out[image : image + 1, :, top : top + rows] = band[:, 0] + (
                 weights.to(dtype) * band[:, 1:]
             ).sum(1)
+    return out
+
+
+def neighborhood_rows(rows: range, k: int, length: int) -> range:
+    """The map rows that the clamped k-row neighborhoods of `rows` cover."""
+
+    def start(p: int) -> int:
+        return min(max(p - k // 2, 0), length - k)
+
+    return range(start(rows.start), start(rows.stop - 1) + k)
+
+
+def neighborhood_sum(
+    z: torch.Tensor, ky: int, kx: int, rows: range, height: int, cols: range, width: int
+) -> torch.Tensor:
+    """Sums over each position's clamped ky x kx neighborhood (start = clamp(p - k // 2,
+    0, L - k) per axis) for the rows `rows` and columns `cols` of a height x width map.
+
+    z is (N, len(row span), len(column span)) and holds the spans
+    neighborhood_rows(rows, ky, height) and neighborhood_rows(cols, kx, width).
+    """
+    sums = torch.nn.functional.avg_pool2d(z, (ky, 1), 1, divisor_override=1)
+    sums = torch.nn.functional.avg_pool2d(sums, (1, kx), 1, divisor_override=1)
+    for axis, (part, k, length) in enumerate(((rows, ky, height), (cols, kx, width))):
+        first = neighborhood_rows(part, k, length).start
+        starts = torch.arange(part.start, part.stop, device=z.device) - k // 2
+        sums = sums.index_select(axis - 2, starts.clamp(0, length - k) - first)
+    return sums
+
+
+def plain_regional_na(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    theta: torch.Tensor,
+    reach: int,
+    cap: int,
+) -> torch.Tensor:
+    """regional_na's PyTorch form: each position's channel attention (Gram, lengths +
+    count * 1e-6, cosine * tau, softmax) from its own clamped reach x reach
+    neighborhood, applied to its own v; q, k and v B,C,H,W, heads of C / heads
+    channels, tau = exp(clamp(theta, max=log 100)); the output in FP32 (FP64 for FP64
+    q). The b*d*d*H*W Gram field is never whole: one head and one band of rows at a
+    time, under `cap` elements; where one row's neighborhood rows already pass it,
+    bands of single rows and of columns."""
+    b, c, h, w = q.shape
+    d = c // heads
+    ky, kx = min(reach, h), min(reach, w)
+    dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+    band = cap // (b * d * d * w) - ky + 1
+    columns = w
+    if band < 1:
+        band = 1
+        columns = max(1, cap // (b * d * d * ky) - kx + 1)
+    out = torch.empty(b, c, h, w, device=q.device, dtype=dtype)
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        tau = theta.to(dtype).clamp(max=math.log(100)).exp()
+        for head in range(heads):
+            channels = slice(head * d, (head + 1) * d)
+            for first in range(0, h, band):
+                rows = range(first, min(first + band, h))
+                span = neighborhood_rows(rows, ky, h)
+                for left in range(0, w, columns):
+                    cols = range(left, min(left + columns, w))
+                    width_span = neighborhood_rows(cols, kx, w)
+                    qh = q[
+                        :,
+                        channels,
+                        span.start : span.stop,
+                        width_span.start : width_span.stop,
+                    ].to(dtype)
+                    kh = k[
+                        :,
+                        channels,
+                        span.start : span.stop,
+                        width_span.start : width_span.stop,
+                    ].to(dtype)
+
+                    def box(
+                        t: torch.Tensor,
+                        rows: range = rows,
+                        span: range = span,
+                        cols: range = cols,
+                        width_span: range = width_span,
+                    ) -> torch.Tensor:
+                        sums = neighborhood_sum(
+                            t.reshape(-1, len(span), len(width_span)),
+                            ky,
+                            kx,
+                            rows,
+                            h,
+                            cols,
+                            w,
+                        )
+                        return sums.reshape(*t.shape[:-2], len(rows), len(cols))
+
+                    q_norm = (box(qh.square()) + ky * kx * 1e-6).sqrt()
+                    k_norm = (box(kh.square()) + ky * kx * 1e-6).sqrt()
+                    gram = box(qh[:, :, None] * kh[:, None])
+                    cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
+                    a = (cosine * tau[head]).softmax(2)
+                    vh = v[:, channels, rows.start : rows.stop, cols.start : cols.stop]
+                    # a matrix product per position, as the blend's class cores take it
+                    o = (
+                        a.to(v.dtype).permute(0, 3, 4, 1, 2)
+                        @ vh.permute(0, 2, 3, 1)[..., None]
+                    )
+                    out[:, channels, rows.start : rows.stop, cols.start : cols.stop] = (
+                        o[..., 0].permute(0, 3, 1, 2).to(dtype)
+                    )
     return out
 
 
