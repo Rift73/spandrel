@@ -3,6 +3,8 @@ import math
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -691,7 +693,8 @@ def _gpu_routed_conv(channels):
 
 # RDUAL's precision (FP32 weights under BF16 autocast, as run_clip and run_window run
 # the trunk) and BF16 weights; batch 2, non-square, above 96 positions on one or both
-# axes, partial position and channel blocks, both layouts
+# axes (one at most 96 and the other above), partial position and channel blocks, both
+# layouts
 @needs_kernel
 @pytest.mark.parametrize(
     ("batch", "channels", "shape", "bfloat16", "channels_last"),
@@ -699,6 +702,7 @@ def _gpu_routed_conv(channels):
         (2, 128, (100, 7), False, False),
         (1, 128, (97, 130), False, True),
         (2, 48, (130, 99), True, False),
+        (1, 64, (60, 200), False, False),
     ],
 )
 def test_routing_na_kernel_matches_the_pytorch_form(
@@ -737,33 +741,134 @@ def test_routing_na_stays_off_up_to_96_and_outside_bf16_inference(monkeypatch):
     x = torch.randn(1, 32, 97, 40, device="cuda")
     calls = _counted(monkeypatch, "routed_sum")
     means = _counted(monkeypatch, "neighborhood_means")
-    with torch.no_grad():
-        with torch.autocast("cuda", torch.bfloat16):
-            conv(x[..., :96, :])
-            conv.train()(x)
-            conv.eval()
-        conv(x)
-        with torch.autocast("cuda", torch.float16):
+    bf16 = partial(torch.autocast, "cuda", torch.bfloat16)
+    fp16 = partial(torch.autocast, "cuda", torch.float16)
+
+    def image_routing(conv, x, context):
+        # the form is in the coefficients' shape; the output must still run
+        with context():
+            routed = conv.router(x)
             conv(x)
-        conv.half()(x.half())
-        conv.double()(x.double())
+        return routed.shape[-2:] == (1, 1)
+
+    with torch.no_grad():
+        assert image_routing(conv, x[..., :96, :], bf16)
+        assert image_routing(conv.train(), x, bf16)
+        conv.eval()
+        assert image_routing(conv, x, nullcontext)
+        assert image_routing(conv, x, fp16)
+        assert image_routing(conv.half(), x.half(), nullcontext)
+        # autocast leaves FP64 alone: an FP64 model under BF16 autocast runs in FP64
+        assert image_routing(conv.double(), x.double(), bf16)
         conv.float()
-    with torch.autocast("cuda", torch.bfloat16):
-        conv(x)
+        assert not image_routing(conv, x, bf16)
+        calls.clear()
+        means.clear()
+    assert image_routing(conv, x, bf16)
     assert not calls and not means
-    routed = conv.router(x)
-    assert routed.shape[-2:] == (1, 1)
 
 
-# the app's window in BF16: a failing routing kernel makes run_window fall back to the
-# PyTorch paths (NA_TRITON off), which route per position too
 @needs_kernel
-def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
+def test_routing_na_blends_in_pytorch_where_routed_sum_does_not_fit(monkeypatch):
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    conv = _gpu_routed_conv(64)
+    x = torch.randn(2, 64, 110, 70, device="cuda")
+    calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    monkeypatch.setattr(na_local_triton, "routed_sum_fits", lambda *_: False)
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+        actual = conv(x)
+        assert not calls and len(means) == 1
+        monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+        expected = conv(x)
+    assert actual.dtype == torch.bfloat16
+    # the same blend; only the means' kernel differs (FP32 rounding of the router)
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-3)
+
+
+def _routed_model():
     torch.manual_seed(0)
     model = _model(scale=2).cuda().eval()
     for conv in model.modules():
         if isinstance(conv, rdual_arch.PremixedDynamicGroupConv3x3):
             conv.experts.data.normal_(0, 0.05)
+            for parameter in conv.router.parameters():
+                parameter.data.normal_(0, 0.3)
+    return model
+
+
+def _per_position_forward(self, x):
+    """FP32, vectorized: means over the clamped 96x96 neighborhoods by box sums and
+    replicated borders, the router per position, base + sum_k c_k * conv_k; returns
+    the output and the coefficients B,H,W,K."""
+    channels, height, width = x.shape[1:]
+    ky, kx = min(96, height), min(96, width)
+    with torch.autocast("cuda", enabled=False):
+        x = x.float()
+        weight, bias = self.base.equivalent_kernel(torch.float32)
+        means = torch.nn.functional.avg_pool2d(x, (ky, kx), 1)
+        means = torch.nn.functional.pad(
+            means, (kx // 2, kx - 1 - kx // 2, ky // 2, ky - 1 - ky // 2), "replicate"
+        ).permute(0, 2, 3, 1)
+        router = self.router
+        hidden = torch.nn.functional.gelu(
+            router.fc1(torch.nn.functional.layer_norm(means, (channels,)))
+        )
+        c = router.fc2(hidden).softmax(-1) - 1 / router.num_experts
+        out = torch.nn.functional.conv2d(x, weight, bias, padding=1)
+        for e, expert in enumerate(self.experts):
+            kernel = expert.reshape(channels, channels, 3, 3)
+            out += c[..., e][:, None] * torch.nn.functional.conv2d(x, kernel, padding=1)
+    return out, c
+
+
+# the app's call in BF16 on a frame whose trunk is 300 x 32 (one axis above 96): every
+# routed convolution's output against the reference on the same input
+@needs_kernel
+def test_run_window_routes_per_position_like_a_reference(monkeypatch):
+    model = _routed_model()
+    # content that changes along the tall axis, so that neighborhoods differ
+    ramp = torch.linspace(0, 1, 600, device="cuda")[:, None]
+    frames = (ramp * torch.rand(1, 2, 3, 1, 64, device="cuda")).expand(1, 2, 3, 600, 64)
+    frames = frames + 0.1 * torch.rand(1, 2, 3, 600, 64, device="cuda")
+    routed = _counted(monkeypatch, "routed_sum")
+    seen = []
+    for conv in model.modules():
+        if isinstance(conv, rdual_arch.PremixedDynamicGroupConv3x3):
+
+            def record(x, conv=conv, forward=conv.forward):
+                out = forward(x)
+                seen.append((conv, x, out))
+                return out
+
+            monkeypatch.setattr(conv, "forward", record)
+    with torch.inference_mode():
+        run_window(model, frames, 2)
+        assert len(routed) == len(seen) >= 4
+        spread = 0.0
+        for conv, x, out in seen:
+            expected, coefficients = _per_position_forward(conv, x)
+            routes = conv.router(x)
+            assert routes.shape[-2:] == x.shape[-2:]
+            # the routes match the reference's to FP32 rounding
+            spread = max(spread, coefficients.std((1, 2)).max().item())
+            torch.testing.assert_close(
+                routes.permute(0, 2, 3, 1), coefficients, rtol=0, atol=1e-5
+            )
+            # the output to the BF16 convolution's rounding
+            assert out.dtype == torch.bfloat16
+            error = (out.float() - expected).abs().mean().item()
+            assert error < 2**-7 * expected.abs().mean().item()
+    # the routes vary over the map
+    assert spread > 1e-2
+
+
+# the app's window in BF16: a failing routing kernel makes run_window fall back to the
+# PyTorch paths (NA_TRITON off), which route per position too
+@needs_kernel
+@pytest.mark.parametrize("failing", ["routed_sum", "neighborhood_means"])
+def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch, failing):
+    model = _routed_model()
     frames = torch.rand(1, 2, 3, 208, 200, device="cuda")
     model.temporal.backend = "reference"
     monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
@@ -776,7 +881,7 @@ def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
         error.__cause__ = _TritonError("ast.Num")
         raise error
 
-    monkeypatch.setattr(na_local_triton, "routed_sum", launch)
+    monkeypatch.setattr(na_local_triton, failing, launch)
     with torch.inference_mode():
         actual, _ = run_window(model, frames, 2)
     assert not rdual_arch.NA_TRITON

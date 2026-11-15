@@ -531,8 +531,8 @@ WINDOW_LANES = 128
 
 
 def neighborhood_means(x: torch.Tensor, ky: int, kx: int) -> torch.Tensor:
-    """x B,C,H,W (FP16 or FP32, any strides) to its FP32 means over the ky x kx windows
-    at every start, B,H-ky+1,W-kx+1,C (channels innermost)."""
+    """x B,C,H,W (FP16, BF16 or FP32, any strides) to its FP32 means over the ky x kx
+    windows at every start, B,H-ky+1,W-kx+1,C (channels innermost)."""
     batch, channels, height, width = x.shape
     rows = torch.empty(
         (batch, channels, height - ky + 1, width), dtype=torch.float64, device=x.device
@@ -599,7 +599,7 @@ def routed_sum_fits(batch: int, channels: int) -> bool:
 def routed_sum(
     parts: torch.Tensor, coefficients: torch.Tensor, layout: torch.memory_format
 ) -> torch.Tensor:
-    """parts B,(K+1)*C,H,W (the base, then the experts; FP16 or FP32) and FP32
+    """parts B,(K+1)*C,H,W (the base, then the experts; FP16, BF16 or FP32) and FP32
     coefficients B,K,H,W, each with its H and W flattening to one stride, to
     base + sum_k c_k * expert_k B,C,H,W in the parts' type and the given layout."""
     batch, total, height, width = parts.shape
@@ -637,6 +637,70 @@ def routed_sum(
             block_c=ROUTED_C,
             num_warps=4,
         )
+    return out
+
+
+# The PyTorch forms of the routing site, shared by DUAL and RDUAL; they need no Triton.
+
+
+def neighborhood_starts(length: int, k: int, device: torch.device) -> torch.Tensor:
+    """Each position's clamped neighborhood start: clamp(p - k // 2, 0, length - k)."""
+    return (torch.arange(length, device=device) - k // 2).clamp(0, length - k)
+
+
+def plain_neighborhood_means(
+    x: torch.Tensor, ky: int, kx: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
+    column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype.
+    Differences of FP64 cumulative sums along each axis, one pass per axis whatever
+    the window (FP32 running sums over a whole row would lose digits), taken in place:
+    at most two FP64 maps of x's size are held."""
+    height, width = x.shape[-2:]
+    sums = x.to(torch.float64, copy=True).cumsum_(2)
+    rows = sums[:, :, ky - 1 :].clone()
+    rows[:, :, 1:] -= sums[:, :, : height - ky]
+    del sums
+    rows.cumsum_(3)
+    means = rows[..., kx - 1 :].clone()
+    means[..., 1:] -= rows[..., : width - kx]
+    del rows
+    return (means / (ky * kx)).to(dtype).permute(0, 2, 3, 1)
+
+
+# positions per block of plain_routed_sum's FP32 sums
+PLAIN_ROUTED_POSITIONS = 65_536
+
+
+def plain_routed_sum(
+    parts: torch.Tensor,
+    coefficients: torch.Tensor,
+    dtype: torch.dtype,
+    layout: torch.memory_format,
+) -> torch.Tensor:
+    """routed_sum's PyTorch form: base + sum_k c_k * expert_k of parts B,(K+1)*C,H,W
+    and coefficients B,K,H,W, summed in dtype and written in the parts' type and the
+    given layout. It runs per image and per block of rows of about
+    PLAIN_ROUTED_POSITIONS positions, so the sums' copies stay small beside the parts
+    (each element's sum is the one the whole tensor would take on CUDA)."""
+    batch, total, height, width = parts.shape
+    experts = coefficients.shape[1]
+    channels = total // (experts + 1)
+    out = torch.empty(
+        (batch, channels, height, width),
+        dtype=parts.dtype,
+        device=parts.device,
+        memory_format=layout,
+    )
+    split = parts.unflatten(1, (experts + 1, channels))
+    rows = max(1, PLAIN_ROUTED_POSITIONS // width)
+    for image in range(batch):
+        for top in range(0, height, rows):
+            band = split[image : image + 1, :, :, top : top + rows].to(dtype)
+            weights = coefficients[image : image + 1, :, None, top : top + rows]
+            out[image : image + 1, :, top : top + rows] = band[:, 0] + (
+                weights.to(dtype) * band[:, 1:]
+            ).sum(1)
     return out
 
 

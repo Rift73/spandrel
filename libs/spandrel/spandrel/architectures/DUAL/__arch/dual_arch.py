@@ -647,24 +647,6 @@ def _neighborhood_sum(
     return sums
 
 
-def _neighborhood_means(x: Tensor, ky: int, kx: int, dtype: torch.dtype) -> Tensor:
-    """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
-    column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype.
-    Differences of FP64 cumulative sums along each axis, one pass per axis whatever
-    the window (FP32 running sums over a whole row would lose digits)."""
-    height, width = x.shape[-2:]
-    sums = F.pad(x.to(torch.float64).cumsum(2), (0, 0, 1, 0))
-    sums = sums[:, :, ky:] - sums[:, :, : height - ky + 1]
-    sums = F.pad(sums.cumsum(3), (1, 0))
-    sums = sums[..., kx:] - sums[..., : width - kx + 1]
-    return (sums / (ky * kx)).to(dtype).permute(0, 2, 3, 1)
-
-
-def _neighborhood_starts(length: int, k: int, device: torch.device) -> Tensor:
-    """Each position's clamped neighborhood start: clamp(p - k // 2, 0, length - k)."""
-    return (torch.arange(length, device=device) - k // 2).clamp(0, length - k)
-
-
 @dataclass
 class NAGeometry:
     """Tiled neighborhood indices; tiles of one class share one mask.
@@ -2080,9 +2062,9 @@ class DynamicRouter(nn.Module):
     def _neighborhood_means_triton(
         self, x: Tensor, ky: int, kx: int, dtype: torch.dtype
     ) -> Tensor | None:
-        """spandrel: _neighborhood_means from the Triton window sums for FP16 / FP32
-        features and an FP32 router; None where they do not run or failed, which
-        switches ROUTING_NA_TRITON off for good."""
+        """spandrel: the plain neighborhood means from the Triton window sums for
+        FP16 / FP32 features and an FP32 router; None where they do not run or failed,
+        which switches ROUTING_NA_TRITON off for good."""
         global ROUTING_NA_TRITON
         if dtype != torch.float32 or not _na_kernel_usable(
             ROUTING_NA_TRITON, self, x, (torch.float16, torch.float32)
@@ -2112,7 +2094,7 @@ class DynamicRouter(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             if na:
                 if pooled is None:
-                    pooled = _neighborhood_means(x, ky, kx, dtype)
+                    pooled = na_local_triton.plain_neighborhood_means(x, ky, kx, dtype)
             else:
                 pooled = x.mean((2, 3), dtype=dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)
@@ -2124,8 +2106,8 @@ class DynamicRouter(nn.Module):
             )
             coefficients = logits.softmax(-1) - 1.0 / self.num_experts
             if na:
-                rows = _neighborhood_starts(height, ky, x.device)
-                columns = _neighborhood_starts(width, kx, x.device)
+                rows = na_local_triton.neighborhood_starts(height, ky, x.device)
+                columns = na_local_triton.neighborhood_starts(width, kx, x.device)
                 return (
                     coefficients.index_select(1, rows)
                     .index_select(2, columns)
@@ -2189,11 +2171,9 @@ def _premixed_conv3x3(
                 ROUTING_NA_TRITON = False
                 coefficients = reroute()[:, :count]
         with torch.autocast(device_type=x.device.type, enabled=False):
-            parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
-            output = parts[:, 0] + (
-                coefficients[:, :, None].to(dtype) * parts[:, 1:]
-            ).sum(1)
-        return output.to(convolved.dtype).contiguous(memory_format=_layers_layout(x))
+            return na_local_triton.plain_routed_sum(
+                convolved, coefficients, dtype, _layers_layout(x)
+            )
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
             experts.reshape(experts.shape[0], -1).to(dtype)

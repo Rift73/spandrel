@@ -1735,7 +1735,8 @@ def _routing_na_available(module: nn.Module, x: Tensor) -> bool:
     """Whether a routed convolution takes routing_na's per-position form in this call,
     decided in the caller's context: eager inference on an NVIDIA GPU with Triton
     importable, the convolution running in BF16 (the precision of RDUAL's kernels,
-    which run_clip and run_window give the trunk by autocast). Whether NA_TRITON then
+    which run_clip and run_window give the trunk by autocast: FP32 or BF16 features;
+    autocast leaves FP64 alone, which keeps the image routing). Whether NA_TRITON then
     lets the kernels run or not (after a kernel failed, spandrel's fallback runs the
     call again with it off), the form is the same; elsewhere the image routing runs."""
     cuda = x.device.type == "cuda"
@@ -1748,6 +1749,7 @@ def _routing_na_available(module: nn.Module, x: Tensor) -> bool:
         na_local_triton.AVAILABLE
         and cuda
         and torch.version.hip is None
+        and x.dtype in (torch.float32, torch.bfloat16)
         and dtype == torch.bfloat16
         and not module.training
         and not torch.is_grad_enabled()
@@ -1755,23 +1757,6 @@ def _routing_na_available(module: nn.Module, x: Tensor) -> bool:
         and not torch.onnx.is_in_onnx_export()
         and not torch.jit.is_tracing()
     )
-
-
-def _neighborhood_means(x: Tensor, ky: int, kx: int, dtype: torch.dtype) -> Tensor:
-    """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
-    column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype,
-    from FP64 cumulative sums along each axis."""
-    height, width = x.shape[-2:]
-    sums = F.pad(x.to(torch.float64).cumsum(2), (0, 0, 1, 0))
-    sums = sums[:, :, ky:] - sums[:, :, : height - ky + 1]
-    sums = F.pad(sums.cumsum(3), (1, 0))
-    sums = sums[..., kx:] - sums[..., : width - kx + 1]
-    return (sums / (ky * kx)).to(dtype).permute(0, 2, 3, 1)
-
-
-def _neighborhood_starts(length: int, k: int, device: torch.device) -> Tensor:
-    """Each position's clamped neighborhood start: clamp(p - k // 2, 0, length - k)."""
-    return (torch.arange(length, device=device) - k // 2).clamp(0, length - k)
 
 
 class DynamicRouter(nn.Module):
@@ -1814,7 +1799,7 @@ class DynamicRouter(nn.Module):
             elif NA_TRITON and x.is_cuda and dtype == torch.float32:
                 pooled = na_local_triton.neighborhood_means(x, ky, kx)
             else:
-                pooled = _neighborhood_means(x, ky, kx, dtype)
+                pooled = na_local_triton.plain_neighborhood_means(x, ky, kx, dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)
             hidden = F.gelu(
                 F.linear(normalized, self.fc1.weight.to(dtype), self.fc1.bias.to(dtype))
@@ -1824,8 +1809,8 @@ class DynamicRouter(nn.Module):
             )
             coefficients = logits.softmax(-1) - 1.0 / self.num_experts
             if na:
-                rows = _neighborhood_starts(height, ky, x.device)
-                columns = _neighborhood_starts(width, kx, x.device)
+                rows = na_local_triton.neighborhood_starts(height, ky, x.device)
+                columns = na_local_triton.neighborhood_starts(width, kx, x.device)
                 return (
                     coefficients.index_select(1, rows)
                     .index_select(2, columns)
@@ -1841,8 +1826,8 @@ def _premixed_conv3x3(
 
     spandrel: per-position coefficients (B, K, H, W) of routing_na mix the experts'
     outputs instead, base + sum_k c_k(p) * conv_k, summed in FP32 (DUAL's
-    routed_sum kernel while NA_TRITON is on). The coefficients sum to zero
-    (softmax - 1/K), so the last expert's term folds into the others: base +
+    routed_sum kernel while NA_TRITON is on, else its plain form). The coefficients
+    sum to zero (softmax - 1/K), so the last expert's term folds into the others: base +
     sum_{k<K} c_k(p) * conv(W_k - W_K), one part fewer. The convolution runs in the
     caller's context, BF16 under run_clip / run_window's autocast.
     """
@@ -1876,11 +1861,9 @@ def _premixed_conv3x3(
         ):
             return na_local_triton.routed_sum(convolved, coefficients.float(), layout)
         with torch.autocast(device_type=x.device.type, enabled=False):
-            parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
-            output = parts[:, 0] + (
-                coefficients[:, :, None].to(dtype) * parts[:, 1:]
-            ).sum(1)
-        return output.to(convolved.dtype).contiguous(memory_format=layout)
+            return na_local_triton.plain_routed_sum(
+                convolved, coefficients, dtype, layout
+            )
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
             experts.reshape(experts.shape[0], -1).to(dtype)
