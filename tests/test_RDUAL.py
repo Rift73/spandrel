@@ -1089,6 +1089,12 @@ def test_a_regional_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
         actual, _ = run_window(model, frames, 2)
     assert not rdual_arch.NA_TRITON
     assert torch.equal(actual, expected)
+    # the control: with regional_na off the same run takes the blend
+    with torch.inference_mode():
+        for m in _regionals(model):
+            m.regional_na = False
+        blend, _ = run_window(model, frames, 2)
+    assert not torch.equal(blend, expected)
 
 
 # bands of 3 rows over 10 (a partial last band), batch 2, both layouts: the banded

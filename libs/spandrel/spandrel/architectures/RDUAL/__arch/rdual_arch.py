@@ -1777,7 +1777,9 @@ def _na_forms_available(module: nn.Module, x: Tensor, weight: Tensor) -> bool:
     of RDUAL's kernels, which run_clip and run_window give the trunk by autocast). The
     precision is that of the site's weight (FP32 or BF16; FP16 and FP64 keep the image
     routing and the blend, autocast leaves FP64 alone) and of the caller's context, not
-    of x, so one call decides alike at every site of a model: both forms or neither.
+    of x, so one call decides alike at every site of a model: both forms or neither
+    (routers read fc1's weight, regional attentions qkv's; they could disagree only
+    in a model whose modules hold different dtypes, which RDUAL never builds).
     Whether NA_TRITON then lets the kernels run or not (after a kernel failed,
     spandrel's fallback runs the call again with it off), the form is the same."""
     cuda = x.device.type == "cuda"
