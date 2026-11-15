@@ -474,23 +474,20 @@ def _counted(monkeypatch, name):
     return calls
 
 
-# RDUAL has its own router and regional attention: the per-position forms DUAL runs
-# by default on NVIDIA GPUs never reach it, so none of their kernels launch
+# RDUAL has its own regional attention: the per-position form DUAL runs by default on
+# NVIDIA GPUs never reaches it, so its kernel never launches; the routing kernels do
 @needs_kernel
-def test_rdual_runs_none_of_duals_per_position_forms(monkeypatch):
-    calls = [
-        _counted(monkeypatch, name)
-        for name in ("regional_na", "routed_sum", "neighborhood_means")
-    ]
+def test_rdual_runs_none_of_duals_regional_forms(monkeypatch):
+    regional = _counted(monkeypatch, "regional_na")
+    routed = _counted(monkeypatch, "routed_sum")
     model = _model(scale=2).cuda().eval()
-    assert not any(hasattr(m, "routing_na") for m in model.modules())
     assert not any(hasattr(m, "regional_na") for m in model.modules())
     with torch.inference_mode():
         run_clip(model, torch.rand(1, 2, 3, 208, 200, device="cuda"))
         run_clip(
             model.bfloat16(), torch.rand(1, 1, 3, 208, 200, device="cuda").bfloat16()
         )
-    assert not any(calls)
+    assert not regional and routed
 
 
 def _local_attention(channels):
@@ -605,3 +602,182 @@ def test_retrieval_na_kernel_matches_the_pytorch_form(
         )
     assert len(calls) == int(kernel)
     torch.testing.assert_close(actual, expected, rtol=0, atol=2e-2)
+
+
+def test_routing_na_is_on_by_default_and_on_loading():
+    assert not _model(scale=2, routing_na=False).groups[0].conv.router.routing_na
+    model = RDUALArch().load(_model(scale=2).state_dict()).model
+    assert model.routing_na
+    routers = [m for m in model.modules() if isinstance(m, rdual_arch.DynamicRouter)]
+    assert len(routers) == 4 and all(router.routing_na for router in routers)
+    with pytest.raises(ValueError, match="routing_na must be a bool"):
+        _model(scale=2, routing_na=1)
+
+
+def _routed_conv(channels=32, experts=4):
+    source = torch.nn.Conv2d(channels, channels, 3, padding=1)
+    base = rdual_arch.EDBBReparamConv3x3(source)
+    conv = rdual_arch.PremixedDynamicGroupConv3x3(base, experts).double().eval()
+    conv.experts.data.normal_(0, 0.05)
+    for parameter in conv.router.parameters():
+        parameter.data.normal_(0, 0.3)
+    return conv
+
+
+def _routing_reference(conv, x, reach=96):
+    """FP64, one position at a time: the router reads the mean over the position's
+    clamped neighborhood; the output is base + sum_k c_k(p) * conv_k."""
+    channels, height, width = x.shape[1:]
+    ky, kx = min(reach, height), min(reach, width)
+    router = conv.router
+    weight, bias = conv.base.equivalent_kernel(torch.float64)
+    out = torch.nn.functional.conv2d(x, weight, bias, padding=1)
+    experts = [
+        torch.nn.functional.conv2d(x, e.reshape(channels, channels, 3, 3), padding=1)
+        for e in conv.experts
+    ]
+    for y in range(height):
+        for z in range(width):
+            sy = min(max(y - ky // 2, 0), height - ky)
+            sz = min(max(z - kx // 2, 0), width - kx)
+            pooled = x[:, :, sy : sy + ky, sz : sz + kx].mean((2, 3))
+            normalized = torch.nn.functional.layer_norm(pooled, (channels,))
+            hidden = torch.nn.functional.gelu(router.fc1(normalized))
+            c = router.fc2(hidden).softmax(-1) - 1 / router.num_experts
+            for e, expert in enumerate(experts):
+                out[:, :, y, z] += c[:, e, None] * expert[:, :, y, z]
+    return out
+
+
+# above 96 positions on one or both axes, batch 2, the folded convolution too
+@pytest.mark.parametrize("shape", [(100, 7), (5, 130), (99, 98)])
+def test_routing_na_matches_a_per_position_reference(monkeypatch, shape):
+    # the per-position form outside its kernels' devices, as the gate would allow it
+    monkeypatch.setattr(rdual_arch, "_routing_na_available", lambda *_: True)
+    torch.manual_seed(0)
+    conv = _routed_conv()
+    conv.router.routing_na = True
+    x = torch.randn(2, 32, *shape, dtype=torch.float64)
+    with torch.no_grad():
+        expected = _routing_reference(conv, x)
+        torch.testing.assert_close(conv(x), expected, rtol=0, atol=1e-10)
+        folded = conv.folded()
+        assert folded.router.routing_na
+        torch.testing.assert_close(folded(x), expected, rtol=0, atol=1e-10)
+
+
+def test_routing_na_keeps_the_image_routing_up_to_96(monkeypatch):
+    monkeypatch.setattr(rdual_arch, "_routing_na_available", lambda *_: True)
+    torch.manual_seed(0)
+    conv = _routed_conv().float()
+    x = torch.randn(2, 32, 96, 80).contiguous(memory_format=torch.channels_last)
+    with torch.no_grad():
+        expected = conv(x)
+        conv.router.routing_na = True
+        assert torch.equal(conv(x), expected)
+
+
+def _gpu_routed_conv(channels):
+    torch.manual_seed(0)
+    conv = _routed_conv(channels).float().cuda().folded()
+    conv.router.routing_na = True
+    return conv
+
+
+# RDUAL's precision (FP32 weights under BF16 autocast, as run_clip and run_window run
+# the trunk) and BF16 weights; batch 2, non-square, above 96 positions on one or both
+# axes, partial position and channel blocks, both layouts
+@needs_kernel
+@pytest.mark.parametrize(
+    ("batch", "channels", "shape", "bfloat16", "channels_last"),
+    [
+        (2, 128, (100, 7), False, False),
+        (1, 128, (97, 130), False, True),
+        (2, 48, (130, 99), True, False),
+    ],
+)
+def test_routing_na_kernel_matches_the_pytorch_form(
+    monkeypatch, batch, channels, shape, bfloat16, channels_last
+):
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    conv = _gpu_routed_conv(channels)
+    x = torch.randn(batch, channels, *shape, device="cuda")
+    if bfloat16:
+        conv, x = conv.bfloat16(), x.bfloat16()
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last)
+    calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=not bfloat16):
+        actual = conv(x)
+        coefficients = conv.router(x)
+        assert len(calls) == 1 and len(means) == 2
+        monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+        expected = conv(x)
+        expected_coefficients = conv.router(x)
+    assert len(calls) == 1 and len(means) == 2
+    torch.testing.assert_close(coefficients, expected_coefficients, rtol=0, atol=1e-6)
+    assert actual.dtype == torch.bfloat16
+    layout = torch.channels_last if channels_last else torch.contiguous_format
+    assert actual.is_contiguous(memory_format=layout)
+    # one BF16 step apart at most (the sums' order differs)
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-3)
+
+
+# up to 96, training, gradients, FP32, FP16 (autocast or weights), FP64: image routing
+@needs_kernel
+def test_routing_na_stays_off_up_to_96_and_outside_bf16_inference(monkeypatch):
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+    conv = _gpu_routed_conv(32)
+    x = torch.randn(1, 32, 97, 40, device="cuda")
+    calls = _counted(monkeypatch, "routed_sum")
+    means = _counted(monkeypatch, "neighborhood_means")
+    with torch.no_grad():
+        with torch.autocast("cuda", torch.bfloat16):
+            conv(x[..., :96, :])
+            conv.train()(x)
+            conv.eval()
+        conv(x)
+        with torch.autocast("cuda", torch.float16):
+            conv(x)
+        conv.half()(x.half())
+        conv.double()(x.double())
+        conv.float()
+    with torch.autocast("cuda", torch.bfloat16):
+        conv(x)
+    assert not calls and not means
+    routed = conv.router(x)
+    assert routed.shape[-2:] == (1, 1)
+
+
+# the app's window in BF16: a failing routing kernel makes run_window fall back to the
+# PyTorch paths (NA_TRITON off), which route per position too
+@needs_kernel
+def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
+    torch.manual_seed(0)
+    model = _model(scale=2).cuda().eval()
+    for conv in (group.conv for group in model.groups):
+        conv.experts.data.normal_(0, 0.05)
+    frames = torch.rand(1, 2, 3, 208, 200, device="cuda")
+    model.temporal.backend = "reference"
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
+    with torch.inference_mode():
+        expected, _ = run_window(model, frames, 2)
+    monkeypatch.setattr(rdual_arch, "NA_TRITON", True)
+
+    def launch(*_):
+        error = RuntimeError("kernel launch")
+        error.__cause__ = _TritonError("ast.Num")
+        raise error
+
+    monkeypatch.setattr(na_local_triton, "routed_sum", launch)
+    with torch.inference_mode():
+        actual, _ = run_window(model, frames, 2)
+    assert not rdual_arch.NA_TRITON
+    assert torch.equal(actual, expected)
+    with torch.inference_mode():
+        model.routing_na = False
+        for router in (group.conv.router for group in model.groups):
+            router.routing_na = False
+        image, _ = run_window(model, frames, 2)
+    assert not torch.equal(image, expected)

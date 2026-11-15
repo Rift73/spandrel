@@ -92,6 +92,15 @@ Contents:
     and batch 8x8 query tiles with a mask; False restores anchored windows and
     96px blocks. Neither changes parameters or checkpoint keys.
 
+    spandrel: routing_na (default True) routes the groups' expert convolutions
+    per position where DUAL's routing kernels run (eager BF16 inference on an
+    NVIDIA GPU with Triton, as run_clip and run_window run RDUAL): each
+    position's router input is the mean of the convolution's input over its
+    clamped 96x96 neighborhood (K = min(96, length) per axis), and the output
+    is base + sum_k c_k(p) * conv_k. Elsewhere (CPU, ROCm, FP32 or FP16,
+    training, export) and on maps of at most 96 positions per axis, the image
+    routing runs as with the switch off. No parameter or key changes.
+
 Execution:
     Eager execution, evaluation, CPU and export use SDPA throughout.
     prepare_for_compile() selects the training paths: for BF16 or FP16 it
@@ -1718,6 +1727,53 @@ class EDBBReparamConv3x3(nn.Module):
         return module.eval()
 
 
+# spandrel: routing_na's neighborhood side.
+_ROUTING_REACH = 96
+
+
+def _routing_na_available(module: nn.Module, x: Tensor) -> bool:
+    """Whether a routed convolution takes routing_na's per-position form in this call,
+    decided in the caller's context: eager inference on an NVIDIA GPU with Triton
+    importable, the convolution running in BF16 (the precision of RDUAL's kernels,
+    which run_clip and run_window give the trunk by autocast). Whether NA_TRITON then
+    lets the kernels run or not (after a kernel failed, spandrel's fallback runs the
+    call again with it off), the form is the same; elsewhere the image routing runs."""
+    cuda = x.device.type == "cuda"
+    dtype = (
+        torch.get_autocast_dtype("cuda")
+        if cuda and torch.is_autocast_enabled("cuda")
+        else x.dtype
+    )
+    return (
+        na_local_triton.AVAILABLE
+        and cuda
+        and torch.version.hip is None
+        and dtype == torch.bfloat16
+        and not module.training
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and not torch.onnx.is_in_onnx_export()
+        and not torch.jit.is_tracing()
+    )
+
+
+def _neighborhood_means(x: Tensor, ky: int, kx: int, dtype: torch.dtype) -> Tensor:
+    """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
+    column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype,
+    from FP64 cumulative sums along each axis."""
+    height, width = x.shape[-2:]
+    sums = F.pad(x.to(torch.float64).cumsum(2), (0, 0, 1, 0))
+    sums = sums[:, :, ky:] - sums[:, :, : height - ky + 1]
+    sums = F.pad(sums.cumsum(3), (1, 0))
+    sums = sums[..., kx:] - sums[..., : width - kx + 1]
+    return (sums / (ky * kx)).to(dtype).permute(0, 2, 3, 1)
+
+
+def _neighborhood_starts(length: int, k: int, device: torch.device) -> Tensor:
+    """Each position's clamped neighborhood start: clamp(p - k // 2, 0, length - k)."""
+    return (torch.arange(length, device=device) - k // 2).clamp(0, length - k)
+
+
 class DynamicRouter(nn.Module):
     """FP32/FP64 per-image GAP/LayerNorm/MLP routing, centred around 1/K."""
 
@@ -1734,13 +1790,31 @@ class DynamicRouter(nn.Module):
         self.fc1 = nn.Linear(channels, channels // 4, device=device, dtype=dtype)
         self.fc2 = nn.Linear(channels // 4, experts, device=device, dtype=dtype)
         nn.init.zeros_(self.fc2.bias)
+        # spandrel: RDUAL sets this from its routing_na switch: where
+        # _routing_na_available holds, (B, K, H, W) coefficients, each position
+        # routed from the mean over its clamped 96x96 neighborhood.
+        self.routing_na = False
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = (
             torch.float64 if self.fc1.weight.dtype == torch.float64 else torch.float32
         )
+        height, width = x.shape[-2:]
+        # Up to 96 positions per axis the neighborhood is the whole map.
+        na = (
+            self.routing_na
+            and (height > _ROUTING_REACH or width > _ROUTING_REACH)
+            and _routing_na_available(self, x)
+        )
+        # one mean per distinct window; positions sharing one share its route
+        ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
         with torch.autocast(device_type=x.device.type, enabled=False):
-            pooled = x.mean((2, 3), dtype=dtype)
+            if not na:
+                pooled = x.mean((2, 3), dtype=dtype)
+            elif NA_TRITON and x.is_cuda and dtype == torch.float32:
+                pooled = na_local_triton.neighborhood_means(x, ky, kx)
+            else:
+                pooled = _neighborhood_means(x, ky, kx, dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)
             hidden = F.gelu(
                 F.linear(normalized, self.fc1.weight.to(dtype), self.fc1.bias.to(dtype))
@@ -1748,15 +1822,65 @@ class DynamicRouter(nn.Module):
             logits = F.linear(
                 hidden, self.fc2.weight.to(dtype), self.fc2.bias.to(dtype)
             )
-            return (logits.softmax(-1) - 1.0 / self.num_experts)[:, :, None, None]
+            coefficients = logits.softmax(-1) - 1.0 / self.num_experts
+            if na:
+                rows = _neighborhood_starts(height, ky, x.device)
+                columns = _neighborhood_starts(width, kx, x.device)
+                return (
+                    coefficients.index_select(1, rows)
+                    .index_select(2, columns)
+                    .permute(0, 3, 1, 2)
+                )
+            return coefficients[:, :, None, None]
 
 
 def _premixed_conv3x3(
     x: Tensor, weight0: Tensor, bias0: Tensor, experts: Tensor, coefficients: Tensor
 ) -> Tensor:
-    """One differentiable mixed kernel per sample, including batch > 1."""
+    """One differentiable mixed kernel per sample, including batch > 1.
+
+    spandrel: per-position coefficients (B, K, H, W) of routing_na mix the experts'
+    outputs instead, base + sum_k c_k(p) * conv_k, summed in FP32 (DUAL's
+    routed_sum kernel while NA_TRITON is on). The coefficients sum to zero
+    (softmax - 1/K), so the last expert's term folds into the others: base +
+    sum_{k<K} c_k(p) * conv(W_k - W_K), one part fewer. The convolution runs in the
+    caller's context, BF16 under run_clip / run_window's autocast.
+    """
     batch, channels, height, width = x.shape
     dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
+    if coefficients.shape[-2:] != (1, 1):
+        count = experts.shape[0] - 1
+        layout = torch.contiguous_format if x.is_contiguous() else torch.channels_last
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kernels = experts.to(dtype).reshape(count + 1, channels, channels, 3, 3)
+            weight = torch.cat(
+                (
+                    weight0.to(dtype),
+                    (kernels[:-1] - kernels[-1]).reshape(
+                        count * channels, channels, 3, 3
+                    ),
+                )
+            )
+            bias = torch.cat(
+                (bias0.to(dtype), bias0.new_zeros(count * channels, dtype=dtype))
+            )
+        convolved = F.conv2d(
+            x, weight.to(experts.dtype), bias.to(experts.dtype), padding=1
+        )
+        coefficients = coefficients[:, :count]
+        if (
+            NA_TRITON
+            and convolved.is_cuda
+            and convolved.dtype == torch.bfloat16
+            and na_local_triton.routed_sum_fits(batch, channels)
+        ):
+            return na_local_triton.routed_sum(convolved, coefficients.float(), layout)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
+            output = parts[:, 0] + (
+                coefficients[:, :, None].to(dtype) * parts[:, 1:]
+            ).sum(1)
+        return output.to(convolved.dtype).contiguous(memory_format=layout)
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
             experts.reshape(experts.shape[0], -1).to(dtype)
@@ -4430,11 +4554,16 @@ class RDUAL(nn.Module):
         attn_type: Literal["auto", "masked", "hybrid"] = "auto",
         local_na: bool = True,
         retrieval_na: bool = True,
+        routing_na: bool = True,
     ) -> None:
         super().__init__()
         if type(use_checkpoint) is not bool:
             raise ValueError("use_checkpoint must be a bool")
-        for name, value in (("local_na", local_na), ("retrieval_na", retrieval_na)):
+        for name, value in (
+            ("local_na", local_na),
+            ("retrieval_na", retrieval_na),
+            ("routing_na", routing_na),
+        ):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be a bool")
         if type(dynamic_experts) is not int or dynamic_experts < 2:
@@ -4456,6 +4585,7 @@ class RDUAL(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.local_na = local_na
         self.retrieval_na = retrieval_na
+        self.routing_na = routing_na
         self.register_buffer(
             "mean", torch.tensor((0.4488, 0.4371, 0.4040)).view(1, 3, 1, 1)
         )
@@ -4520,6 +4650,7 @@ class RDUAL(nn.Module):
         with torch.random.fork_rng(devices=[]):
             for group in self.groups:
                 group.conv = PremixedDynamicGroupConv3x3(group.conv, dynamic_experts)
+                group.conv.router.routing_na = routing_na
         self.temporal = StateFusion(temporal_backend)
         # The tag names the back end that runs, not the requested one, so a
         # cache built without the kernels is never reused with them.

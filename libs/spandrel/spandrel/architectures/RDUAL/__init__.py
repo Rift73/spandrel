@@ -87,9 +87,10 @@ def _window(
 
 
 def _falling_back(model: RDUAL, run: Callable[[], T]) -> T:
-    """run(), and when the Triton kernels of the temporal stage or of the
-    neighborhood attention fail to compile (a Triton too old for this Python, for
-    example), run() again on the PyTorch paths, which are then kept for good."""
+    """run(), and when the Triton kernels of the temporal stage, of the
+    neighborhood attention or of the expert routing fail to compile (a Triton too
+    old for this Python, for example), run() again on the PyTorch paths, which are
+    then kept for good."""
     from .__arch import rdual_arch
 
     try:
@@ -165,13 +166,15 @@ class RDUALArch(Architecture["RDUAL"]):
         # The scale is only in the shapes of the reconstruction tail.
         experts = int(state_dict["groups.0.conv.experts"].shape[0])
         for scale in (2, 4, 1):
-            # every RDUAL runs its local layers and its retrieval as neighborhoods
+            # every RDUAL runs its local layers, its retrieval and (where the
+            # routing kernels run) its expert routing as neighborhoods
             model = RDUAL(
                 scale=scale,
                 use_checkpoint=False,
                 dynamic_experts=experts,
                 local_na=True,
                 retrieval_na=True,
+                routing_na=True,
             )
             reference = model.state_dict()
             if reference.keys() == state_dict.keys() and all(
