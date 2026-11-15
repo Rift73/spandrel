@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 import torch
 import torch.nn as nn
@@ -335,7 +335,7 @@ class PLKSR(nn.Module):
 
         self.to_img = nn.PixelShuffle(upscaling_factor)
 
-        self.repeat_op = partial(
+        self.repeat_op: Callable[[torch.Tensor], torch.Tensor] = partial(
             torch.repeat_interleave, repeats=upscaling_factor**2, dim=1
         )
 

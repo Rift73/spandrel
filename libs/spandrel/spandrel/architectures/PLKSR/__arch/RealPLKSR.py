@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Callable
 
 import torch
 from torch import nn
@@ -168,7 +169,7 @@ class RealPLKSR(nn.Module):
         trunc_normal_(self.feats[0].weight, std=0.02)
         trunc_normal_(self.feats[-1].weight, std=0.02)
 
-        self.repeat_op = partial(
+        self.repeat_op: Callable[[torch.Tensor], torch.Tensor] = partial(
             torch.repeat_interleave, repeats=upscaling_factor**2, dim=1
         )
 
