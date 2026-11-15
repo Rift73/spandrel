@@ -1515,7 +1515,7 @@ class RegionalChannelAttention(nn.Module):
             self.regional_na
             and (h > 16 or w > 16)
             and q.shape[1] // self.heads == 32
-            and _na_forms_available(self, q)
+            and _na_forms_available(self, q, self.qkv.weight)
         ):
             return self._mix_na(q, k, v)
         result = None
@@ -1770,27 +1770,27 @@ class EDBBReparamConv3x3(nn.Module):
 _ROUTING_REACH = 96
 
 
-def _na_forms_available(module: nn.Module, x: Tensor) -> bool:
+def _na_forms_available(module: nn.Module, x: Tensor, weight: Tensor) -> bool:
     """Whether a routed convolution (routing_na) or a regional channel attention
-    (regional_na, x = its q) takes its per-position form in this call, decided in the
-    caller's context, so that one call takes both or neither: eager inference on an
-    NVIDIA GPU with Triton
-    importable, the convolution running in BF16 (the precision of RDUAL's kernels,
-    which run_clip and run_window give the trunk by autocast: FP32 or BF16 features;
-    autocast leaves FP64 alone, which keeps the image routing). Whether NA_TRITON then
-    lets the kernels run or not (after a kernel failed, spandrel's fallback runs the
-    call again with it off), the form is the same; elsewhere the image routing runs."""
+    (regional_na; x its q) takes its per-position form in this call: eager inference
+    on an NVIDIA GPU with Triton importable, the site computing in BF16 (the precision
+    of RDUAL's kernels, which run_clip and run_window give the trunk by autocast). The
+    precision is that of the site's weight (FP32 or BF16; FP16 and FP64 keep the image
+    routing and the blend, autocast leaves FP64 alone) and of the caller's context, not
+    of x, so one call decides alike at every site of a model: both forms or neither.
+    Whether NA_TRITON then lets the kernels run or not (after a kernel failed,
+    spandrel's fallback runs the call again with it off), the form is the same."""
     cuda = x.device.type == "cuda"
     dtype = (
         torch.get_autocast_dtype("cuda")
         if cuda and torch.is_autocast_enabled("cuda")
-        else x.dtype
+        else weight.dtype
     )
     return (
         na_local_triton.AVAILABLE
         and cuda
         and torch.version.hip is None
-        and x.dtype in (torch.float32, torch.bfloat16)
+        and weight.dtype in (torch.float32, torch.bfloat16)
         and dtype == torch.bfloat16
         and not module.training
         and not torch.is_grad_enabled()
@@ -1830,7 +1830,7 @@ class DynamicRouter(nn.Module):
         na = (
             self.routing_na
             and (height > _ROUTING_REACH or width > _ROUTING_REACH)
-            and _na_forms_available(self, x)
+            and _na_forms_available(self, x, self.fc1.weight)
         )
         # one mean per distinct window; positions sharing one share its route
         ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)

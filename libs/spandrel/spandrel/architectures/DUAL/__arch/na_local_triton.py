@@ -649,24 +649,37 @@ def neighborhood_starts(length: int, k: int, device: torch.device) -> torch.Tens
     return (torch.arange(length, device=device) - k // 2).clamp(0, length - k)
 
 
+# elements of x per channel block of plain_neighborhood_means
+PLAIN_MEANS_ELEMENTS = 2**24
+
+
 def plain_neighborhood_means(
     x: torch.Tensor, ky: int, kx: int, dtype: torch.dtype
 ) -> torch.Tensor:
     """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
     column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype.
     Differences of FP64 cumulative sums along each axis, one pass per axis whatever
-    the window (FP32 running sums over a whole row would lose digits), taken in place:
-    at most two FP64 maps of x's size are held."""
-    height, width = x.shape[-2:]
-    sums = x.to(torch.float64, copy=True).cumsum_(2)
-    rows = sums[:, :, ky - 1 :].clone()
-    rows[:, :, 1:] -= sums[:, :, : height - ky]
-    del sums
-    rows.cumsum_(3)
-    means = rows[..., kx - 1 :].clone()
-    means[..., 1:] -= rows[..., : width - kx]
-    del rows
-    return (means / (ky * kx)).to(dtype).permute(0, 2, 3, 1)
+    the window (FP32 running sums over a whole row would lose digits), taken in place
+    and per block of channels of about PLAIN_MEANS_ELEMENTS elements of x (channels
+    are independent): at most two FP64 maps of one block are held."""
+    batch, channels, height, width = x.shape
+    out = torch.empty(
+        (batch, channels, height - ky + 1, width - kx + 1),
+        dtype=dtype,
+        device=x.device,
+    )
+    block = max(1, PLAIN_MEANS_ELEMENTS // (batch * height * width))
+    for first in range(0, channels, block):
+        sums = x[:, first : first + block].to(torch.float64, copy=True).cumsum_(2)
+        rows = sums[:, :, ky - 1 :].clone()
+        rows[:, :, 1:] -= sums[:, :, : height - ky]
+        del sums
+        rows.cumsum_(3)
+        means = rows[..., kx - 1 :].clone()
+        means[..., 1:] -= rows[..., : width - kx]
+        del rows
+        out[:, first : first + block] = means / (ky * kx)
+    return out.permute(0, 2, 3, 1)
 
 
 # positions per block of plain_routed_sum's FP32 sums

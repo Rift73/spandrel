@@ -848,7 +848,9 @@ def test_run_window_routes_per_position_like_a_reference(monkeypatch):
         spread = 0.0
         for conv, x, out in seen:
             expected, coefficients = _per_position_forward(conv, x)
-            routes = conv.router(x)
+            # the router under the model run's autocast, as the site called it
+            with torch.autocast("cuda", torch.bfloat16):
+                routes = conv.router(x)
             assert routes.shape[-2:] == x.shape[-2:]
             # the routes match the reference's to FP32 rounding
             spread = max(spread, coefficients.std((1, 2)).max().item())
@@ -1087,3 +1089,67 @@ def test_a_regional_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
         actual, _ = run_window(model, frames, 2)
     assert not rdual_arch.NA_TRITON
     assert torch.equal(actual, expected)
+
+
+# bands of 3 rows over 10 (a partial last band), batch 2, both layouts: the banded
+# blend is the whole tensor's expression bit for bit
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_plain_routed_sum_in_bands_is_the_whole_expression(monkeypatch, channels_last):
+    torch.manual_seed(0)
+    count, channels, height, width = 3, 16, 10, 12
+    layout = torch.channels_last if channels_last else torch.contiguous_format
+    parts = torch.randn(2, (count + 1) * channels, height, width).bfloat16()
+    parts = parts.contiguous(memory_format=layout)
+    coefficients = torch.randn(2, height, width, count + 1).permute(0, 3, 1, 2)
+    coefficients = coefficients[:, :count]
+    split = parts.float().unflatten(1, (count + 1, channels))
+    expected = (split[:, 0] + (coefficients[:, :, None] * split[:, 1:]).sum(1)).to(
+        parts.dtype
+    )
+    monkeypatch.setattr(na_local_triton, "PLAIN_ROUTED_POSITIONS", 3 * width)
+    actual = na_local_triton.plain_routed_sum(
+        parts, coefficients, torch.float32, layout
+    )
+    assert torch.equal(actual, expected)
+    assert actual.is_contiguous(memory_format=layout)
+
+
+# channel blocks of 3 over 7 (a partial last block), batch 2, both layouts, FP32 and
+# BF16 input: the blocked means are the unblocked ones bit for bit, and the window means
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_plain_neighborhood_means_in_channel_blocks(monkeypatch, dtype, channels_last):
+    torch.manual_seed(0)
+    x = (torch.randn(2, 7, 30, 20) * 10).to(dtype)
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last)
+    whole = na_local_triton.plain_neighborhood_means(x, 9, 6, torch.float32)
+    monkeypatch.setattr(na_local_triton, "PLAIN_MEANS_ELEMENTS", 3 * 2 * 30 * 20)
+    blocked = na_local_triton.plain_neighborhood_means(x, 9, 6, torch.float32)
+    assert torch.equal(blocked, whole)
+    windows = torch.nn.functional.avg_pool2d(x.double(), (9, 6), 1).permute(0, 2, 3, 1)
+    torch.testing.assert_close(blocked.double(), windows, rtol=2**-23, atol=1e-6)
+
+
+# the form follows the site's weights and the call's context, never the features'
+# dtype, so every site of a model decides alike: FP32 weights under BF16 autocast route
+# per position for FP16, BF16 and FP32 features; FP16 weights keep the image routing
+# (an FP16 RDUAL does not run run_window at all: its flow takes FP32 frames)
+@needs_kernel
+def test_routing_and_regional_na_follow_the_weights_not_the_features():
+    conv, rca = _gpu_routed_conv(32), _gpu_regional(64)
+    x = torch.randn(1, 64, 97, 40, device="cuda")
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+        for half in (False, True):
+            if half:
+                conv.half()
+                rca.half()
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                features = x.to(dtype)
+                routes = conv.router(features[:, :32])
+                assert (routes.shape[-2:] == (1, 1)) == half
+                q, k, v = features, features, features
+                rca.regional_na = False
+                blend = rca.mix(q, k, v)
+                rca.regional_na = True
+                assert torch.equal(rca.mix(q, k, v), blend) == half
