@@ -604,11 +604,16 @@ def test_retrieval_na_kernel_matches_the_pytorch_form(
     torch.testing.assert_close(actual, expected, rtol=0, atol=2e-2)
 
 
+def _routers(model: RDUAL):
+    return [m for m in model.modules() if isinstance(m, rdual_arch.DynamicRouter)]
+
+
 def test_routing_na_is_on_by_default_and_on_loading():
-    assert not _model(scale=2, routing_na=False).groups[0].conv.router.routing_na
+    off = _routers(_model(scale=2, routing_na=False))
+    assert len(off) == 4 and not any(router.routing_na for router in off)
     model = RDUALArch().load(_model(scale=2).state_dict()).model
     assert model.routing_na
-    routers = [m for m in model.modules() if isinstance(m, rdual_arch.DynamicRouter)]
+    routers = _routers(model)
     assert len(routers) == 4 and all(router.routing_na for router in routers)
     with pytest.raises(ValueError, match="routing_na must be a bool"):
         _model(scale=2, routing_na=1)
@@ -756,8 +761,9 @@ def test_routing_na_stays_off_up_to_96_and_outside_bf16_inference(monkeypatch):
 def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
     torch.manual_seed(0)
     model = _model(scale=2).cuda().eval()
-    for conv in (group.conv for group in model.groups):
-        conv.experts.data.normal_(0, 0.05)
+    for conv in model.modules():
+        if isinstance(conv, rdual_arch.PremixedDynamicGroupConv3x3):
+            conv.experts.data.normal_(0, 0.05)
     frames = torch.rand(1, 2, 3, 208, 200, device="cuda")
     model.temporal.backend = "reference"
     monkeypatch.setattr(rdual_arch, "NA_TRITON", False)
@@ -777,7 +783,7 @@ def test_a_routing_kernel_failure_falls_back_to_the_pytorch_form(monkeypatch):
     assert torch.equal(actual, expected)
     with torch.inference_mode():
         model.routing_na = False
-        for router in (group.conv.router for group in model.groups):
+        for router in _routers(model):
             router.routing_na = False
         image, _ = run_window(model, frames, 2)
     assert not torch.equal(image, expected)
