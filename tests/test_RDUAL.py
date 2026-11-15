@@ -476,20 +476,22 @@ def _counted(monkeypatch, name):
     return calls
 
 
-# regional_na is off by default: the regional kernel never launches, the routing
-# kernels do
+# by default both per-position forms run where their kernels run: the routing and the
+# regional kernels launch; with regional_na off only the routing kernels do
 @needs_kernel
-def test_by_default_rdual_runs_no_regional_kernel(monkeypatch):
+def test_by_default_rdual_runs_the_routing_and_regional_kernels(monkeypatch):
     regional = _counted(monkeypatch, "regional_na")
     routed = _counted(monkeypatch, "routed_sum")
-    model = _model(scale=2).cuda().eval()
-    assert not any(m.regional_na for m in _regionals(model))
-    with torch.inference_mode():
-        run_clip(model, torch.rand(1, 2, 3, 208, 200, device="cuda"))
-        run_clip(
-            model.bfloat16(), torch.rand(1, 1, 3, 208, 200, device="cuda").bfloat16()
-        )
-    assert not regional and routed
+    frames = torch.rand(1, 2, 3, 208, 200, device="cuda")
+    for regional_na in (True, False):
+        regional.clear()
+        routed.clear()
+        model = _model(scale=2, regional_na=regional_na).cuda().eval()
+        assert all(m.regional_na == regional_na for m in _regionals(model))
+        with torch.inference_mode():
+            run_clip(model, frames)
+            run_clip(model.bfloat16(), frames[:, :1].bfloat16())
+        assert bool(regional) == regional_na and routed
 
 
 def _local_attention(channels):
@@ -902,14 +904,16 @@ def _regionals(model: RDUAL):
     ]
 
 
-def test_regional_na_is_off_by_default_and_on_loading():
+def test_regional_na_is_on_by_default_and_on_loading():
     default = _regionals(_model(scale=2))
-    assert default and not any(m.regional_na for m in default)
+    assert default and all(m.regional_na for m in default)
     model = RDUALArch().load(_model(scale=2).state_dict()).model
-    assert not model.regional_na
-    assert not any(m.regional_na for m in _regionals(model))
-    on = _model(scale=2, regional_na=True)
-    assert on.regional_na and all(m.regional_na for m in _regionals(on))
+    hyperparameters = vars(model)["hyperparameters"]
+    assert model.regional_na and hyperparameters["regional_na"]
+    assert hyperparameters["routing_na"]
+    assert all(m.regional_na for m in _regionals(model))
+    off = _model(scale=2, regional_na=False)
+    assert not off.regional_na and not any(m.regional_na for m in _regionals(off))
     with pytest.raises(ValueError, match="regional_na must be a bool"):
         _model(scale=2, regional_na=1)
 

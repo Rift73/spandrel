@@ -101,12 +101,13 @@ Contents:
     training, export) and on maps of at most 96 positions per axis, the image
     routing runs as with the switch off. No parameter or key changes.
 
-    spandrel: regional_na (default False) gives the regional channel attention
+    spandrel: regional_na (default True) gives the regional channel attention
     DUAL's per-position form under the same gate: each position's channel
     attention (Gram, lengths + count * 1e-6, cosine * tau, softmax) comes from
     its own clamped 32x32 neighborhood and is applied to its own v. With both
-    switches on, a call takes both per-position forms or neither. Maps of at
-    most 16 positions per axis keep the blend. No parameter or key changes.
+    switches on, a call takes both per-position forms or neither: where the
+    kernels run, both; elsewhere the released image routing and blend. Maps of
+    at most 16 positions per axis keep the blend. No parameter or key changes.
 
 Execution:
     Eager execution, evaluation, CPU and export use SDPA throughout.
@@ -4581,7 +4582,7 @@ class RDUAL(nn.Module):
         local_na: bool = True,
         retrieval_na: bool = True,
         routing_na: bool = True,
-        regional_na: bool = False,
+        regional_na: bool = True,
     ) -> None:
         super().__init__()
         if type(use_checkpoint) is not bool:
