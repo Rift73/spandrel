@@ -7,6 +7,7 @@ import torch
 
 from spandrel import MAIN_REGISTRY
 from spandrel.architectures.MoSR import MoSR
+from spandrel.architectures.RSR import RSR
 from spandrel.architectures.SPAN import SPAN
 from spandrel.architectures.WSR import WESR, WideContextSR, WSRArch
 from spandrel.architectures.WSR.__arch.wsr_arch import (
@@ -122,12 +123,23 @@ def test_preset_tags(name: str):
     assert descriptor.tags[0] == name.split("-")[0]
 
 
-def test_window_is_not_in_the_weights():
-    # The attention window leaves no trace in the state dict: 64 is assumed.
-    torch.manual_seed(0)
-    model = WESR(window=32)
+@pytest.mark.parametrize("name", ["Default-x2", "Compact-x1", "Compact-x4"])
+def test_attention_is_halo(name: str):
+    # RSR reads one frame without neighbours with the same Halo attention: 32x32
+    # query tiles reading a 64x64 donor region across the tile borders.
+    model = _build(name)
+    options = {k: v for k, v in model.hyperparameters.items() if k != "use_xsa"}
+    rsr = RSR(**options).eval()
+    missing, unexpected = rsr.load_state_dict(model.state_dict(), strict=False)
+    assert not unexpected
+    assert all(key.startswith("attention.") for key in missing)
     descriptor = MAIN_REGISTRY.load(model.state_dict())
-    assert descriptor.model.hyperparameters == {**model.hyperparameters, "window": 64}
+
+    image = torch.rand(1, 3, 45, 70)
+    with torch.no_grad():
+        expected = rsr(image)
+        actual = descriptor.model(image)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("folded", [False, True], ids=["training", "folded"])

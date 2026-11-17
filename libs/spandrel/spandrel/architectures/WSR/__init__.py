@@ -98,8 +98,6 @@ class WSRArch(Architecture[_WSR]):
             model = WESR(
                 depth=depth,
                 gates=gates,
-                # cannot be deduced from the state dict (32 or 64)
-                window=64,
                 use_xsa=use_xsa,
                 width=width,
                 hidden=hidden,
