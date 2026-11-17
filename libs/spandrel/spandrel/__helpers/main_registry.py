@@ -22,6 +22,7 @@ from ..architectures import (
     RCAN,
     RDUAL,
     RGT,
+    RSR,
     SAFMN,
     SAFMNBCIE,
     SPAN,
@@ -114,6 +115,8 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(DUAL.DUALArch()),
     ArchSupport.from_architecture(SST.SSTArch()),
     ArchSupport.from_architecture(SST.SSTRealArch()),
+    # Before WSR: an RSR file holds all of a WSR Compact's weights as well.
+    ArchSupport.from_architecture(RSR.RSRArch()),
     ArchSupport.from_architecture(WSR.WSRArch()),
     ArchSupport.from_architecture(FIGSR.FIGSRArch()),
     ArchSupport.from_architecture(GFISRv2.GFISRv2Arch()),

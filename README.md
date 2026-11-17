@@ -1,6 +1,6 @@
 # Spandrel
 
-> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with ten more architectures: DRFT, DUAL, RDUAL, SST (with SST-Real), WSR, GaterV3, SMoSR, FIGSR, GFISRv2 and HEART. On ROCm builds of PyTorch (Windows and Linux) it runs depthwise 3x3 convolutions and ESRGAN's dense blocks on HIP kernels adapted from [florentia-mysteria/spandrel-rocm](https://github.com/florentia-mysteria/spandrel-rocm) (MIT); see `spandrel.rocm`. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
+> **Fork for [chaiNNer-C](https://github.com/Rift73/chaiNNer-C).** This is spandrel 0.4.2 from [chaiNNer-org/spandrel](https://github.com/chaiNNer-org/spandrel) with eleven more architectures: DRFT, DUAL, RDUAL, SST (with SST-Real), WSR, RSR, GaterV3, SMoSR, FIGSR, GFISRv2 and HEART. On ROCm builds of PyTorch (Windows and Linux) it runs depthwise 3x3 convolutions and ESRGAN's dense blocks on HIP kernels adapted from [florentia-mysteria/spandrel-rocm](https://github.com/florentia-mysteria/spandrel-rocm) (MIT); see `spandrel.rocm`. Its wheel is attached to this fork's [releases](https://github.com/Rift73/spandrel/releases); it is not on PyPI.
 
 [![PyPI package](https://img.shields.io/badge/pip%20install-spandrel-brightgreen)](https://pypi.org/project/spandrel/)
 [![version number](https://img.shields.io/pypi/v/spandrel?color=green&label=version)](https://github.com/chaiNNer-org/spandrel/releases)
@@ -116,6 +116,7 @@ Spandrel currently supports a limited amount of network architectures. If the ar
 - [AuraSR](https://github.com/fal-ai/aura-sr) | Models: [v1](https://huggingface.co/fal/AuraSR) | [v2](https://huggingface.co/fal/AuraSR-v2)
 - DRFT, DUAL and WSR (this fork)
 - RDUAL (this fork): a video model, DUAL Light with a temporal stage guided by a bundled [NeuFlow v2](https://github.com/neufieldrobotics/NeuFlow_v2) (Apache-2.0); `spandrel.architectures.RDUAL.run_clip` upscales a clip, and a single image is a clip of one frame
+- RSR (this fork): a video model, WSR Compact whose attention stage also reads the states of the neighbouring frames (no optical flow); `spandrel.architectures.RSR.run_clip` upscales a clip, `run_window` a window of one, and a single image is one frame without neighbours
 - [SST](https://github.com/dslisleedh/SST) and SST-Real | [Models](https://github.com/dslisleedh/SST/tree/main/pretrained_models)
 - [FIGSR](https://github.com/enhancr/figsr)
 - [GFISRv2](https://github.com/umzi2/gfisrv2)
