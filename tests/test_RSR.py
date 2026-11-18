@@ -6,7 +6,13 @@ import pytest
 import torch
 
 from spandrel import MAIN_REGISTRY
-from spandrel.architectures.RSR import RSR, RSRArch, run_clip, run_window
+from spandrel.architectures.RSR import (
+    RSR,
+    RSRArch,
+    flow_working_factor,
+    run_clip,
+    run_window,
+)
 from spandrel.architectures.RSR.__arch.rsr_arch import rsr_compact
 from spandrel.architectures.WSR.__arch.wsr_arch import wsr_compact
 
@@ -149,11 +155,12 @@ def test_window_covering_the_clip_is_the_clip():
     frames = torch.rand(2, 5, 3, 29, 37)
     with torch.inference_mode():
         clip = run_clip(model, frames)
-        window, (state, encoded) = run_window(model, frames, 5)
+        window, (state, encoded, previous) = run_window(model, frames, 5)
     assert window.dtype == torch.float32
     assert window.shape == (2, 5, 3, 58, 74)
     assert state.shape == (2, 32, 29, 37)
     assert encoded == ()
+    assert previous is None
     torch.testing.assert_close(window, clip, rtol=0, atol=0)
 
 
@@ -221,3 +228,102 @@ def test_size_requirements():
                 descriptor.model, torch.rand(1, 2, 3, height, width), 2
             )
             assert output.shape == (1, 2, 3, 2 * height, 2 * width)
+
+
+# The aligned read: a flow-aligned read of the neighbours' states, blended in.
+
+
+def _aligned(blend: bool = True) -> RSR:
+    """An aligned Compact x2 with random weights everywhere; with blend False the
+    blends keep their initial zero values and the read adds nothing."""
+    torch.manual_seed(0)
+    model = rsr_compact(scale=2, temporal_read="aligned")
+    with torch.no_grad():
+        for key, parameter in model.named_parameters():
+            if blend or not key.startswith("blend_"):
+                parameter.add_(torch.randn_like(parameter) * 0.05 * (parameter == 0))
+        model.flow_loaded.fill_(True)
+    return model.eval()
+
+
+def test_aligned_is_detected_as_rsr():
+    state_dict = _aligned().state_dict()
+    assert "attention.null_key" not in state_dict
+    descriptor = MAIN_REGISTRY.load(state_dict)
+    assert descriptor.architecture.id == "RSR"
+    assert descriptor.model.temporal_read == "aligned"
+    assert "aligned" in descriptor.tags
+    assert descriptor.scale == 2
+    assert descriptor.model.blend_forward.weight.shape == (32, 96, 3, 3)
+    block = RSRArch().load(_build("Compact-x2").state_dict())
+    assert block.model.temporal_read == "block"
+    assert "aligned" not in block.tags
+
+
+def test_aligned_folded_equals_unfolded():
+    model = _aligned()
+    folded = RSRArch().load(model.state_dict()).model
+    assert folded.deploy
+    frames = torch.rand(1, 3, 3, 32, 40)
+    with torch.inference_mode():
+        torch.testing.assert_close(
+            run_clip(folded, frames), run_clip(model, frames), rtol=0, atol=1e-4
+        )
+
+
+def test_aligned_zero_blends_are_the_per_frame_model():
+    model = RSRArch().load(_aligned(blend=False).state_dict()).model
+    frames = torch.rand(1, 3, 3, 32, 40)
+    with torch.inference_mode():
+        clip = run_clip(model, frames)
+        alone = torch.stack([model(frames[:, t]) for t in range(3)], 1)
+    torch.testing.assert_close(clip, alone, rtol=0, atol=1e-5)
+
+
+def test_aligned_window_covering_the_clip_is_the_clip():
+    model = RSRArch().load(_aligned().state_dict()).model
+    frames = torch.rand(1, 4, 3, 32, 40)
+    with torch.inference_mode():
+        clip = run_clip(model, frames)
+        alone = torch.stack([model(frames[:, t]) for t in range(4)], 1)
+        window, (_, encoded, previous) = run_window(model, frames, 4)
+    assert (clip - alone).abs().amax() > 1e-3
+    assert encoded == ()
+    assert previous is not None
+    torch.testing.assert_close(previous, frames[:, 3:4], rtol=0, atol=0)
+    torch.testing.assert_close(window, clip, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("size", "keep"), [(4, 3), (3, 1)])
+def test_aligned_chained_windows_are_infer(size: int, keep: int):
+    model = RSRArch().load(_aligned().state_dict()).model
+    frames = torch.rand(1, 6, 3, 32, 40)
+    outputs = []
+    past = None
+    with torch.inference_mode():
+        expected = model.infer(frames, chunk=keep, lookahead=size - keep)
+        for start in range(0, 6, keep):
+            window = frames[:, start : start + size]
+            count = min(keep, window.shape[1])
+            output, past = run_window(model, window, count, past)
+            outputs.append(output)
+    torch.testing.assert_close(torch.cat(outputs, 1), expected, rtol=0, atol=0)
+
+
+def test_aligned_reduced_precision():
+    model = RSRArch().load(_aligned().state_dict()).model
+    frames = torch.rand(1, 3, 3, 32, 40)
+    with torch.inference_mode():
+        expected, _ = run_window(model, frames, 3)
+        actual, _ = run_window(model.to(torch.bfloat16), frames, 3)
+    assert actual.dtype == torch.float32
+    assert model.flow_loaded.dtype == torch.bool
+    assert all(p.dtype == torch.float32 for p in model.flow.parameters())
+    assert model.blend_forward.weight.dtype == torch.bfloat16
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.1)
+
+
+def test_flow_working_factor():
+    assert flow_working_factor(240, 320) == 1
+    assert flow_working_factor(1080, 1920) == 4

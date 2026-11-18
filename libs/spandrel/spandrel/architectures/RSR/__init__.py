@@ -10,12 +10,21 @@ from spandrel.util import KeyCondition, get_seq_len
 from ...__helpers.model_descriptor import Architecture, ImageModelDescriptor, StateDict
 from ..WSR import _channels, _conv3xc, _rgb5
 from .__arch.rsr_arch import RSR
+from .__arch.rsr_arch import flow_working_factor as _flow_working_factor
 
-# What a window carries to the next: the forward state of its last kept frame
-# and the encodings of the frames after it.
+# What a window carries to the next: the forward state of its last kept frame,
+# the encodings of the frames after it and, for the aligned read, the last kept
+# input frame (the flow into the next window's first frame starts from it).
 _Carry = tuple[
-    torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]
+    torch.Tensor,
+    tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
+    torch.Tensor | None,
 ]
+
+
+def flow_working_factor(height: int, width: int) -> int:
+    """The factor an aligned RSR reduces H,W frames by before its optical flow."""
+    return _flow_working_factor(height, width)
 
 
 def run_clip(model: RSR, frames: torch.Tensor) -> torch.Tensor:
@@ -39,32 +48,57 @@ def run_window(
     reverse sweep starts at the window's last frame, which has no future; the
     forward sweep reads `past`'s state at the first frame. A window covering a whole
     clip with keep = T equals run_clip(), and chained windows equal
-    RSR.infer(chunk=keep, lookahead=T - keep)."""
+    RSR.infer(chunk=keep, lookahead=T - keep).
+
+    The aligned read computes the window's flow in one call, in FP32, over its
+    frames and the last kept frame of the previous window, which `past` holds."""
     count = frames.shape[1]
     if not 1 <= keep <= count:
         raise ValueError(f"RSR: keep must be in 1..{count}, got {keep}")
     clip = list(frames.to(model.reconstruct.weight.dtype).unbind(1))
-    state, carried = (None, ()) if past is None else past
+    state, carried, previous = (None, (), None) if past is None else past
     if len(carried) > count:
         raise ValueError(
             f"RSR: the carry holds {len(carried)} encoded frames, the window only {count}"
         )
     encoded = [*carried, *(model.encode(frame) for frame in clip[len(carried) :])]
 
+    guidance: torch.Tensor | None = None
+    if model.temporal_read == "aligned":
+        flow_frames = frames if previous is None else torch.cat((previous, frames), 1)
+        guidance = model.guidance(flow_frames.float())[
+            :, flow_frames.shape[1] - count :
+        ]
+
+    def guide(t: int, side: int) -> torch.Tensor | None:
+        return None if guidance is None else guidance[:, t, side]
+
     reverse: list[torch.Tensor | None] = [None] * (count + 1)
     for t in range(count - 1, 0, -1):
         _, reverse[t] = model.step_encoded(
-            clip[t], encoded[t], future=reverse[t + 1], output=False
+            clip[t],
+            encoded[t],
+            future=reverse[t + 1],
+            future_guidance=guide(t, 1),
+            output=False,
+            reverse=True,
         )
     outputs: list[torch.Tensor] = []
     for t in range(keep):
         _, state = model.step_encoded(
-            clip[t], encoded[t], state, reverse[t + 1], output=False
+            clip[t],
+            encoded[t],
+            state,
+            reverse[t + 1],
+            past_guidance=guide(t, 0),
+            future_guidance=guide(t, 1),
+            output=False,
         )
         outputs.append(model.head(clip[t], state).float())
     # keep >= 1, so the forward sweep set the state
     assert state is not None
-    return torch.stack(outputs, dim=1), (state, tuple(encoded[keep:]))
+    last = frames[:, keep - 1 : keep] if model.temporal_read == "aligned" else None
+    return torch.stack(outputs, dim=1), (state, tuple(encoded[keep:]), last)
 
 
 class RSRArch(Architecture[RSR]):
@@ -88,11 +122,23 @@ class RSRArch(Architecture[RSR]):
                 "attention.logit_scale",
                 "reconstruct.weight",
                 _rgb5("base"),
-                # the temporal read of the neighbouring frames' states
-                "attention.key_value_past.weight",
-                "attention.key_value_future.weight",
-                "attention.null_key",
-                "attention.temporal_gain",
+                # the temporal read of the neighbouring frames' states: block
+                # tokens in the Halo attention, or a flow-aligned read
+                KeyCondition.has_any(
+                    KeyCondition.has_all(
+                        "attention.key_value_past.weight",
+                        "attention.key_value_future.weight",
+                        "attention.null_key",
+                        "attention.temporal_gain",
+                    ),
+                    KeyCondition.has_all(
+                        "blend_reverse.weight",
+                        "blend_forward.weight",
+                        "confidence_past",
+                        "confidence_future",
+                        "flow_loaded",
+                    ),
+                ),
             ),
         )
 
@@ -109,6 +155,7 @@ class RSRArch(Architecture[RSR]):
         gates = get_seq_len(state_dict, "gates")
         heads = state_dict["attention.logit_scale"].shape[0]
         scale = math.isqrt(state_dict["reconstruct.weight"].shape[0] // 3)
+        temporal_read = "aligned" if "blend_forward.weight" in state_dict else "block"
 
         model = RSR(
             depth=depth,
@@ -118,9 +165,12 @@ class RSRArch(Architecture[RSR]):
             context_width=context_width,
             heads=heads,
             scale=scale,
+            temporal_read=temporal_read,
         )
 
         tags = [f"{width}nf", f"{depth}nb", "temporal"]
+        if temporal_read == "aligned":
+            tags.append("aligned")
         if (width, hidden, depth, gates, context_width, heads) == (32, 64, 9, 3, 64, 1):
             tags.insert(0, "Compact")
 
@@ -155,4 +205,4 @@ class RSRArch(Architecture[RSR]):
         return descriptor
 
 
-__all__ = ["RSRArch", "RSR", "run_clip", "run_window"]
+__all__ = ["RSRArch", "RSR", "flow_working_factor", "run_clip", "run_window"]

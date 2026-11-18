@@ -17,6 +17,16 @@ exactly zero: a WSR Compact checkpoint loads non-strictly and RSR then equals
 WSR Compact per frame until training opens the values. A 4-D input is one
 frame without neighbours and is identical to WSR Compact.
 
+temporal_read="aligned" replaces the block read: the Halo stage does the
+frame's own read only, then reads each neighbour's bounded state tanh(state)
+at full resolution, moved into place by optical flow from a frozen NeuFlow v2
+(flow.*, saved with the checkpoint, never trained) and weighted by a
+forward-backward consistency confidence. One zero-initialized 3x3 blend per
+sweep adds the reads to the trunk, so an aligned model also starts equal to
+WSR Compact. Guidance (B,T,2,3,h,w) holds per frame, for the past [:, :, 0]
+and the future [:, :, 1] neighbour, the flow in pixels of the flow grid h,w
+and the inconsistency in frame pixels; guidance() computes it.
+
 Keep training checkpoints unfolded. For deployment, make a separate copy,
 call eval(), then prepare_for_export(). This conversion is in-place and is
 not reversible.
@@ -676,10 +686,12 @@ Encoded = tuple[Tensor, ...]
 class StepFunctions(NamedTuple):
     """The per-frame callables of a clip, eager or compiled.
 
-    full(frame, encoded, past, past_valid, future, future_valid) returns
-    (output, state); reverse(encoded, future, future_valid) and
-    forward_state(encoded, past, past_valid, future, future_valid) return the
-    state only.
+    full(frame, encoded, past, past_valid, future, future_valid,
+    past_guidance, future_guidance) returns (output, state);
+    reverse(encoded, future, future_valid, future_guidance) and
+    forward_state(encoded, past, past_valid, future, future_valid,
+    past_guidance, future_guidance) return the state only. The guidance
+    arguments are None for the block read.
     """
 
     encode: Callable[[Tensor], Encoded]
@@ -701,6 +713,43 @@ def _gradient(x: Tensor) -> Tensor:
     """The gradient an encoded leaf collected over the sweeps."""
     assert x.grad is not None
     return x.grad
+
+
+# Inconsistency, in frame pixels, of a position whose flow leaves the frame
+_OUT_OF_FRAME = 1000.0
+
+
+def flow_working_factor(height: int, width: int) -> int:
+    """The largest f in (1, 2, 4, 8) with min(height, width) / f >= 256, else 1."""
+    short = min(height, width)
+    return max((f for f in (1, 2, 4, 8) if short / f >= 256), default=1)
+
+
+def _inconsistency(
+    flow: Tensor, back: Tensor, scale_x: float, scale_y: float
+) -> Tensor:
+    """N,1,h,w forward-backward inconsistency |flow(p) + back(p + flow(p))|.
+
+    flow and back are N,2,h,w flows in pixels of their grid, flow on the grid
+    of the frame it maps from and back on the other; the result is in frame
+    pixels (x times scale_x, y times scale_y). A position whose flow leaves
+    the frame gets _OUT_OF_FRAME.
+    """
+    # RDUAL's module imports Triton and Flex attention: aligned read only.
+    from ...RDUAL.__arch.rdual_arch import warp_image
+
+    height, width = flow.shape[-2:]
+    loop = flow + warp_image(back, flow)
+    error = torch.hypot(loop[:, 0] * scale_x, loop[:, 1] * scale_y)
+    y, x = torch.meshgrid(
+        torch.arange(height, dtype=flow.dtype, device=flow.device),
+        torch.arange(width, dtype=flow.dtype, device=flow.device),
+        indexing="ij",
+    )
+    x, y = x + flow[:, 0], y + flow[:, 1]
+    # The frame covers [-0.5, size - 0.5] around its pixel centres.
+    outside = (x < -0.5) | (x > width - 0.5) | (y < -0.5) | (y > height - 0.5)
+    return error.masked_fill(outside, _OUT_OF_FRAME)[:, None]
 
 
 class TemporalBlockTokenAttention(BlockTokenAttention):
@@ -841,6 +890,10 @@ class RSR(WESR):
     (the trunk after the last gate, the tensor that enters reconstruct) and
     optionally the image. forward() accepts one frame (B,3,H,W) or a clip
     (B,T,3,H,W); infer() gives the clip result for long videos in chunks.
+
+    temporal_read "block" reads neighbours through block tokens in the Halo
+    attention; "aligned" reads them through flow after the frame's own Halo
+    read, with the guidance computed by guidance() when none is passed.
     """
 
     def __init__(
@@ -855,6 +908,7 @@ class RSR(WESR):
         num_in_ch: int = 3,
         num_out_ch: int = 3,
         scale: int = 4,
+        temporal_read: Literal["block", "aligned"] = "block",
     ) -> None:
         super().__init__(
             depth=depth,
@@ -875,7 +929,162 @@ class RSR(WESR):
             raise ValueError(
                 "RSR requires the merge before the Halo stage and merged context after it"
             )
-        self.attention = TemporalBlockTokenAttention(channels=width, heads=heads)
+        if temporal_read not in ("block", "aligned"):
+            raise ValueError(
+                f"temporal_read must be 'block' or 'aligned', not {temporal_read!r}"
+            )
+        self.temporal_read = temporal_read
+        if temporal_read == "block":
+            self.attention = TemporalBlockTokenAttention(channels=width, heads=heads)
+            return
+        # The reverse sweep reads the future, the forward sweep both neighbours.
+        self.blend_reverse = nn.Conv2d(2 * width, width, 3, padding=1)
+        self.blend_forward = nn.Conv2d(3 * width, width, 3, padding=1)
+        for blend in (self.blend_reverse, self.blend_forward):
+            nn.init.zeros_(blend.weight)
+            nn.init.zeros_(blend.bias)
+        # softplus(k) starts at 0.5 for both neighbours.
+        start = math.log(math.expm1(0.5))
+        self.confidence_past = nn.Parameter(torch.tensor(start))
+        self.confidence_future = nn.Parameter(torch.tensor(start))
+        # The frozen flow estimator comes last, on a forked RNG, so a seed still
+        # gives every other initial weight; load_flow_weights() fills it.
+        # RDUAL's module imports Triton and Flex attention: aligned read only.
+        from ...RDUAL.__arch.rdual_arch import NeuFlowV2
+
+        with torch.random.fork_rng(devices=[]):
+            self.flow = NeuFlowV2()
+        self.flow.requires_grad_(False)
+        self.flow.eval()
+        self.register_buffer("flow_loaded", torch.tensor(False))
+
+    def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> RSR:
+        # The frozen flow estimator follows the model's device but stays in
+        # FP32 when the model is cast (half(), to(dtype)): guidance() runs FP32.
+        if self.temporal_read != "aligned" or not recurse:
+            return super()._apply(fn, recurse)
+        flow = self._modules.pop("flow")
+        try:
+            super()._apply(fn, recurse)
+        finally:
+            self._modules["flow"] = flow
+        device = fn(torch.empty(0, device=self.flow_loaded.device)).device
+        flow._apply(lambda t: t.to(device))
+        return self
+
+    def train(self, mode: bool = True) -> RSR:
+        super().train(mode)
+        if self.temporal_read == "aligned":
+            # The flow estimator stays in eval mode: its BatchNorm statistics are fixed.
+            self.flow.eval()
+        return self
+
+    def load_flow_weights(self, state_dict: dict[str, Tensor]) -> None:
+        """Load an upstream NeuFlow v2 state dict (no prefix) strictly into flow."""
+        self.flow.load_state_dict(state_dict, strict=True)
+        self.flow_loaded.fill_(True)
+
+    @torch.no_grad()
+    def guidance(self, frames: Tensor, shot_ids: Tensor | None = None) -> Tensor:
+        """The aligned read's guidance of a B,T,3,H,W clip in 0..1: B,T,2,3,h,w.
+
+        Entry [:, t, 0] reads frame t-1 into frame t and [:, t, 1] frame t+1:
+        the flow from frame t to that neighbour in x/y pixels of the h,w grid,
+        then its forward-backward inconsistency in frame pixels. Entries
+        without a neighbour (clip ends, a change of shot id) are zero, and no
+        flow is computed across a shot change.
+
+        The flow runs on frames reduced by flow_working_factor() to h,w =
+        round(H/f), round(W/f) (bilinear with antialiasing), in 0..255,
+        padded by replication to a multiple of 16 and at least 32 pixels a
+        side and cropped back. FP32 without gradients, with autocast and TF32
+        off inside and the caller's settings restored, on the model's device
+        in calls of at most _flow_pairs_per_call() pairs; the result is on the
+        frames' device.
+        """
+        if frames.ndim != 5 or frames.shape[2] != 3:
+            raise ValueError("RSR guidance expects B,T,3,H,W frames")
+        if not bool(self.flow_loaded):
+            raise RuntimeError(
+                "RSR has no NeuFlow v2 weights: call load_flow_weights() with the "
+                "upstream state dict, or pass a guidance tensor instead"
+            )
+        batch, count, _, height, width = frames.shape
+        factor = flow_working_factor(height, width)
+        flow_h, flow_w = max(1, round(height / factor)), max(1, round(width / factor))
+        result = torch.zeros((batch, count, 2, 3, flow_h, flow_w), device=frames.device)
+        if shot_ids is None:
+            linked = torch.ones(batch, count - 1, dtype=torch.bool)
+        else:
+            linked = (shot_ids[:, :-1] == shot_ids[:, 1:]).cpu()
+        # Pair k joins frames k % (T-1) and the next one of sample k // (T-1).
+        index = linked.flatten().nonzero().squeeze(1).to(frames.device)
+        if index.numel() == 0:
+            return result
+        device = self.flow_loaded.device
+        padded_h = max(32, (flow_h + 15) // 16 * 16)
+        padded_w = max(32, (flow_w + 15) // 16 * 16)
+        earlier = frames[:, :-1].flatten(0, 1)
+        later = frames[:, 1:].flatten(0, 1)
+        # RDUAL's module imports Triton and Flex attention: aligned read only.
+        from ...RDUAL.__arch.rdual_arch import _flow_pairs_per_call
+
+        pairs = _flow_pairs_per_call(padded_h, padded_w)
+        ahead = result.new_zeros((batch * (count - 1), 3, flow_h, flow_w))
+        behind = torch.zeros_like(ahead)
+        # The per-backend switches only: the global getters raise once a
+        # process has set one backend on its own.
+        matmul, conv = torch.backends.cuda.matmul, torch.backends.cudnn.conv
+        matmul_precision, conv_precision = matmul.fp32_precision, conv.fp32_precision
+        with torch.autocast(device.type, enabled=False):
+            matmul.fp32_precision = "ieee"
+            conv.fp32_precision = "ieee"
+            try:
+                for first in range(0, index.numel(), pairs):
+                    span = index[first : first + pairs]
+                    images = torch.cat((earlier[span], later[span]))
+                    images = images.to(device, torch.float32)
+                    if factor > 1:
+                        images = F.interpolate(
+                            images,
+                            size=(flow_h, flow_w),
+                            mode="bilinear",
+                            antialias=True,
+                            align_corners=False,
+                        ).clamp(0, 1)
+                    images = images * 255.0
+                    if (padded_h, padded_w) != (flow_h, flow_w):
+                        padding = (0, padded_w - flow_w, 0, padded_h - flow_h)
+                        images = F.pad(images, padding, mode="replicate")
+                    # Flow on the grid of the first image, towards the second.
+                    flow = self.flow(images, images.roll(span.numel(), 0))
+                    flow = flow[:, :, :flow_h, :flow_w]
+                    forward, backward = flow.split(span.numel())
+                    scale_x, scale_y = width / flow_w, height / flow_h
+                    ahead[span] = torch.cat(
+                        (forward, _inconsistency(forward, backward, scale_x, scale_y)),
+                        1,
+                    ).to(frames.device)
+                    behind[span] = torch.cat(
+                        (backward, _inconsistency(backward, forward, scale_x, scale_y)),
+                        1,
+                    ).to(frames.device)
+            finally:
+                matmul.fp32_precision = matmul_precision
+                conv.fp32_precision = conv_precision
+        result[:, :-1, 1] = ahead.view(batch, count - 1, 3, flow_h, flow_w)
+        result[:, 1:, 0] = behind.view(batch, count - 1, 3, flow_h, flow_w)
+        return result
+
+    def _clip_guidance(
+        self, frames: Tensor, shot_ids: Tensor | None, guidance: Tensor | None
+    ) -> Tensor | None:
+        """The guidance a clip runs with: None for the block read."""
+        if self.temporal_read == "block":
+            if guidance is not None:
+                raise ValueError("guidance is used with temporal_read='aligned' only")
+            return None
+        return self.guidance(frames, shot_ids) if guidance is None else guidance
 
     def encode(self, frame: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Run positions 1 to the Halo stage, excluding its attention and gate."""
@@ -908,11 +1117,27 @@ class RSR(WESR):
         future: Tensor | None = None,
         past_valid: Tensor | None = None,
         future_valid: Tensor | None = None,
+        past_guidance: Tensor | None = None,
+        future_guidance: Tensor | None = None,
         *,
         output: bool = True,
+        reverse: bool = False,
     ) -> tuple[Tensor | None, Tensor]:
-        """Finish one encoded frame; return (image or None, state)."""
-        state = self._state(encoded, past, future, past_valid, future_valid)
+        """Finish one encoded frame; return (image or None, state).
+
+        The guidance (B,3,h,w per neighbour) and reverse (a reverse-sweep step,
+        which reads the future only) are used by the aligned read.
+        """
+        state = self._state(
+            encoded,
+            past,
+            future,
+            past_valid,
+            future_valid,
+            past_guidance,
+            future_guidance,
+            reverse=reverse,
+        )
         if not output:
             return None, state
         return self.head(frame, state), state
@@ -924,12 +1149,37 @@ class RSR(WESR):
         future: Tensor | None,
         past_valid: Tensor | None,
         future_valid: Tensor | None,
+        past_guidance: Tensor | None,
+        future_guidance: Tensor | None,
+        *,
+        reverse: bool = False,
     ) -> Tensor:
         """Own and temporal Halo read, then the remaining blocks and gates."""
         current, c3, c4 = encoded
-        current = current + self.attention(
-            current, past, future, past_valid, future_valid
-        )
+        if self.temporal_read == "block":
+            current = current + self.attention(
+                current, past, future, past_valid, future_valid
+            )
+        else:
+            current = current + self.attention(current)
+            reads = [
+                self.aligned_read(
+                    current,
+                    future,
+                    future_valid,
+                    future_guidance,
+                    self.confidence_future,
+                )
+            ]
+            if not reverse:
+                reads.insert(
+                    0,
+                    self.aligned_read(
+                        current, past, past_valid, past_guidance, self.confidence_past
+                    ),
+                )
+            blend = self.blend_reverse if reverse else self.blend_forward
+            current = current + blend(torch.cat((current, *reads), dim=1))
         for position in range(self.xsa_position, self.depth + 1):
             if position > self.xsa_position:
                 current = self.blocks[position - 2](current)
@@ -937,6 +1187,63 @@ class RSR(WESR):
                 j, q = self.gate_at[position]
                 current = self.gates[j](current, (c3, c4)[q - 2])
         return current
+
+    @staticmethod
+    def aligned_read(
+        current: Tensor,
+        state: Tensor | None,
+        valid: Tensor | None,
+        guidance: Tensor | None,
+        confidence: Tensor,
+    ) -> Tensor:
+        """A neighbour's tanh(state) warped onto the frame, times its confidence.
+
+        guidance (B,3,h,w) is resized to the state's size (bilinear,
+        align_corners=False, flow times the size ratio); the state is sampled
+        bilinearly at p + flow with zeros outside the frame and weighted by
+        exp(-softplus(confidence) * inconsistency^2). Grid and sampling run in
+        FP32 (FP64 for double features) outside autocast; the read returns in
+        the features' dtype. An absent neighbour (None, or False in valid for
+        a sample) reads zero.
+        """
+        if state is None:
+            return torch.zeros_like(current)
+        if guidance is None:
+            raise ValueError("the aligned read of a neighbour needs its guidance")
+        height, width = current.shape[-2:]
+        precision = torch.promote_types(current.dtype, torch.float32)
+        bounded = torch.tanh(state)
+        with torch.autocast(device_type=current.device.type, enabled=False):
+            guide = guidance.to(precision)
+            flow_h, flow_w = guide.shape[-2:]
+            guide = F.interpolate(
+                guide, size=(height, width), mode="bilinear", align_corners=False
+            )
+            y, x = torch.meshgrid(
+                torch.arange(height, dtype=precision, device=guide.device),
+                torch.arange(width, dtype=precision, device=guide.device),
+                indexing="ij",
+            )
+            x = x + guide[:, 0] * (width / flow_w)
+            y = y + guide[:, 1] * (height / flow_h)
+            # align_corners=False: pixel i sits at (2i + 1) / size - 1.
+            grid = torch.stack(
+                ((2 * x + 1) / width - 1, (2 * y + 1) / height - 1), dim=-1
+            )
+            warped = F.grid_sample(
+                bounded.to(precision),
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+            weight = torch.exp(
+                -F.softplus(confidence.to(precision)) * guide[:, 2:].square()
+            )
+            read = weight * warped
+        if valid is not None:
+            read = torch.where(valid.view(-1, 1, 1, 1), read, 0.0)
+        return read.to(current.dtype)
 
     def head(self, frame: Tensor, state: Tensor) -> Tensor:
         """Reconstruct the image of a frame from its state."""
@@ -960,12 +1267,18 @@ class RSR(WESR):
         count: int,
         past: Tensor | None = None,
         past_valid: Tensor | None = None,
+        guidance: Tensor | None = None,
     ) -> tuple[list[Tensor], Tensor | None]:
         """Reverse sweep over the whole window, forward sweep over its first frames.
 
         links[t] is the validity between window frames t and t+1; past is the
         forward state of the frame before the window, valid per past_valid.
+        guidance (B,L,2,3,h,w), the window's, is given for the aligned read.
         """
+
+        def guide(t: int, side: int) -> Tensor | None:
+            return None if guidance is None else guidance[:, t, side]
+
         length = len(frames)
         reverse: list[Tensor | None] = [None] * (length + 1)
         for t in range(length - 1, 0, -1):
@@ -974,7 +1287,9 @@ class RSR(WESR):
                 encoded[t],
                 future=reverse[t + 1],
                 future_valid=links[t],
+                future_guidance=guide(t, 1),
                 output=False,
+                reverse=True,
             )
         outputs: list[Tensor] = []
         state = past
@@ -986,15 +1301,24 @@ class RSR(WESR):
                 reverse[t + 1],
                 past_valid if t == 0 else links[t - 1],
                 links[t],
+                guide(t, 0),
+                guide(t, 1),
                 output=False,
             )
             outputs.append(self.head(frames[t], state))
         return outputs, state
 
-    def forward(self, x: Tensor, shot_ids: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        shot_ids: Tensor | None = None,
+        guidance: Tensor | None = None,
+    ) -> Tensor:
         """One frame (B,3,H,W) without neighbours, or a clip (B,T,3,H,W).
 
         shot_ids (B,T), optional: no state crosses a change of shot id.
+        guidance (B,T,2,3,h,w), aligned read only: computed by guidance()
+        when None.
         """
         if x.ndim == 4:
             _, state = self.step_encoded(x, self.encode(x), output=False)
@@ -1007,6 +1331,7 @@ class RSR(WESR):
             [self.encode(frame) for frame in frames],
             self._links(shot_ids, 0, len(frames)),
             len(frames),
+            guidance=self._clip_guidance(x, shot_ids, guidance),
         )
         return torch.stack(outputs, dim=1)
 
@@ -1017,12 +1342,16 @@ class RSR(WESR):
         chunk: int = 16,
         lookahead: int = 8,
         shot_ids: Tensor | None = None,
+        guidance: Tensor | None = None,
     ) -> Tensor:
         """Clip result in bounded memory: chunks with a look-ahead reverse sweep.
 
         The forward state is carried across chunks; each chunk's reverse sweep
         starts lookahead frames past its end. Every frame is encoded once.
         Equals forward() exactly when chunk + lookahead covers the clip.
+        For the aligned read, guidance None computes each chunk's guidance
+        from its frames, the look-ahead and the frame before the chunk, so
+        the flow across a chunk edge exists; a tensor is sliced per chunk.
         """
         if frames.ndim != 5 or chunk < 1 or lookahead < 0:
             raise ValueError("infer expects (B,T,3,H,W), chunk >= 1, lookahead >= 0")
@@ -1041,6 +1370,13 @@ class RSR(WESR):
                 if shot_ids is None or start == 0
                 else shot_ids[:, start - 1] == shot_ids[:, start]
             )
+            # The frame before the chunk links the carried state through flow.
+            first = max(start - 1, 0)
+            window = self._clip_guidance(
+                frames[:, first:stop],
+                None if shot_ids is None else shot_ids[:, first:stop],
+                None if guidance is None else guidance[:, first:stop],
+            )
             chunk_outputs, past = self._sweep(
                 list(frames[:, start:stop].unbind(1)),
                 [encoded[t] for t in range(start, stop)],
@@ -1048,6 +1384,7 @@ class RSR(WESR):
                 end - start,
                 past,
                 past_valid,
+                None if window is None else window[:, start - first :],
             )
             outputs.extend(chunk_outputs)
             for t in range(start, end):
@@ -1061,22 +1398,36 @@ class RSR(WESR):
 
         compile is for example torch.compile or a functools.partial of it with a
         mode; None keeps every callable eager. They do not depend on the clip
-        length, so one set serves every clip.
+        length, so one set serves every clip. Each takes the guidance of the
+        neighbours it reads last (sg past, dg future; None for the block read).
         """
 
         def full(
-            x: Tensor, e: Encoded, s: Tensor, v: Tensor, d: Tensor, lv: Tensor
+            x: Tensor,
+            e: Encoded,
+            s: Tensor,
+            v: Tensor,
+            d: Tensor,
+            lv: Tensor,
+            sg: Tensor | None,
+            dg: Tensor | None,
         ) -> tuple[Tensor, Tensor]:
-            state = self._state(e, s, d, v, lv)
+            state = self._state(e, s, d, v, lv, sg, dg)
             return self.head(x, state), state
 
-        def reverse(e: Encoded, d: Tensor, lv: Tensor) -> Tensor:
-            return self._state(e, None, d, None, lv)
+        def reverse(e: Encoded, d: Tensor, lv: Tensor, dg: Tensor | None) -> Tensor:
+            return self._state(e, None, d, None, lv, None, dg, reverse=True)
 
         def forward_state(
-            e: Encoded, s: Tensor, v: Tensor, d: Tensor, lv: Tensor
+            e: Encoded,
+            s: Tensor,
+            v: Tensor,
+            d: Tensor,
+            lv: Tensor,
+            sg: Tensor | None,
+            dg: Tensor | None,
         ) -> Tensor:
-            return self._state(e, s, d, v, lv)
+            return self._state(e, s, d, v, lv, sg, dg)
 
         if compile is None:
             return StepFunctions(self.encode, full, reverse, forward_state)
@@ -1093,6 +1444,7 @@ class RSR(WESR):
         loss: Callable[[Tensor, int], Tensor],
         *,
         shot_ids: Tensor | None = None,
+        guidance: Tensor | None = None,
         keep: str = "none",
         functions: StepFunctions | None = None,
         autocast: Callable[[], AbstractContextManager] = nullcontext,
@@ -1102,7 +1454,7 @@ class RSR(WESR):
         """Run one clip and backpropagate the sum of its per-frame losses.
 
         Parameter and frame gradients equal those of summing loss(out[:, t], t)
-        over self(frames, shot_ids) and calling backward, and accumulate into
+        over self(frames, shot_ids, guidance) and calling backward, and accumulate into
         .grad. loss is called once per frame, inside autocast(), with that
         frame's B,3,sH,sW output as a detached leaf, so it must not rely on
         reaching the model through it. A frame's loss graph is released as soon
@@ -1144,6 +1496,9 @@ class RSR(WESR):
         may run compiled functions, which belong to the frame's step, but must
         not keep their outputs beyond the call without copying them; the caller
         marks steps for its own compiled calls outside this method.
+
+        For the aligned read, guidance None computes it with guidance() first,
+        in eager code before any step mark; a tensor is used as given.
         """
         if keep not in ("none", "reverse", "both"):
             raise ValueError(f"keep must be none/reverse/both, not {keep!r}")
@@ -1152,10 +1507,16 @@ class RSR(WESR):
         if frames.ndim != 5:
             raise ValueError("backward_clip expects (B,T,3,H,W) frames")
         fn = self.step_functions() if functions is None else functions
+        guidance = self._clip_guidance(frames, shot_ids, guidance)
 
         batch, count = frames.shape[:2]
         # A compiled step guards on strides, so every per-frame slice is contiguous.
         images = [frames[:, t].contiguous() for t in range(count)]
+        past_guidance: list[Tensor | None] = [None] * count
+        future_guidance: list[Tensor | None] = [None] * count
+        if guidance is not None:
+            past_guidance = [guidance[:, t, 0].contiguous() for t in range(count)]
+            future_guidance = [guidance[:, t, 1].contiguous() for t in range(count)]
         closed = torch.zeros(batch, dtype=torch.bool, device=frames.device)
         if shot_ids is None:
             edge = [torch.ones_like(closed) for _ in range(count - 1)]
@@ -1231,7 +1592,14 @@ class RSR(WESR):
             """
             with autocast():
                 output, carried = fn.full(
-                    images[t], encoded[t], state, past_valid[t], donor, ahead_valid[t]
+                    images[t],
+                    encoded[t],
+                    state,
+                    past_valid[t],
+                    donor,
+                    ahead_valid[t],
+                    past_guidance[t],
+                    future_guidance[t],
                 )
                 target = output.detach().requires_grad_()
                 value = loss(target, t)
@@ -1247,7 +1615,9 @@ class RSR(WESR):
             for t in reversed(range(1, count)):
                 leaves[t] = leaf(future[t + 1])
                 with autocast():
-                    out = fn.reverse(encoded[t], leaves[t], ahead_valid[t])
+                    out = fn.reverse(
+                        encoded[t], leaves[t], ahead_valid[t], future_guidance[t]
+                    )
                 produced[t], future[t] = out, out.detach()
                 del out
         else:
@@ -1255,7 +1625,10 @@ class RSR(WESR):
                 for t in reversed(range(1, count)):
                     step()
                     future[t] = fn.reverse(
-                        _plain(encoded[t]), future[t + 1], ahead_valid[t]
+                        _plain(encoded[t]),
+                        future[t + 1],
+                        ahead_valid[t],
+                        future_guidance[t],
                     ).clone()
 
         pending: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = []
@@ -1278,6 +1651,8 @@ class RSR(WESR):
                             past_valid[t],
                             future[t + 1],
                             ahead_valid[t],
+                            past_guidance[t],
+                            future_guidance[t],
                         ).clone()
                     )
         # Backward runs from the last frame so each carried state's adjoint is
@@ -1310,7 +1685,9 @@ class RSR(WESR):
                 step()
                 donor = leaf(future[t + 1])
                 with autocast():
-                    out = fn.reverse(encoded[t], donor, ahead_valid[t])
+                    out = fn.reverse(
+                        encoded[t], donor, ahead_valid[t], future_guidance[t]
+                    )
             else:
                 donor, out = leaves[t], produced[t]
                 produced[t] = leaves[t] = None
@@ -1356,8 +1733,13 @@ class RSR(WESR):
 # Registered preset.
 
 
-def rsr_compact(num_in_ch: int = 3, num_out_ch: int = 3, scale: int = 4) -> RSR:
-    """Recurrent WSR Compact C32/H64/D9/S3 with temporal Halo reads; 1x/2x/4x."""
+def rsr_compact(
+    num_in_ch: int = 3,
+    num_out_ch: int = 3,
+    scale: int = 4,
+    temporal_read: Literal["block", "aligned"] = "block",
+) -> RSR:
+    """Recurrent WSR Compact C32/H64/D9/S3 with temporal reads; 1x/2x/4x."""
     return RSR(
         width=32,
         hidden=64,
@@ -1368,5 +1750,5 @@ def rsr_compact(num_in_ch: int = 3, num_out_ch: int = 3, scale: int = 4) -> RSR:
         num_in_ch=num_in_ch,
         num_out_ch=num_out_ch,
         scale=scale,
+        temporal_read=temporal_read,
     )
-
