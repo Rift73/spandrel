@@ -97,7 +97,10 @@ def run_window(
         outputs.append(model.head(clip[t], state).float())
     # keep >= 1, so the forward sweep set the state
     assert state is not None
-    last = frames[:, keep - 1 : keep] if model.temporal_read == "aligned" else None
+    # A copy: a view would keep the whole window's frames alive with the carry.
+    last = (
+        frames[:, keep - 1 : keep].clone() if model.temporal_read == "aligned" else None
+    )
     return torch.stack(outputs, dim=1), (state, tuple(encoded[keep:]), last)
 
 
@@ -131,12 +134,13 @@ class RSRArch(Architecture[RSR]):
                         "attention.null_key",
                         "attention.temporal_gain",
                     ),
+                    # without the flow's weights and flag, which load refuses
+                    # by name rather than leaving the file to WSR's detection
                     KeyCondition.has_all(
                         "blend_reverse.weight",
                         "blend_forward.weight",
                         "confidence_past",
                         "confidence_future",
-                        "flow_loaded",
                     ),
                 ),
             ),
@@ -156,6 +160,15 @@ class RSRArch(Architecture[RSR]):
         heads = state_dict["attention.logit_scale"].shape[0]
         scale = math.isqrt(state_dict["reconstruct.weight"].shape[0] // 3)
         temporal_read = "aligned" if "blend_forward.weight" in state_dict else "block"
+        if temporal_read == "aligned" and (
+            "flow_loaded" not in state_dict
+            or not bool(state_dict["flow_loaded"])
+            or not any(key.startswith("flow.") for key in state_dict)
+        ):
+            raise ValueError(
+                "RSR: this RSR model with optical flow holds no optical flow weights"
+                " (NeuFlow v2); save it again with them loaded"
+            )
 
         model = RSR(
             depth=depth,

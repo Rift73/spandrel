@@ -413,3 +413,38 @@ def test_aligned_guidance_is_the_same_for_channels_last_frames():
         expected = model.guidance(clip)
         actual = model.guidance(_channels_last_clip(clip))
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "stripped",
+    ["no flag", "no flow weights", "no flow weights and no flag", "flag false"],
+)
+def test_aligned_without_its_flow_is_refused_as_rsr(stripped: str):
+    # The flow's weights are most of an aligned file: stripped, it is still told apart
+    # from WSR, and refused with a message that names what is missing.
+    state = _aligned().state_dict()
+    if stripped == "flag false":
+        state["flow_loaded"] = torch.tensor(False)
+    if "no flag" in stripped:
+        del state["flow_loaded"]
+    if "no flow weights" in stripped:
+        state = {k: v for k, v in state.items() if not k.startswith("flow.")}
+    with pytest.raises(
+        ValueError, match="RSR model with optical flow holds no optical"
+    ):
+        MAIN_REGISTRY.load(state)
+
+
+def test_a_complete_aligned_file_loads():
+    descriptor = MAIN_REGISTRY.load(_aligned().state_dict())
+    assert descriptor.architecture.id == "RSR" and "aligned" in descriptor.tags
+
+
+def test_aligned_carry_holds_its_frame_not_the_window():
+    model = RSRArch().load(_aligned().state_dict()).model
+    frames = torch.rand(1, 3, 3, 32, 32)
+    with torch.inference_mode():
+        _, (_, _, last) = run_window(model, frames, 2)
+    assert last is not None
+    assert torch.equal(last, frames[:, 1:2])
+    assert last.untyped_storage().nbytes() == last.numel() * last.element_size()
