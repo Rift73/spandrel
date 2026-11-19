@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import pickle
+from collections.abc import Iterator
 from pathlib import Path
 
 import torch
@@ -115,21 +116,61 @@ class ModelLoader:
             )
         except pickle.UnpicklingError as error:
             raise ValueError(_TORCHSCRIPT_REFUSED) from error
-        state_dict: StateDict = {}
-        _collect_script_tensors(root, "", state_dict)
-        return state_dict
+        return _collect_script_tensors(root)
 
     def _load_safetensors(self, path: str | Path) -> StateDict:
         return load_file(path, device=str(self.device))
 
 
-def _collect_script_tensors(obj: object, prefix: str, state_dict: StateDict) -> None:
+# Bounds of the walk below, which reads a file-controlled object graph. Modules that
+# the pickle shares (one module under two names, tied weights) are visited once per
+# name, as by `state_dict()`, so without bounds a small crafted archive could ask
+# for 2**n visits, an endless walk or keys of any length. Real modules nest less
+# than 20 deep and hold a few thousand modules and tensors.
+_MAX_SCRIPT_DEPTH = 64
+_MAX_SCRIPT_VISITS = 100_000
+_MAX_SCRIPT_KEY_CHARS = 16_000_000
+
+
+def _script_state(obj: object) -> dict[object, object]:
     # A module that pickles its own state (a TorchScript __getstate__) can only be
     # restored by running its __setstate__, so it is refused.
     if not isinstance(obj, ScriptObject) or not isinstance(obj.state, dict):
         raise ValueError(_TORCHSCRIPT_REFUSED)
-    for name, value in obj.state.items():
+    return obj.state
+
+
+def _collect_script_tensors(root: object) -> StateDict:
+    # Depth first in attribute order, which is the order of `state_dict()`. The
+    # path is kept as its parts and joined only for a tensor.
+    state_dict: StateDict = {}
+    path: list[str] = []
+    stack: list[Iterator[tuple[object, object]]] = [iter(_script_state(root).items())]
+    visits = 0
+    key_chars = 0
+    while stack:
+        item = next(stack[-1], None)
+        if item is None:
+            stack.pop()
+            if path:
+                path.pop()
+            continue
+        name, value = item
+        if not isinstance(value, (torch.Tensor, ScriptObject)):
+            continue
+        visits += 1
+        if visits > _MAX_SCRIPT_VISITS:
+            raise ValueError(_TORCHSCRIPT_REFUSED)
         if isinstance(value, torch.Tensor):
-            state_dict[f"{prefix}{name}"] = value
-        elif isinstance(value, ScriptObject):
-            _collect_script_tensors(value, f"{prefix}{name}.", state_dict)
+            key = ".".join([*path, str(name)])
+            key_chars += len(key)
+            if key_chars > _MAX_SCRIPT_KEY_CHARS:
+                raise ValueError(_TORCHSCRIPT_REFUSED)
+            state_dict[key] = value
+            continue
+        # also ends the walk through an object that holds itself
+        if len(stack) >= _MAX_SCRIPT_DEPTH:
+            raise ValueError(_TORCHSCRIPT_REFUSED)
+        path.append(str(name))
+        stack.append(iter(_script_state(value).items()))
+    return state_dict

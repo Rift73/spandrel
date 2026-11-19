@@ -4,6 +4,7 @@ import collections
 import pickle
 import struct
 import typing
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,107 @@ def test_traced_esrgan_loads(tmp_path: Path):
     assert model.architecture.id == "ESRGAN"
     assert model.scale == 2
     assert_same_state_dict(model.model.state_dict(), net.state_dict())
+
+
+class Shared(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = torch.nn.Conv2d(3, 3, 3, padding=1)
+        self.again = self.first  # one module under two names
+        self.last = torch.nn.Conv2d(3, 3, 3, padding=1)
+        self.last.weight = self.first.weight  # tied weights
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.last(self.again(self.first(x)))
+
+
+@pytest.mark.parametrize("kind", ["trace", "script"])
+def test_torchscript_shared_modules_and_weights(tmp_path: Path, kind: str):
+    net = Shared().eval()
+    if kind == "trace":
+        module = torch.jit.trace(net, torch.rand(1, 3, 8, 8))
+    else:
+        module = torch.jit.script(net)
+    path = tmp_path / "model.pt"
+    module.save(str(path))
+    expected = torch.jit.load(str(path), map_location="cpu").state_dict()
+
+    actual = ModelLoader().load_state_dict_from_file(path)
+
+    assert_same_state_dict(actual, expected)
+
+
+def _torchscript_archive(
+    path: Path, data: bytes, records: tuple[tuple[str, bytes], ...] = ()
+):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("archive/data.pkl", data)
+        for name, record in records:
+            archive.writestr(f"archive/{name}", record)
+        archive.writestr("archive/constants.pkl", b"\x80\x02).")
+        archive.writestr("archive/version", b"3\n")
+
+
+def _script_object(fields: bytes) -> bytes:
+    # an object of the TorchScript class __torch__.M with the given state items
+    return b"c__torch__\nM\n)\x81}" + fields + b"b"
+
+
+def test_torchscript_shared_objects_are_walked_within_bounds(tmp_path: Path):
+    # Each object holds the one before it twice: 2**22 paths to the first one, a
+    # few seconds for a walk without a bound, which then returns an empty dict.
+    data = b"\x80\x04" + _script_object(_pickled_text("v") + b"K\x01s") + b"\x94"
+    for i in range(22):
+        held = b"h" + bytes([i])
+        fields = _pickled_text("a") + held + b"s" + _pickled_text("b") + held + b"s"
+        data += _script_object(fields) + b"\x94"
+    path = tmp_path / "model.pt"
+    _torchscript_archive(path, data + b".")
+
+    with pytest.raises(ValueError, match="TorchScript model files are not run"):
+        ModelLoader().load_state_dict_from_file(path)
+
+
+def test_torchscript_object_holding_itself(tmp_path: Path):
+    data = b"\x80\x04c__torch__\nM\n)\x81\x94}" + _pickled_text("self") + b"h\x00sb."
+    path = tmp_path / "model.pt"
+    _torchscript_archive(path, data)
+
+    with pytest.raises(ValueError, match="TorchScript model files are not run"):
+        ModelLoader().load_state_dict_from_file(path)
+
+
+def test_torchscript_nesting_is_bounded(tmp_path: Path):
+    # 200 objects, each inside the one after it
+    data = b"\x80\x04" + _script_object(_pickled_text("v") + b"K\x01s") + b"\x94"
+    for i in range(200):
+        held = b"h" + bytes([i])
+        data += _script_object(_pickled_text("a") + held + b"s") + b"\x94"
+    path = tmp_path / "model.pt"
+    _torchscript_archive(path, data + b".")
+
+    with pytest.raises(ValueError, match="TorchScript model files are not run"):
+        ModelLoader().load_state_dict_from_file(path)
+
+
+def test_torchscript_key_length_is_bounded(tmp_path: Path):
+    # Seven nested objects, each holding one 4-byte tensor as "t" and the object
+    # before it under one pickled 1 MB name: 21 million key characters from a
+    # 1 MB file.
+    tensor = b"ctorch._utils\n_rebuild_tensor_v2\n((" + _pickled_text("storage")
+    tensor += b"ctorch\nFloatStorage\n" + _pickled_text("0") + _pickled_text("cpu")
+    tensor += b"K\x01tQK\x00K\x01\x85K\x01\x85\x89ccollections\nOrderedDict\n)RtR"
+    data = b"\x80\x04" + _pickled_text("n" * 1_000_000) + b"\x94"  # memo 0
+    data += _pickled_text("t") + b"\x94" + tensor + b"\x94"  # memo 1, 2
+    data += _script_object(b"h\x01h\x02s") + b"\x94"  # memo 3
+    for i in range(6):
+        fields = b"h\x01h\x02sh\x00h" + bytes([i + 3]) + b"s"
+        data += _script_object(fields) + b"\x94"
+    path = tmp_path / "model.pt"
+    _torchscript_archive(path, data + b".", records=(("data/0", bytes(4)),))
+
+    with pytest.raises(ValueError, match="TorchScript model files are not run"):
+        ModelLoader().load_state_dict_from_file(path)
 
 
 @pytest.mark.parametrize("extension", [".pt", ".pth", ".ckpt"])
