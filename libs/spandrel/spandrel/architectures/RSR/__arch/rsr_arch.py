@@ -1072,7 +1072,13 @@ class RSR(WESR):
                 for first in range(0, index.numel(), pairs):
                     span = index[first : first + pairs]
                     images = torch.cat((earlier[span], later[span]))
-                    images = images.to(device, torch.float32)
+                    # NCHW whatever the frames' layout: from a channels-last
+                    # stack (a first window's) cuDNN picks, for the flow's
+                    # 130-channel convolution, an algorithm of 4.3-4.7 GiB of
+                    # workspace.
+                    images = images.to(
+                        device, torch.float32, memory_format=torch.contiguous_format
+                    )
                     if factor > 1:
                         images = F.interpolate(
                             images,

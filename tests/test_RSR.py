@@ -373,3 +373,43 @@ def test_onnx_export_pads_without_modulo(tmp_path: Path):
     graph = onnx.load(str(path)).graph
     assert "Pad" in {node.op_type for node in graph.node}
     assert not {"Neg", "Mod"} & {node.op_type for node in graph.node}
+
+
+def _channels_last_clip(clip: torch.Tensor) -> torch.Tensor:
+    """The same B,T,3,H,W values with each frame channels-last, as a window's stack on a
+    GPU holds them."""
+    batch, count, channels, height, width = clip.shape
+    stacked = clip.flatten(0, 1).contiguous(memory_format=torch.channels_last)
+    return stacked.reshape(batch, count, channels, height, width)
+
+
+def test_aligned_flow_takes_nchw_frames_whatever_their_layout():
+    # From channels-last frames cuDNN picks, for the flow's 130-channel convolution,
+    # an algorithm of 4.3-4.7 GiB of workspace: the flow is handed NCHW frames.
+    model = RSRArch().load(_aligned().state_dict()).model
+    seen: list[bool] = []
+
+    def hook(_module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        seen.extend(arg.is_contiguous() for arg in args)
+
+    handle = model.flow.register_forward_pre_hook(hook)
+    torch.manual_seed(1)
+    clip = _channels_last_clip(torch.rand(1, 3, 3, 64, 96))
+    assert clip[0].is_contiguous(memory_format=torch.channels_last)
+    assert not clip[0, 0].is_contiguous()
+    try:
+        with torch.inference_mode():
+            model.guidance(clip)
+    finally:
+        handle.remove()
+    assert seen and all(seen)
+
+
+def test_aligned_guidance_is_the_same_for_channels_last_frames():
+    model = RSRArch().load(_aligned().state_dict()).model
+    torch.manual_seed(1)
+    clip = torch.rand(1, 3, 3, 64, 96)
+    with torch.inference_mode():
+        expected = model.guidance(clip)
+        actual = model.guidance(_channels_last_clip(clip))
+    assert torch.equal(actual, expected)
