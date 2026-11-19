@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from spandrel.architectures.RSR import RSR
 from spandrel.architectures.SPAN import SPAN
 from spandrel.architectures.WSR import WESR, WideContextSR, WSRArch
 from spandrel.architectures.WSR.__arch.wsr_arch import (
+    ContextGate,
     wsr,
     wsr_compact,
     wsr_mobile,
@@ -186,3 +188,61 @@ def test_reduced_precision(name: str, dtype: torch.dtype):
 @pytest.mark.parametrize("name", ["Compact-x2", "Mobile-x4"])
 def test_size_requirements(name: str):
     assert_size_requirements(MAIN_REGISTRY.load(_build(name).state_dict()))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_eval_gate_upsamples_as_a_scale_factor_of_4(dtype: torch.dtype):
+    # The eval gate's interpolation by sizes gives the numbers of scale_factor=4.0
+    # bit for bit, on a frame not divisible by 4 (the map is cropped to it).
+    torch.manual_seed(0)
+    gate = ContextGate(8, 16).eval()
+    with torch.no_grad():
+        for parameter in gate.parameters():
+            parameter.normal_(0, 0.5)
+    gate = gate.to(dtype)
+    x = torch.rand(1, 8, 29, 37, dtype=dtype)
+    context = torch.rand(1, 16, 8, 10, dtype=dtype)
+    with torch.no_grad():
+        maps = torch.nn.functional.interpolate(
+            gate.project(context),
+            scale_factor=4.0,
+            mode="bilinear",
+            align_corners=False,
+        )
+        gamma, beta = maps[..., :29, :37].chunk(2, dim=1)
+        expected = x * (2.0 * torch.sigmoid(gamma + gate.local_scale * x)) + beta
+        actual = gate(x, context)
+    assert torch.equal(actual, expected)
+
+
+def test_onnx_export_resizes_by_sizes_and_pads_without_modulo(tmp_path: Path):
+    # A Resize with sizes, not scales, has an output shape TensorRT's shape inference
+    # bounds for dynamic inputs (Build Engine's Dynamic shapes).
+    onnx = pytest.importorskip("onnx")
+    descriptor = MAIN_REGISTRY.load(_build("Compact-x2").state_dict())
+    path = tmp_path / "wsr.onnx"
+    torch.onnx.export(
+        descriptor.model,
+        (torch.rand(1, 3, 64, 64),),
+        str(path),
+        opset_version=17,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {2: "h", 3: "w"}, "output": {2: "h", 3: "w"}},
+        dynamo=False,
+    )
+    graph = onnx.load(str(path)).graph
+    resizes = [node for node in graph.node if node.op_type == "Resize"]
+    assert len(resizes) == 3
+    for node in resizes:
+        # inputs: X, roi, scales, sizes
+        assert len(node.input) == 4 and node.input[2] == "" and node.input[3] != ""
+    # The pads to a multiple of 4 as (n + 3) // 4 * 4 - n: TensorRT cannot bound the
+    # context map's size through the Neg and Mod of (-n) % 4.
+    assert not {"Neg", "Mod"} & {node.op_type for node in graph.node}
+
+
+def test_pads_to_4_are_the_integers_of_the_negated_modulo():
+    # Eager runs on Python integers: the same pads give the same output bit for bit.
+    for n in range(1, 257):
+        assert (n + 3) // 4 * 4 - n == (-n) % 4

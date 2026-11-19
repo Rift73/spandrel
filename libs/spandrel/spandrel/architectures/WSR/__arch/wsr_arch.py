@@ -368,8 +368,14 @@ class ContextGate(nn.Module):
         if self.training:
             maps = _upsample4(_upsample4(maps, -2), -1)
         else:
+            # Sizes, not a scale factor: an exported Resize then has an output
+            # shape TensorRT's shape inference can bound for dynamic inputs.
+            # Same numbers: the scale 4 follows from the sizes.
             maps = F.interpolate(
-                maps, scale_factor=4.0, mode="bilinear", align_corners=False
+                maps,
+                size=(4 * maps.shape[-2], 4 * maps.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
             )
         # Always crop dynamically: padded coarse cells need not fill a frame.
         gamma, beta = maps[..., : x.shape[-2], : x.shape[-1]].chunk(2, dim=1)
@@ -449,7 +455,15 @@ class BlockTokenAttention(nn.Module):
         rows, cols = (height + 31) // 32, (width + 31) // 32
         hp, wp = rows * 32, cols * 32
         q = self.query(x).reshape(batch, self.heads, self.cosine_dim, height, width)
-        kv = self.key_value(F.pad(x, (0, (-width) % 4, 0, (-height) % 4)))
+        # Pads to a multiple of 4 without Neg/Mod, which TensorRT cannot bound
+        # for dynamic shapes (the same integers as (-n) % 4).
+        pad = (
+            0,
+            (width + 3) // 4 * 4 - width,
+            0,
+            (height + 3) // 4 * 4 - height,
+        )
+        kv = self.key_value(F.pad(x, pad))
         ch, cw = kv.shape[-2:]
         k, v = kv.split((self.query_channels, self.channels), dim=1)
         k = k.reshape(batch, self.heads, self.cosine_dim, ch, cw)
@@ -637,7 +651,14 @@ class WESR(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         height, width = x.shape[-2:]
-        padding = (0, (-width) % 4, 0, (-height) % 4)
+        # Pads to a multiple of 4 without Neg/Mod, which TensorRT cannot bound
+        # for dynamic shapes (the same integers as (-n) % 4).
+        padding = (
+            0,
+            (width + 3) // 4 * 4 - width,
+            0,
+            (height + 3) // 4 * 4 - height,
+        )
         current = self.stem(x) + self.first_project(F.relu(self.first_expand(x)))
         context = F.relu(self.context_stem(F.pixel_unshuffle(F.pad(x, padding), 4)))
         c1 = self.context_blocks[0](context)
@@ -750,7 +771,14 @@ class WideContextSR(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         height, width = x.shape[-2:]
-        padding = (0, (-width) % 4, 0, (-height) % 4)
+        # Pads to a multiple of 4 without Neg/Mod, which TensorRT cannot bound
+        # for dynamic shapes (the same integers as (-n) % 4).
+        padding = (
+            0,
+            (width + 3) // 4 * 4 - width,
+            0,
+            (height + 3) // 4 * 4 - height,
+        )
         shallow = self.stem(x)
         context = F.relu(self.context_stem(F.pixel_unshuffle(F.pad(x, padding), 4)))
         c1 = self.context_blocks[0](context)

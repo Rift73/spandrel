@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import pytest
 import torch
@@ -13,7 +14,7 @@ from spandrel.architectures.RSR import (
     run_clip,
     run_window,
 )
-from spandrel.architectures.RSR.__arch.rsr_arch import rsr_compact
+from spandrel.architectures.RSR.__arch.rsr_arch import ContextGate, rsr_compact
 from spandrel.architectures.WSR.__arch.wsr_arch import wsr_compact
 
 from .util import assert_loads_correctly, assert_size_requirements, skip_if_unchanged
@@ -327,3 +328,48 @@ def test_aligned_reduced_precision():
 def test_flow_working_factor():
     assert flow_working_factor(240, 320) == 1
     assert flow_working_factor(1080, 1920) == 4
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_eval_gate_upsamples_as_a_scale_factor_of_4(dtype: torch.dtype):
+    # The eval gate's interpolation by sizes gives the numbers of scale_factor=4.0
+    # bit for bit, on a frame not divisible by 4 (the map is cropped to it).
+    torch.manual_seed(0)
+    gate = ContextGate(8, 16).eval()
+    with torch.no_grad():
+        for parameter in gate.parameters():
+            parameter.normal_(0, 0.5)
+    gate = gate.to(dtype)
+    x = torch.rand(1, 8, 29, 37, dtype=dtype)
+    context = torch.rand(1, 16, 8, 10, dtype=dtype)
+    with torch.no_grad():
+        maps = torch.nn.functional.interpolate(
+            gate.project(context),
+            scale_factor=4.0,
+            mode="bilinear",
+            align_corners=False,
+        )
+        gamma, beta = maps[..., :29, :37].chunk(2, dim=1)
+        expected = x * (2.0 * torch.sigmoid(gamma + gate.local_scale * x)) + beta
+        actual = gate(x, context)
+    assert torch.equal(actual, expected)
+
+
+def test_onnx_export_pads_without_modulo(tmp_path: Path):
+    # The pads to a multiple of 4 as WSR's: no Neg or Mod, which TensorRT cannot bound
+    # for dynamic shapes. A 4-D input is one frame without neighbours.
+    onnx = pytest.importorskip("onnx")
+    path = tmp_path / "rsr.onnx"
+    torch.onnx.export(
+        _deployed("Compact-x2"),
+        (torch.rand(1, 3, 64, 64),),
+        str(path),
+        opset_version=17,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {2: "h", 3: "w"}, "output": {2: "h", 3: "w"}},
+        dynamo=False,
+    )
+    graph = onnx.load(str(path)).graph
+    assert "Pad" in {node.op_type for node in graph.node}
+    assert not {"Neg", "Mod"} & {node.op_type for node in graph.node}
