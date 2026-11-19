@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import pickle
+from collections import OrderedDict
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -142,8 +143,9 @@ def _script_state(obj: object) -> dict[object, object]:
 
 def _collect_script_tensors(root: object) -> StateDict:
     # Depth first in attribute order, which is the order of `state_dict()`. The
-    # path is kept as its parts and joined only for a tensor.
-    state_dict: StateDict = {}
+    # path is kept as its parts and joined only for a tensor. An OrderedDict, as
+    # `state_dict()` gives.
+    state_dict: StateDict = OrderedDict()
     path: list[str] = []
     stack: list[Iterator[tuple[object, object]]] = [iter(_script_state(root).items())]
     visits = 0

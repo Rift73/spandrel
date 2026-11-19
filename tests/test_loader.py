@@ -77,6 +77,7 @@ def make_net() -> Net:
 
 
 def assert_same_state_dict(actual: dict[str, Tensor], expected: dict[str, Tensor]):
+    assert type(actual) is type(expected)
     assert list(actual) == list(expected)
     for key, value in expected.items():
         assert actual[key].dtype == value.dtype, key
