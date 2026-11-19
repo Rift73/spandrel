@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import collections
+import pickle
+import struct
+import typing
 from pathlib import Path
 
 import pytest
@@ -139,6 +143,56 @@ def test_pickled_state_dict_refuses_other_globals(tmp_path: Path):
 
     with pytest.raises(Exception, match="is forbidden"):
         ModelLoader().load_state_dict_from_file(path)
+
+
+def _pickled_text(text: str) -> bytes:
+    data = text.encode()
+    return b"X" + struct.pack("<I", len(data)) + data
+
+
+def _pickled_global(module: str, name: str) -> bytes:
+    return f"c{module}\n{name}\n".encode()
+
+
+@pytest.mark.parametrize("target", ["rebuild", "typing"])
+def test_pickled_state_dict_cannot_change_later_loads(tmp_path: Path, target: str):
+    # A pickle can set attributes on the globals it is given (BUILD). This one sets
+    # the default metadata of the tensor rebuild function (negated tensors), or the
+    # class behind typing's OrderedDict, for the rest of the process.
+    if target == "rebuild":
+        obj = _pickled_global("torch._utils", "_rebuild_tensor_v2")
+        value = b"}" + _pickled_text("neg") + b"\x88s\x85"  # ({"neg": True},)
+    else:
+        obj = _pickled_global("typing", "OrderedDict")
+        value = b"N"
+    name = "__defaults__" if target == "rebuild" else "__origin__"
+    # (None, {name: value}) BUILD on the global, then drop it and return {}
+    payload = b"\x80\x02" + obj + b"N}" + _pickled_text(name) + value + b"s\x86b0}."
+    path = tmp_path / "changes.pth"
+    with path.open("wb") as file:
+        header = {
+            "protocol_version": 1001,
+            "little_endian": True,
+            "type_sizes": {"short": 2, "int": 4, "long": 4},
+        }
+        for value in (0x1950A86A20F9469CFC6C, 1001, header):
+            pickle.dump(value, file, protocol=2)
+        file.write(payload)
+        pickle.dump([], file, protocol=2)
+    expected = make_net().state_dict()
+    plain = tmp_path / "model.pth"
+    torch.save(expected, plain)
+
+    if target == "rebuild":
+        assert ModelLoader().load_state_dict_from_file(path) == {}
+    else:
+        with pytest.raises(TypeError, match="immutable type"):
+            ModelLoader().load_state_dict_from_file(path)
+    actual = ModelLoader().load_state_dict_from_file(plain)
+
+    assert_same_state_dict(actual, expected)
+    assert not any(value.is_neg() for value in actual.values())
+    assert typing.OrderedDict() == collections.OrderedDict()
 
 
 def test_safetensors(tmp_path: Path):

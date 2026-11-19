@@ -1,6 +1,8 @@
 # Safe unpickler to prevent arbitrary code execution
+import collections
 import pickle
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
+from typing import Callable
 
 from typing_extensions import override
 
@@ -23,7 +25,17 @@ class RestrictedUnpickler(pickle.Unpickler):
         # Only allow required classes to load state dict
         if (module, name) not in safe_list:
             raise pickle.UnpicklingError(f"Global '{module}.{name}' is forbidden")
-        return super().find_class(module, name)
+        found = super().find_class(module, name)
+        # A pickle can set attributes on the globals it is given (BUILD), which
+        # would change them for the rest of the process. Functions are therefore
+        # given as a new function each time, and typing's OrderedDict alias as the
+        # class it stands for.
+        if module == "typing":
+            return collections.OrderedDict
+        if isinstance(found, FunctionType):
+            function: Callable[..., object] = found
+            return lambda *args: function(*args)
+        return found
 
 
 RestrictedUnpickle = SimpleNamespace(
@@ -56,10 +68,6 @@ _script_list_functions = {
 }
 
 
-def _first_argument(value: object, *_: object) -> object:
-    return value
-
-
 class TorchScriptUnpickler(RestrictedUnpickler):
     """
     Reads the pickled modules of a TorchScript archive as `ScriptObject`s, so
@@ -68,10 +76,11 @@ class TorchScriptUnpickler(RestrictedUnpickler):
 
     @override
     def find_class(self, module: str, name: str):
+        # New each time, for the same reason as in RestrictedUnpickler
         if module == "__torch__" or module.startswith("__torch__."):
-            return ScriptObject
+            return type(name, (ScriptObject,), {})
         if module == "torch.jit._pickle" and name in _script_list_functions:
-            return _first_argument
+            return lambda value, *_: value
         return super().find_class(module, name)
 
 
