@@ -28,13 +28,16 @@ class RestrictedUnpickler(pickle.Unpickler):
         found = super().find_class(module, name)
         # A pickle can set attributes on the globals it is given (BUILD), which
         # would change them for the rest of the process. Functions are therefore
-        # given as a new function each time, and typing's OrderedDict alias as the
-        # class it stands for.
+        # given as a new function each time, torch's storage classes as a new
+        # subclass each time, and typing's OrderedDict alias as the class it stands
+        # for (a built-in class, which cannot be changed).
         if module == "typing":
             return collections.OrderedDict
         if isinstance(found, FunctionType):
             function: Callable[..., object] = found
             return lambda *args: function(*args)
+        if module == "torch" and isinstance(found, type):
+            return type(name, (found,), {})
         return found
 
 

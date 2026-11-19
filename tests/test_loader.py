@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import collections
+import io
 import pickle
 import struct
+import tarfile
 import typing
 import zipfile
 from pathlib import Path
@@ -296,6 +298,61 @@ def test_pickled_state_dict_cannot_change_later_loads(tmp_path: Path, target: st
     assert_same_state_dict(actual, expected)
     assert not any(value.is_neg() for value in actual.values())
     assert typing.OrderedDict() == collections.OrderedDict()
+
+
+class _TensorMarker:
+    pass
+
+
+class _MarkerPickler(pickle.Pickler):
+    def persistent_id(self, obj: object):
+        return "1" if isinstance(obj, _TensorMarker) else None
+
+
+def _tar_checkpoint(path: Path, storages: bytes, tensors: bytes, main: bytes):
+    # The tar format of torch.save before 2017
+    with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+        for name, data in (
+            ("storages", storages),
+            ("tensors", tensors),
+            ("pickle", main),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+
+
+def test_tar_checkpoint(tmp_path: Path):
+    values = torch.arange(1.0, 5.0)
+    storages = pickle.dumps(1, protocol=2)
+    storages += pickle.dumps((0, "cpu", torch.FloatStorage), protocol=2)
+    storages += struct.pack("<q", 4) + values.numpy().tobytes()
+    storages += pickle.dumps([], protocol=2)
+    tensors = pickle.dumps(1, protocol=2) + pickle.dumps((1, 0, None), protocol=2)
+    tensors += struct.pack("<ii", 1, 0) + struct.pack("<qqq", 4, 1, 0)
+    main = io.BytesIO()
+    _MarkerPickler(main, protocol=2).dump({"w": _TensorMarker()})
+    path = tmp_path / "model.pth"
+    _tar_checkpoint(path, storages, tensors, main.getvalue())
+
+    actual = ModelLoader().load_state_dict_from_file(path)
+
+    assert list(actual) == ["w"]
+    assert torch.equal(actual["w"], values)
+
+
+def test_tar_checkpoint_cannot_change_storage_classes(tmp_path: Path):
+    # BUILD on the storage class, then 0 storages
+    storages = b"\x80\x02" + _pickled_global("torch", "FloatStorage") + b"N}"
+    storages += _pickled_text("set_by_a_file") + b"K\x01s\x86b0K\x00."
+    storages += pickle.dumps([], protocol=2)
+    tensors = pickle.dumps(0, protocol=2)
+    path = tmp_path / "model.pth"
+    _tar_checkpoint(path, storages, tensors, pickle.dumps({}, protocol=2))
+
+    assert ModelLoader().load_state_dict_from_file(path) == {}
+
+    assert not hasattr(torch.FloatStorage, "set_by_a_file")
 
 
 def test_safetensors(tmp_path: Path):
