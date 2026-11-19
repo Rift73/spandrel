@@ -31,3 +31,52 @@ RestrictedUnpickle = SimpleNamespace(
     __name__="pickle",
     load=lambda *args, **kwargs: RestrictedUnpickler(*args, **kwargs).load(),
 )
+
+
+class ScriptObject:
+    """
+    Stands in for an object of a class compiled by TorchScript. It keeps the
+    pickled state and runs none of the class's code.
+    """
+
+    state: object = None
+
+    def __setstate__(self, state: object) -> None:
+        self.state = state
+
+
+# TorchScript pickles typed lists through these functions, which all return
+# their first argument.
+_script_list_functions = {
+    "build_intlist",
+    "build_tensorlist",
+    "build_doublelist",
+    "build_boollist",
+    "restore_type_tag",
+}
+
+
+def _first_argument(value: object, *_: object) -> object:
+    return value
+
+
+class TorchScriptUnpickler(RestrictedUnpickler):
+    """
+    Reads the pickled modules of a TorchScript archive as `ScriptObject`s, so
+    that only tensors and plain values are built from the file.
+    """
+
+    @override
+    def find_class(self, module: str, name: str):
+        if module == "__torch__" or module.startswith("__torch__."):
+            return ScriptObject
+        if module == "torch.jit._pickle" and name in _script_list_functions:
+            return _first_argument
+        return super().find_class(module, name)
+
+
+TorchScriptUnpickle = SimpleNamespace(
+    Unpickler=TorchScriptUnpickler,
+    __name__="pickle",
+    load=lambda *args, **kwargs: TorchScriptUnpickler(*args, **kwargs).load(),
+)

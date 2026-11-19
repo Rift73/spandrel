@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+from safetensors.torch import save_file
+from torch import Tensor
+
+from spandrel import ModelLoader
+from spandrel.architectures.ESRGAN import ESRGAN
+
+
+class Block(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.convs = torch.nn.ModuleList(
+            torch.nn.Conv2d(4, 4, 3, padding=1) for _ in range(2)
+        )
+        self.norm = torch.nn.BatchNorm2d(4)
+
+    def forward(self, x: Tensor) -> Tensor:
+        for conv in self.convs:
+            x = conv(x)
+        return self.norm(x)
+
+
+class Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.head = torch.nn.Conv2d(3, 4, 3, padding=1)
+        self.body = torch.nn.Sequential(Block(), torch.nn.LeakyReLU(0.2), Block())
+        self.tail = torch.nn.Conv2d(4, 12, 3, padding=1)
+        self.up = torch.nn.PixelShuffle(2)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.up(self.tail(self.body(self.head(x))))
+
+
+class WritesOnLoad(torch.nn.Module):
+    """A TorchScript module whose stored __setstate__ writes into `target`."""
+
+    def __init__(self, target: str):
+        super().__init__()
+        self.target = target
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x
+
+    @torch.jit.export
+    def __getstate__(self):
+        return (self.target, self.weight, self.training)
+
+    @torch.jit.export
+    def __setstate__(self, state: tuple[str, Tensor, bool]):
+        self.target = state[0]
+        self.weight = state[1]
+        self.training = state[2]
+        written = torch.from_file(self.target, True, 8, dtype=torch.uint8)
+        written.fill_(33)
+        # printed so that TorchScript keeps the write
+        print(written)
+
+
+def make_net() -> Net:
+    net = Net().eval()
+    with torch.no_grad():
+        for p in net.parameters():
+            p.copy_(torch.rand_like(p))
+    return net
+
+
+def assert_same_state_dict(actual: dict[str, Tensor], expected: dict[str, Tensor]):
+    assert list(actual) == list(expected)
+    for key, value in expected.items():
+        assert actual[key].dtype == value.dtype, key
+        assert torch.equal(actual[key], value), key
+
+
+@pytest.mark.parametrize("extension", [".pt", ".pth", ".ckpt"])
+def test_torchscript_code_does_not_run(tmp_path: Path, extension: str):
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"UNTOUCHED")
+    path = tmp_path / f"model{extension}"
+    torch.jit.script(WritesOnLoad(str(victim))).save(str(path))
+    victim.write_bytes(b"UNTOUCHED")
+
+    with pytest.raises(ValueError, match="TorchScript model files are not run"):
+        ModelLoader().load_state_dict_from_file(path)
+
+    assert victim.read_bytes() == b"UNTOUCHED"
+
+
+@pytest.mark.parametrize("kind", ["trace", "script"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_torchscript_weights_are_read(tmp_path: Path, kind: str, dtype: torch.dtype):
+    net = make_net().to(dtype)
+    if kind == "trace":
+        module = torch.jit.trace(net, torch.rand(1, 3, 8, 8, dtype=dtype))
+    else:
+        module = torch.jit.script(net)
+    path = tmp_path / "model.pt"
+    module.save(str(path))
+    expected = torch.jit.load(str(path), map_location="cpu").state_dict()
+
+    actual = ModelLoader().load_state_dict_from_file(path)
+
+    assert_same_state_dict(actual, expected)
+
+
+def test_traced_esrgan_loads(tmp_path: Path):
+    net = ESRGAN(in_nc=3, out_nc=3, num_filters=16, num_blocks=2, scale=2).eval()
+    path = tmp_path / "model.pt"
+    torch.jit.trace(net, torch.rand(1, 3, 8, 8)).save(str(path))
+
+    model = ModelLoader().load_from_file(path)
+
+    assert model.architecture.id == "ESRGAN"
+    assert model.scale == 2
+    assert_same_state_dict(model.model.state_dict(), net.state_dict())
+
+
+@pytest.mark.parametrize("extension", [".pt", ".pth", ".ckpt"])
+@pytest.mark.parametrize("zipfile_format", [True, False])
+def test_pickled_state_dict(tmp_path: Path, extension: str, zipfile_format: bool):
+    expected = make_net().state_dict()
+    path = tmp_path / f"model{extension}"
+    torch.save(expected, path, _use_new_zipfile_serialization=zipfile_format)
+
+    actual = ModelLoader().load_state_dict_from_file(path)
+
+    assert_same_state_dict(actual, expected)
+
+
+def test_pickled_state_dict_refuses_other_globals(tmp_path: Path):
+    path = tmp_path / "model.pth"
+    torch.save({"weight": torch.zeros(1), "loader": ModelLoader}, path)
+
+    with pytest.raises(Exception, match="is forbidden"):
+        ModelLoader().load_state_dict_from_file(path)
+
+
+def test_safetensors(tmp_path: Path):
+    expected = make_net().state_dict()
+    path = tmp_path / "model.safetensors"
+    save_file(expected, str(path))
+
+    actual = ModelLoader().load_state_dict_from_file(path)
+
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert torch.equal(actual[key], value), key
