@@ -355,6 +355,17 @@ def test_tar_checkpoint_cannot_change_storage_classes(tmp_path: Path):
     assert not hasattr(torch.FloatStorage, "set_by_a_file")
 
 
+def test_missing_torch_serialization_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "model.pth"
+    torch.save(make_net().state_dict(), path)
+    monkeypatch.delattr("torch.serialization._load")
+
+    with pytest.raises(ValueError, match=r"torch\.serialization\._load is missing"):
+        ModelLoader().load_state_dict_from_file(path)
+
+
 def test_safetensors(tmp_path: Path):
     expected = make_net().state_dict()
     path = tmp_path / "model.safetensors"

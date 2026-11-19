@@ -21,6 +21,13 @@ from .unpickler import RestrictedUnpickle, ScriptObject, TorchScriptUnpickle
 # are used instead, looked up by name because strict type checking rejects private
 # members.
 _serialization = importlib.import_module("torch.serialization")
+_SERIALIZATION_STEPS = (
+    "_is_zipfile",
+    "_legacy_load",
+    "_open_zipfile_reader",
+    "_is_torchscript_zip",
+    "_load",
+)
 
 _TORCHSCRIPT_REFUSED = (
     "This TorchScript file holds more than plain weights, and TorchScript model files"
@@ -95,6 +102,13 @@ class ModelLoader:
     def _load_pth(self, path: str | Path) -> StateDict:
         # The same steps as `torch.load`, except that a TorchScript archive is read
         # by `_load_torchscript` and never by `torch.jit.load`.
+        for step in _SERIALIZATION_STEPS:
+            if not hasattr(_serialization, step):
+                raise ValueError(
+                    f"This version of PyTorch ({torch.__version__}) is not supported for"
+                    f" loading .pt, .pth and .ckpt files: torch.serialization.{step} is"
+                    " missing."
+                )
         with open(path, "rb") as file:
             if not _serialization._is_zipfile(file):
                 return _serialization._legacy_load(
