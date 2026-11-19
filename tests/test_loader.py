@@ -366,6 +366,56 @@ def test_missing_torch_serialization_step(
         ModelLoader().load_state_dict_from_file(path)
 
 
+def test_storage_larger_than_its_record(tmp_path: Path):
+    # A tensor whose storage claims 100 GB, in a zip record of 16 bytes: refused by
+    # the record's size before anything of the claimed size is allocated.
+    numel = b"\x8a\x05" + (100 * 10**9).to_bytes(5, "little")
+    data = b"\x80\x02}" + _pickled_text("w")
+    data += b"ctorch._utils\n_rebuild_tensor_v2\n((" + _pickled_text("storage")
+    data += b"ctorch\nFloatStorage\n" + _pickled_text("0") + _pickled_text("cpu")
+    data += numel + b"tQK\x00K\x04\x85K\x01\x85\x89ccollections\nOrderedDict\n)RtRs."
+    path = tmp_path / "model.pth"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("archive/data.pkl", data)
+        archive.writestr("archive/version", b"3\n")
+        archive.writestr("archive/data/0", bytes(16))
+
+    with pytest.raises(RuntimeError, match="record size"):
+        ModelLoader().load_state_dict_from_file(path)
+
+
+@pytest.mark.parametrize("zipfile_format", [True, False])
+def test_lightning_checkpoint(tmp_path: Path, zipfile_format: bool):
+    weights = {f"model.{key}": value for key, value in make_net().state_dict().items()}
+    step = torch.tensor(10.0)
+    checkpoint = {
+        "epoch": 3,
+        "global_step": 1200,
+        "pytorch-lightning_version": "2.4.0",
+        "state_dict": collections.OrderedDict(weights),
+        "hyper_parameters": {
+            "lr": 2e-4,
+            "betas": (0.9, 0.99),
+            "scales": [2, 4],
+            "name": "net",
+            "ema": True,
+            "warmup": None,
+        },
+        "optimizer_states": [
+            {
+                "state": {0: {"step": step, "exp_avg": torch.rand(4, 3, 3, 3)}},
+                "param_groups": [{"lr": 2e-4, "params": [0]}],
+            }
+        ],
+    }
+    path = tmp_path / "model.ckpt"
+    torch.save(checkpoint, path, _use_new_zipfile_serialization=zipfile_format)
+
+    actual = ModelLoader().load_state_dict_from_file(path)
+
+    assert_same_state_dict(actual, checkpoint["state_dict"])
+
+
 def test_safetensors(tmp_path: Path):
     expected = make_net().state_dict()
     path = tmp_path / "model.safetensors"
