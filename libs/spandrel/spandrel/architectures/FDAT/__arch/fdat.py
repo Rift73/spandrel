@@ -13,6 +13,7 @@ from torch.nn.init import trunc_normal_
 from torch.nn.modules.module import _IncompatibleKeys  # type: ignore
 
 from spandrel.__helpers.model_descriptor import StateDict
+from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath
 
@@ -446,6 +447,17 @@ class UniUpsampleV3(nn.Sequential):
         )
 
 
+def _fast_tokens(x: Tensor, module: nn.Module) -> bool:
+    """Whether module may run its token-order path on x: plain eager inference
+    (plain_inference) on a CUDA GPU in FP16 or BF16. Elsewhere (CPU, FP32, tracing,
+    ONNX export, training) the original operations run."""
+    return (
+        x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and plain_inference(x, module)
+    )
+
+
 # --- fdat Components ---
 class FastSpatialWindowAttention(nn.Module):
     """Window attention; with `shift`, the windows move by half a window (a roll
@@ -532,9 +544,41 @@ class FastChannelAttention(nn.Module):
             nn.Linear(dim, dim),
         )
 
+    def _gram_forward(self, qkv: Tensor) -> Tensor:
+        """The attention from one Gram matrix of [q k] over all tokens, accumulated in
+        FP32: q and k are never normalized in memory (their norms are its diagonal), and
+        the attention, which mixes v's channels head by head, is folded into the
+        projection: one GEMM of v against proj.weight @ blockdiag(attn). The
+        transposed q k^T over N tokens (a 30 x 30 output per head) ran without
+        split-K: 0.53 ms per block at 720x480 on an RTX 5090, the Gram 0.08 ms."""
+        B, N, C3 = qkv.shape
+        C = C3 // 3
+        hd = C // self.nh
+        qk = qkv[..., : 2 * C]
+        gram = torch.bmm(qk.transpose(1, 2), qk, out_dtype=torch.float32)
+        # F.normalize(t * pre, eps=eps) = t * pre / max(|t| * pre, eps)
+        pre, eps = (N**-0.5, 1e-4) if self.stable_norm else (1.0, 1e-12)
+        norm = (gram.diagonal(dim1=1, dim2=2).clamp_min(0).sqrt() * pre).clamp_min(eps)
+        nq = norm[:, :C].view(B, self.nh, hd, 1)
+        nk = norm[:, C:].view(B, self.nh, 1, hd)
+        dots = gram[:, :C, C:].view(B, self.nh, hd, self.nh, hd)
+        dots = dots.diagonal(dim1=1, dim2=3).permute(0, 3, 1, 2)  # (B, nh, hd, hd)
+        attn = torch.softmax(dots * (pre * pre) / (nq * nk) * self.temp.float(), -1)
+        # out[n, h hd + i] = sum_j attn[h, i, j] v[n, h hd + j] = v @ blockdiag(attn)^T
+        mix = attn.new_zeros(B, C, C)
+        mix.view(B, self.nh, hd, self.nh, hd).diagonal(dim1=1, dim2=3).copy_(
+            attn.permute(0, 2, 3, 1)
+        )
+        weight = (self.proj.weight.float() @ mix).to(qkv.dtype)
+        bias = self.proj.bias.to(qkv.dtype).expand(B, 1, C)
+        return torch.baddbmm(bias, qkv[..., 2 * C :], weight.transpose(1, 2))
+
     def forward(self, x, H, W):  # H, W are unused but kept for API consistency
         B, N, C = x.shape
-        qkv = self.qkv(x).view(B, N, 3, self.nh, C // self.nh).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x)
+        if _fast_tokens(qkv, self):
+            return self._gram_forward(qkv)
+        qkv = qkv.view(B, N, 3, self.nh, C // self.nh).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         if self.stable_norm:
             inv_n = N**-0.5
