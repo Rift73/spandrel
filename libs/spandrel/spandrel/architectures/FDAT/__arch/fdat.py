@@ -17,6 +17,8 @@ from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath
 
+from ...__arch_helpers.token_dwconv import token_dwconv
+
 SampleMods = Literal[
     "conv",
     "pixelshuffledirect",
@@ -609,6 +611,15 @@ class SimplifiedAIM(nn.Module):
 
     def forward(self, attn_feat, conv_feat, interaction_type, H, W):
         B, L, C = attn_feat.shape
+        if _fast_tokens(attn_feat, self):
+            # The 1x1 convolutions as Linears on the tokens: their channels-last
+            # views made the convolutions copy to NCHW and back
+            if interaction_type == "spatial_modulates_channel":
+                sm = torch.sigmoid(F.linear(attn_feat, self.sg[0].weight.view(1, C)))
+                return torch.addcmul(attn_feat, conv_feat, sm)
+            squeeze, expand = self.cg[1].weight.flatten(1), self.cg[3].weight.flatten(1)
+            cm = F.gelu(F.linear(conv_feat.mean(1, keepdim=True), squeeze))
+            return torch.addcmul(conv_feat, attn_feat, torch.sigmoid(F.linear(cm, expand)))
         if interaction_type == "spatial_modulates_channel":
             sm = (
                 self.sg(attn_feat.transpose(1, 2).view(B, C, H, W))
@@ -640,6 +651,9 @@ class SimplifiedFFN(nn.Module):
     def forward(self, x, H, W):
         B, L, _C = x.shape
         x = self.drop(self.act(self.fc1(x)))
+        x_s = token_dwconv(x, self.smix, H, W)
+        if x_s is not None:
+            return self.drop(self.fc2(x_s))
         x_s = (
             self.smix(x.transpose(1, 2).view(B, x.shape[-1], H, W))
             .view(B, x.shape[-1], L)
@@ -679,6 +693,9 @@ class SimplifiedDATBlock(nn.Module):
 
     def _conv_fwd(self, x, H, W):
         B, L, C = x.shape
+        y = token_dwconv(x, self.conv[0], H, W, gelu=True)
+        if y is not None:
+            return y
         return (
             self.conv(x.transpose(1, 2).view(B, C, H, W)).view(B, C, L).transpose(1, 2)
         )
