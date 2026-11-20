@@ -167,13 +167,16 @@ def launch(
     shift: int,
     width: int,
     scale: float,
+    masked: bool = True,
     block_m: int = TILE,
     block_n: int = TILE,
     num_warps: int = 4,
     num_stages: int = 2,
 ) -> torch.Tensor:
     """The output (B, H, W, heads * width) for qkv (B, H, W, 3, heads, head_stride)
-    contiguous, H and W multiples of the window, and bias (heads, N, N) contiguous."""
+    contiguous, H and W multiples of the window, and bias (heads, N, N) contiguous.
+    Shifted windows take Swin's mask unless masked is False (TFDATv2's windows wrap
+    around unmasked)."""
     if (window * window) % block_m or (window * window) % block_n:
         # the kernel does not mask past a window's end
         raise ValueError(
@@ -205,7 +208,7 @@ def launch(
             width,
             scale,
             window=window,
-            masked=shift > 0,
+            masked=masked and shift > 0,
             linear=linear,
             block_m=block_m,
             block_n=block_n,
@@ -249,9 +252,11 @@ def index_window_attention(
     shift: int,
     width: int,
     scale: float,
+    masked: bool = True,
 ) -> torch.Tensor | None:
     """softmax(q @ k^T * scale + bias + Swin's mask) @ v over the (shifted) windows of
-    an image's qkv (B, H, W, 3, heads, head_stride), as (B, H, W, heads * width); or
+    an image's qkv (B, H, W, 3, heads, head_stride), as (B, H, W, heads * width), the
+    mask left out when masked is False; or
     None when the caller's PyTorch path must run: the kernel may not run (usable), or it
     failed in Triton, which switches it off for the rest of the process with one
     warning. Other errors are raised."""
@@ -259,7 +264,7 @@ def index_window_attention(
     if not usable(qkv, bias, window):
         return None
     try:
-        return launch(qkv, bias, window, shift, width, scale)
+        return launch(qkv, bias, window, shift, width, scale, masked)
     except Exception as error:
         if not from_triton(error):
             raise

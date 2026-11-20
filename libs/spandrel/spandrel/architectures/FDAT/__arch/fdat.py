@@ -17,6 +17,7 @@ from spandrel.__helpers.rocm.common import plain_inference
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath
 
+from ...__arch_helpers.index_window import index_window_attention
 from ...__arch_helpers.token_dwconv import token_dwconv
 
 SampleMods = Literal[
@@ -484,6 +485,20 @@ class FastSpatialWindowAttention(nn.Module):
 
     def forward(self, x, H, W):
         B, L, C = x.shape
+        if _fast_tokens(x, self) and H % self.ws == 0 and W % self.ws == 0:
+            # One kernel reads the image's qkv and writes the output in token order:
+            # no window partition, reverse or roll copies (the shift unmasked)
+            y = index_window_attention(
+                self.qkv(x).view(B, H, W, 3, self.nh, C // self.nh),
+                self.bias.to(x.dtype),
+                self.ws,
+                self.shift,
+                C // self.nh,
+                self.scale,
+                masked=False,
+            )
+            if y is not None:
+                return self.proj(y.view(B, L, C))
         pad_r, pad_b = (
             (self.ws - W % self.ws) % self.ws,
             (self.ws - H % self.ws) % self.ws,
