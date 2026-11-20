@@ -448,9 +448,16 @@ class UniUpsampleV3(nn.Sequential):
 
 # --- fdat Components ---
 class FastSpatialWindowAttention(nn.Module):
-    def __init__(self, dim, window_size=8, num_heads=4, qkv_bias=False) -> None:
+    """Window attention; with `shift`, the windows move by half a window (a roll
+    without an attention mask: the wrapped windows at the border mix both edges,
+    as TFDATv2 trains them)."""
+
+    def __init__(
+        self, dim, window_size=8, num_heads=4, qkv_bias=False, shift=False
+    ) -> None:
         super().__init__()
         self.dim, self.ws, self.nh = dim, window_size, num_heads
+        self.shift = window_size // 2 if shift else 0
         self.scale = (dim // num_heads) ** -0.5
         self.qkv, self.proj = (
             nn.Linear(dim, dim * 3, bias=qkv_bias),
@@ -474,6 +481,10 @@ class FastSpatialWindowAttention(nn.Module):
             x = F.pad(x.view(B, H, W, C), (0, 0, 0, pad_r, 0, pad_b)).view(B, -1, C)
 
         H_pad, W_pad = H + pad_b, W + pad_r
+        if self.shift:
+            x = torch.roll(
+                x.view(B, H_pad, W_pad, C), (-self.shift, -self.shift), (1, 2)
+            )
         x = (
             x.view(B, H_pad // self.ws, self.ws, W_pad // self.ws, self.ws, C)
             .permute(0, 1, 3, 2, 4, 5)
@@ -499,15 +510,22 @@ class FastSpatialWindowAttention(nn.Module):
             .contiguous()
             .view(B, H_pad, W_pad, C)
         )
+        if self.shift:
+            x = torch.roll(x, (self.shift, self.shift), (1, 2))
         if padded:
             x = x[:, :H, :W, :].contiguous()
         return x.view(B, L, C)
 
 
 class FastChannelAttention(nn.Module):
-    def __init__(self, dim, num_heads=4, qkv_bias=False) -> None:
+    """Channel attention; `stable_norm` is TFDATv2's normalization: q and k scaled
+    by 1/sqrt(N) first (the same direction, but the sum of squares over N tokens
+    stays in FP16's range at large sizes) and an eps of 1e-4."""
+
+    def __init__(self, dim, num_heads=4, qkv_bias=False, stable_norm=False) -> None:
         super().__init__()
         self.nh = num_heads
+        self.stable_norm = stable_norm
         self.temp = nn.Parameter(torch.ones(num_heads, 1, 1))
         self.qkv, self.proj = (
             nn.Linear(dim, dim * 3, bias=qkv_bias),
@@ -518,10 +536,15 @@ class FastChannelAttention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).view(B, N, 3, self.nh, C // self.nh).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        q, k = (
-            F.normalize(q.transpose(-2, -1), dim=-1),
-            F.normalize(k.transpose(-2, -1), dim=-1),
-        )
+        if self.stable_norm:
+            inv_n = N**-0.5
+            q = F.normalize(q.transpose(-2, -1) * inv_n, dim=-1, eps=1e-4)
+            k = F.normalize(k.transpose(-2, -1) * inv_n, dim=-1, eps=1e-4)
+        else:
+            q, k = (
+                F.normalize(q.transpose(-2, -1), dim=-1),
+                F.normalize(k.transpose(-2, -1), dim=-1),
+            )
         attn = F.softmax((q @ k.transpose(-2, -1)) * self.temp, dim=-1)
         return self.proj(
             (attn @ v.transpose(-2, -1)).permute(0, 3, 1, 2).reshape(B, N, C)
@@ -582,14 +605,26 @@ class SimplifiedFFN(nn.Module):
 
 
 class SimplifiedDATBlock(nn.Module):
-    def __init__(self, dim, nh, ws, ffn_exp, aim_re, btype, dp, qkv_b=False) -> None:
+    def __init__(
+        self,
+        dim,
+        nh,
+        ws,
+        ffn_exp,
+        aim_re,
+        btype,
+        dp,
+        qkv_b=False,
+        shift=False,
+        stable_norm=False,
+    ) -> None:
         super().__init__()
         self.btype = btype
         self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.attn = (
-            FastSpatialWindowAttention(dim, ws, nh, qkv_b)
+            FastSpatialWindowAttention(dim, ws, nh, qkv_b, shift)
             if btype == "spatial"
-            else FastChannelAttention(dim, nh, qkv_b)
+            else FastChannelAttention(dim, nh, qkv_b, stable_norm)
         )
         self.conv = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=False), nn.GELU()
@@ -618,14 +653,39 @@ class SimplifiedDATBlock(nn.Module):
 
 
 class SimplifiedResidualGroup(nn.Module):
-    def __init__(self, dim, depth, nh, ws, ffn_exp, aim_re, pattern, dp_rates) -> None:
+    """`shifted_windows`: every second spatial block of the group shifts its windows
+    (TFDATv2); `stable_norm`: TFDATv2's channel attention normalization."""
+
+    def __init__(
+        self,
+        dim,
+        depth,
+        nh,
+        ws,
+        ffn_exp,
+        aim_re,
+        pattern,
+        dp_rates,
+        shifted_windows=False,
+        stable_norm=False,
+    ) -> None:
         super().__init__()
+        types = [pattern[i % len(pattern)] for i in range(depth)]
+        spatial = [i for i, btype in enumerate(types) if btype == "spatial"]
         self.blocks = nn.ModuleList(
             [
                 SimplifiedDATBlock(
-                    dim, nh, ws, ffn_exp, aim_re, pattern[i % len(pattern)], dp_rates[i]
+                    dim,
+                    nh,
+                    ws,
+                    ffn_exp,
+                    aim_re,
+                    btype,
+                    dp_rates[i],
+                    shift=shifted_windows and i in spatial[1::2],
+                    stable_norm=stable_norm,
                 )
-                for i in range(depth)
+                for i, btype in enumerate(types)
             ]
         )
         self.conv = nn.Conv2d(dim, dim, 3, 1, 1, bias=False)

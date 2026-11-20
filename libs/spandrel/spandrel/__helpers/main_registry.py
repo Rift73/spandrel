@@ -27,6 +27,7 @@ from ..architectures import (
     SAFMNBCIE,
     SPAN,
     SST,
+    TFDAT,
     WSR,
     AuraSR,
     Compact,
@@ -107,6 +108,9 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(GaterV3.GaterV3Arch()),
     ArchSupport.from_architecture(SMoSR.SMoSRArch()),
     ArchSupport.from_architecture(RCAN.RCANArch()),
+    # Before FDAT: a TFDAT file holds all the keys FDAT checks for as well.
+    ArchSupport.from_architecture(TFDAT.TFDATArch()),
+    ArchSupport.from_architecture(TFDAT.TFDATv2Arch()),
     ArchSupport.from_architecture(FDAT.FDATArch()),
     ArchSupport.from_architecture(AuraSR.AuraSRArch()),
     ArchSupport.from_architecture(DRFT.DRFTArch()),
