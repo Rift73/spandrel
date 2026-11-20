@@ -45,17 +45,22 @@ class LightFlowNet(nn.Module):
 
 def warp_frame(x: Tensor, flow: Tensor) -> Tensor:
     """x (B,C,H,W) warped by flow (B,2,H,W, pixels): bilinear sampling by gathers,
-    the coordinates clamped to the frame (border replication). The coordinates are
-    built in x's dtype."""
+    the coordinates clamped to the frame (border replication).
+
+    The coordinates, the weights and the sum are FP32 whatever x's dtype: FP16 spaces
+    its values 0.5 apart from 512 and BF16 1 apart from 128 (2 from 256), which would
+    snap the sampling positions and, in BF16, round H - 1 = 479 up past the frame.
+    For FP32 inputs these are the source's operations."""
     B, C, H, W = x.shape
+    flow = flow.float()
 
     yy = (
-        torch.arange(H, device=x.device, dtype=x.dtype)
+        torch.arange(H, device=x.device, dtype=torch.float32)
         .view(1, 1, H, 1)
         .expand(B, 1, H, W)
     )
     xx = (
-        torch.arange(W, device=x.device, dtype=x.dtype)
+        torch.arange(W, device=x.device, dtype=torch.float32)
         .view(1, 1, 1, W)
         .expand(B, 1, H, W)
     )
@@ -63,8 +68,8 @@ def warp_frame(x: Tensor, flow: Tensor) -> Tensor:
     new_x = xx + flow[:, 0:1]
     new_y = yy + flow[:, 1:2]
 
-    max_x = torch.tensor(W - 1, device=x.device, dtype=x.dtype)
-    max_y = torch.tensor(H - 1, device=x.device, dtype=x.dtype)
+    max_x = torch.tensor(W - 1, device=x.device, dtype=torch.float32)
+    max_y = torch.tensor(H - 1, device=x.device, dtype=torch.float32)
 
     new_x = new_x.clamp(0, max_x)
     new_y = new_y.clamp(0, max_y)
@@ -99,7 +104,7 @@ def warp_frame(x: Tensor, flow: Tensor) -> Tensor:
     w10 = (1 - dx) * dy
     w11 = dx * dy
 
-    return w00 * p00 + w01 * p01 + w10 * p10 + w11 * p11
+    return (w00 * p00 + w01 * p01 + w10 * p10 + w11 * p11).to(x.dtype)
 
 
 @store_hyperparameters()

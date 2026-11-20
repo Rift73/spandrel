@@ -7,6 +7,7 @@ from spandrel import MAIN_REGISTRY
 from spandrel.architectures.FDAT import FDAT
 from spandrel.architectures.FDAT.__arch.fdat import SimplifiedDATBlock
 from spandrel.architectures.TFDAT import TFDAT, TFDATArch, TFDATv2, TFDATv2Arch
+from spandrel.architectures.TFDAT.__arch.tfdat import warp_frame
 
 from .util import assert_loads_correctly, skip_if_unchanged
 
@@ -178,4 +179,16 @@ def test_tags_and_settings():
     v1 = TFDATArch().load(TFDAT(scale=1).state_dict())
     assert v1.purpose == "Restoration"
     assert v1.model.align == 32
-    assert not v1.supports_bfloat16
+    assert v1.supports_bfloat16
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_v1_warp_samples_in_fp32(dtype: torch.dtype):
+    # 480 x 720: FP16 spaces coordinates past 512 by 0.5, and BF16 rounds
+    # H - 1 = 479 up to 480, past the frame
+    generator = torch.Generator().manual_seed(2)
+    frame = torch.rand(1, 3, 480, 720, generator=generator).to(dtype)
+    flow = (torch.rand(1, 2, 480, 720, generator=generator) * 8 - 4).to(dtype)
+    warped = warp_frame(frame, flow)
+    assert warped.dtype == dtype
+    assert torch.equal(warped, warp_frame(frame.float(), flow.float()).to(dtype))

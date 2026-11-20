@@ -95,7 +95,6 @@ def _descriptor(
     model: M,
     state_dict: StateDict,
     settings: _Settings,
-    supports_bfloat16: bool,
 ) -> ImageModelDescriptor[M]:
     scale = model.upscale
     return ImageModelDescriptor(
@@ -110,7 +109,7 @@ def _descriptor(
             "temporal",
         ],
         supports_half=True,
-        supports_bfloat16=supports_bfloat16,
+        supports_bfloat16=True,
         scale=scale,
         input_channels=model.num_in_ch,
         output_channels=settings["num_out_ch"],
@@ -143,9 +142,7 @@ class TFDATArch(Architecture[TFDAT]):
         # The clip size is in no weight (the neighbours are averaged), and the
         # trainer always builds TFDAT with 5 frames.
         model = TFDAT(**settings, clip_size=5, flow_base_ch=flow_first.shape[0])
-        # the warp builds its pixel coordinates in the input's dtype, which BF16
-        # holds exactly only up to 256
-        return _descriptor(self, model, state_dict, settings, supports_bfloat16=False)
+        return _descriptor(self, model, state_dict, settings)
 
 
 class TFDATv2Arch(Architecture[TFDATv2]):
@@ -179,7 +176,7 @@ class TFDATv2Arch(Architecture[TFDATv2]):
         model = TFDATv2(
             **settings, clip_size=clip_size, flow_base_ch=flow_first.shape[0]
         )
-        return _descriptor(self, model, state_dict, settings, supports_bfloat16=True)
+        return _descriptor(self, model, state_dict, settings)
 
 
 __all__ = ["TFDAT", "TFDATArch", "TFDATv2", "TFDATv2Arch"]
