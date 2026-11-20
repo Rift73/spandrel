@@ -18,7 +18,11 @@ import logging
 import torch
 from torch import nn
 
-from spandrel.__helpers.rocm.common import from_triton, is_depthwise_3x3, plain_inference
+from spandrel.__helpers.rocm.common import (
+    from_triton,
+    is_depthwise_3x3,
+    plain_inference,
+)
 
 try:
     import triton

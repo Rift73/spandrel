@@ -635,7 +635,9 @@ class SimplifiedAIM(nn.Module):
                 return torch.addcmul(attn_feat, conv_feat, sm)
             squeeze, expand = self.cg[1].weight.flatten(1), self.cg[3].weight.flatten(1)
             cm = F.gelu(F.linear(conv_feat.mean(1, keepdim=True), squeeze))
-            return torch.addcmul(conv_feat, attn_feat, torch.sigmoid(F.linear(cm, expand)))
+            return torch.addcmul(
+                conv_feat, attn_feat, torch.sigmoid(F.linear(cm, expand))
+            )
         if interaction_type == "spatial_modulates_channel":
             sm = (
                 self.sg(attn_feat.transpose(1, 2).view(B, C, H, W))
