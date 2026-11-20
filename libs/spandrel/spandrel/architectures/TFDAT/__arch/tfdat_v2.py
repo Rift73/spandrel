@@ -13,6 +13,7 @@ from spandrel.__helpers.model_descriptor import StateDict
 from spandrel.util import store_hyperparameters
 
 from ...FDAT.__arch.fdat import SampleMods3, SimplifiedResidualGroup, UniUpsampleV3
+from .warp_triton import warp
 
 
 def warp_frame(x: Tensor, flow: Tensor) -> Tensor:
@@ -22,6 +23,9 @@ def warp_frame(x: Tensor, flow: Tensor) -> Tensor:
     The sampling position is an exact integer grid plus the flow's floor, and the
     weights come from the flow's fraction alone, so they keep their precision in
     FP16 at any frame size."""
+    out = warp(x, flow)
+    if out is not None:
+        return out
     B, C, H, W = x.shape
 
     yy = torch.arange(H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
