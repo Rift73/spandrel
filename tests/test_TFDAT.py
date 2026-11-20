@@ -4,9 +4,12 @@ import pytest
 import torch
 
 from spandrel import MAIN_REGISTRY
+from spandrel.architectures.__arch_helpers import index_window, token_dwconv
 from spandrel.architectures.FDAT import FDAT
+from spandrel.architectures.FDAT.__arch import fdat
 from spandrel.architectures.FDAT.__arch.fdat import SimplifiedDATBlock
 from spandrel.architectures.TFDAT import TFDAT, TFDATArch, TFDATv2, TFDATv2Arch
+from spandrel.architectures.TFDAT.__arch import tfdat_v2, warp_triton
 from spandrel.architectures.TFDAT.__arch.tfdat import warp_frame
 
 from .util import assert_loads_correctly, skip_if_unchanged
@@ -194,3 +197,81 @@ def test_v1_warp_samples_in_fp32(dtype: torch.dtype):
     warped = warp_frame(frame, flow)
     assert warped.dtype == dtype
     assert torch.equal(warped, warp_frame(frame.float(), flow.float()).to(dtype))
+
+
+needs_kernels = pytest.mark.skipif(
+    not (
+        token_dwconv.AVAILABLE
+        and torch.cuda.is_available()
+        and torch.version.hip is None
+    ),
+    reason="the kernels run on NVIDIA GPUs with Triton",
+)
+
+
+@needs_kernels
+@pytest.mark.parametrize("version", [TFDAT, TFDATv2])
+@pytest.mark.parametrize(
+    ("batch", "size"),
+    [(1, (32, 64)), (2, (48, 32)), (1, (27, 45))],
+    ids=["aligned", "batch", "padded"],
+)
+def test_fp16_token_paths_match_the_original_operations(
+    monkeypatch: pytest.MonkeyPatch,
+    version: Version,
+    batch: int,
+    size: tuple[int, int],
+):
+    model = _random(_small(version)).cuda().half()
+    clip = _clip(model.clip_size, *size).repeat(batch, 1, 1, 1, 1).cuda().half()
+    clip[1:] = clip[1:].flip(-1)
+    calls: dict[str, int] = {"dwconv": 0, "window": 0, "warp": 0}
+
+    def counted(module, name: str, key: str):
+        original = getattr(module, name)
+
+        def run(*args, **kwargs):
+            calls[key] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, run)
+
+    counted(fdat, "token_dwconv", "dwconv")
+    counted(fdat, "index_window_attention", "window")
+    counted(tfdat_v2, "warp", "warp")
+    with torch.inference_mode():
+        actual = model(clip)
+        assert token_dwconv.TOKEN_DWCONV and index_window.INDEX_WINDOW
+        assert warp_triton.WARP
+        # 4 blocks per group, 2 groups: 8 block convolutions and 8 FFN ones
+        assert calls["dwconv"] == 16
+        # the padded model input is aligned: every spatial block runs the kernel
+        assert calls["window"] == 4
+        assert calls["warp"] == (3 * (model.clip_size - 1) if version is TFDATv2 else 0)
+        monkeypatch.setattr(fdat, "_fast_tokens", lambda *_: False)
+        monkeypatch.setattr(token_dwconv, "TOKEN_DWCONV", False)
+        monkeypatch.setattr(warp_triton, "WARP", False)
+        expected = model(clip)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0.02)
+
+
+@needs_kernels
+@pytest.mark.parametrize(
+    ("n", "c", "h", "w"), [(1, 3, 48, 72), (8, 3, 30, 44), (2, 64, 12, 18)]
+)
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_v2_warp_kernel_is_the_gathers_bit_for_bit(
+    monkeypatch: pytest.MonkeyPatch, n: int, c: int, h: int, w: int, channels_last: bool
+):
+    generator = torch.Generator().manual_seed(3)
+    frame = torch.rand(n, c, h, w, generator=generator).cuda().half()
+    if channels_last:
+        frame = frame.contiguous(memory_format=torch.channels_last)
+    # flows past the border on every side, fractions everywhere
+    flow = ((torch.rand(n, 2, h, w, generator=generator) - 0.5) * 2 * w).cuda().half()
+    with torch.inference_mode():
+        actual = warp_triton.warp(frame, flow)
+        monkeypatch.setattr(warp_triton, "WARP", False)
+        expected = tfdat_v2.warp_frame(frame, flow)
+    assert actual is not None
+    assert torch.equal(actual, expected)
