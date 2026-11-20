@@ -247,7 +247,9 @@ def test_fp16_token_paths_match_the_original_operations(
         assert calls["dwconv"] == 16
         # the padded model input is aligned: every spatial block runs the kernel
         assert calls["window"] == 4
-        assert calls["warp"] == (3 * (model.clip_size - 1) if version is TFDATv2 else 0)
+        # three warps (the frame, two pyramid levels) per group of neighbour pairs
+        groups = -(-(model.clip_size - 1) // tfdat_v2.FLOW_PAIRS)
+        assert calls["warp"] == (3 * groups if version is TFDATv2 else 0)
         monkeypatch.setattr(fdat, "_fast_tokens", lambda *_: False)
         monkeypatch.setattr(token_dwconv, "TOKEN_DWCONV", False)
         monkeypatch.setattr(warp_triton, "WARP", False)
@@ -275,3 +277,75 @@ def test_v2_warp_kernel_is_the_gathers_bit_for_bit(
         expected = tfdat_v2.warp_frame(frame, flow)
     assert actual is not None
     assert torch.equal(actual, expected)
+
+
+def _moving_clip(clip_size: int, batch: int = 1) -> torch.Tensor:
+    """Frames of one picture moving a few pixels a frame, each clip of the batch its
+    own picture and direction."""
+    generator = torch.Generator().manual_seed(5)
+    picture = torch.rand(batch, 3, 48, 72, generator=generator)
+    frames = [
+        torch.stack(
+            [
+                picture[b].roll((t * (b + 1), -2 * t), (-2, -1))[:, 6:38, 6:70]
+                for t in range(clip_size)
+            ]
+        )
+        for b in range(batch)
+    ]
+    return torch.stack(frames)
+
+
+@pytest.mark.parametrize(
+    ("clip_size", "batch"),
+    [(9, 1), (7, 1), (9, 2), (3, 1)],
+    ids=["9", "7", "batch", "3"],
+)
+def test_v2_flow_pair_batches_equal_one_pair_at_a_time(
+    monkeypatch: pytest.MonkeyPatch, clip_size: int, batch: int
+):
+    # clip 7: 6 neighbours, a group of 4 and one of 2; clip 3: one group of 2
+    model = _random(_small(TFDATv2, clip_size=clip_size))
+    clip = _moving_clip(clip_size, batch)
+    with torch.inference_mode():
+        grouped = model(clip)
+        monkeypatch.setattr(tfdat_v2, "FLOW_PAIRS", 1)
+        one_by_one = model(clip)
+    # not bit for bit: a convolution's sums over a larger batch may take another order
+    torch.testing.assert_close(grouped, one_by_one, rtol=0, atol=1e-5)
+
+
+def test_v2_trace_keeps_one_flow_pair_at_a_time(monkeypatch: pytest.MonkeyPatch):
+    # the exported graph (and the engines built from it) stays the one of a pair per step
+    model = _random(_small(TFDATv2, clip_size=7))
+    clip = _moving_clip(7)
+    with torch.no_grad():
+        traced = torch.jit.trace(model, clip)
+        monkeypatch.setattr(tfdat_v2, "FLOW_PAIRS", 1)
+        one_by_one = torch.jit.trace(model, clip)
+
+    def kinds(module: torch.jit.ScriptModule) -> list[str]:
+        return [node.kind() for node in module.inlined_graph.nodes()]
+
+    assert kinds(traced) == kinds(one_by_one)
+    with torch.no_grad():
+        assert torch.equal(traced(clip), one_by_one(clip))
+
+
+@pytest.mark.parametrize(
+    ("limit", "batches"), [(32 * 64, [1, 4, 2]), (32 * 64 - 1, [1] * 7)]
+)
+def test_v2_flow_pair_batches_up_to_the_frame_size_limit(
+    monkeypatch: pytest.MonkeyPatch, limit: int, batches: list[int]
+):
+    # a 32 x 64 clip (no padding): at the limit the 6 neighbours of clip 7 run as
+    # groups of 4 and 2 after the centre, one pixel over the limit one at a time
+    monkeypatch.setattr(tfdat_v2, "FLOW_PAIRS_PIXELS", limit)
+    model = _random(_small(TFDATv2, clip_size=7))
+    seen: list[int] = []
+    model.flow_net.enc1.register_forward_hook(
+        lambda _m, i, _o: seen.append(i[0].shape[0])
+    )
+    with torch.inference_mode():
+        model(_moving_clip(7))
+    assert seen == batches

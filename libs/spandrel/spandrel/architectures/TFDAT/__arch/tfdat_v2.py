@@ -71,6 +71,15 @@ def warp_frame(x: Tensor, flow: Tensor) -> Tensor:
     return w00 * p00 + w01 * p01 + w10 * p10 + w11 * p11
 
 
+# Eager runs estimate the motion of FLOW_PAIRS neighbour pairs in one batch for padded
+# frames up to FLOW_PAIRS_PIXELS, one pair at a time above. Measured on an RTX 5090, FP16,
+# 9-frame clips, against one pair at a time: 720x480 -17.6 %, 720x576 -12.9 %, 1280x720
+# -2.1 %, 1920x1080 +1.2 % (the whole clip in one batch was slower than 4 at 720x480 and
+# 720x576 and than 1 at 1280x720).
+FLOW_PAIRS = 4
+FLOW_PAIRS_PIXELS = 720 * 576
+
+
 def _flow_head(in_ch: int, hidden_ch: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Conv2d(in_ch, hidden_ch, 3, 1, 1),
@@ -357,19 +366,39 @@ class TFDATv2(nn.Module):
 
         center = x[:, center_idx]
 
-        # The centre frame's pyramid is encoded once for every pair.
+        # The centre frame's pyramid is encoded once for every pair. Eager runs on frames
+        # up to FLOW_PAIRS_PIXELS take FLOW_PAIRS neighbours per batch (the last group
+        # may be smaller); larger frames and a trace (ONNX export: the graph engines are
+        # built from) one pair per step.
         pyr_center = self.flow_net.encode(center)
-        warped_neighbors = []
-        warp_errs = []
-        for t in range(T):
-            if t == center_idx:
-                continue
-            neighbor = x[:, t]
-            flow = self.flow_net(self.flow_net.encode(neighbor), pyr_center)
+        neighbors = [t for t in range(T) if t != center_idx]
+        pairs = (
+            1
+            if torch.jit.is_tracing()
+            or torch.onnx.is_in_onnx_export()
+            or center.shape[-2] * center.shape[-1] > FLOW_PAIRS_PIXELS
+            else FLOW_PAIRS
+        )
+        warped_neighbors: list[Tensor] = []
+        warp_errs: list[Tensor] = []
+        for start in range(0, T - 1, pairs):
+            group = neighbors[start : start + pairs]
+            n = len(group)
+            if n == 1:
+                neighbor, target = x[:, group[0]], pyr_center
+            else:
+                # (B * n, ...), each clip's neighbours next to each other
+                neighbor = x[:, group].flatten(0, 1)
+                target = tuple(
+                    f[:, None].expand(B, n, *f.shape[1:]).flatten(0, 1)
+                    for f in pyr_center
+                )
+            flow = self.flow_net(self.flow_net.encode(neighbor), target)
             warped = warp_frame(neighbor, flow)
-            warped_neighbors.append(warped)
-            # the photometric error: a signal of occlusion or misalignment
-            warp_errs.append((warped - center).abs().mean(dim=1, keepdim=True))
+            for w in [warped] if n == 1 else warped.unflatten(0, (B, n)).unbind(1):
+                warped_neighbors.append(w)
+                # the photometric error: a signal of occlusion or misalignment
+                warp_errs.append((w - center).abs().mean(dim=1, keepdim=True))
 
         center_feat = self._to_feat(center)
         neighbor_feats = [
