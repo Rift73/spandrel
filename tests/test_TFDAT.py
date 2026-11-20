@@ -175,11 +175,13 @@ def test_tags_and_settings():
     assert descriptor.scale == 2
     assert descriptor.model.clip_size == 9
     assert descriptor.model.align == 16
-    assert descriptor.supports_bfloat16
+    assert descriptor.supports_half
+    assert not descriptor.supports_bfloat16
     v1 = TFDATArch().load(TFDAT(scale=1).state_dict())
     assert v1.purpose == "Restoration"
     assert v1.model.align == 32
-    assert v1.supports_bfloat16
+    assert v1.supports_half
+    assert not v1.supports_bfloat16
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

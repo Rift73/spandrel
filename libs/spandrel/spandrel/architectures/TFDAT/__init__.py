@@ -109,7 +109,8 @@ def _descriptor(
             "temporal",
         ],
         supports_half=True,
-        supports_bfloat16=True,
+        # BF16 costs up to 11 levels (v2) and 40 (v1) against FP32, FP16 under 6
+        supports_bfloat16=False,
         scale=scale,
         input_channels=model.num_in_ch,
         output_channels=settings["num_out_ch"],
