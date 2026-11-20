@@ -215,3 +215,34 @@ def test_shifted_windows_past_a_grid_axis_match_the_window_copies(
         monkeypatch.setattr(index_window, "INDEX_WINDOW", False)
         expected = model(image)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0.02)
+
+
+def _rolled_windows(qkv, bias, window, shift, width, scale):
+    """The attention of the image's windows rolled by (-shift, -shift), without a mask,
+    in FP32 PyTorch operations, as (B, H, W, heads * width)."""
+    b, h, w, _, heads, _ = qkv.shape
+    x = torch.roll(qkv.float(), (-shift, -shift), (1, 2))[..., :width]
+    x = x.view(b, h // window, window, w // window, window, 3, heads, width)
+    x = x.permute(5, 0, 1, 3, 6, 2, 4, 7).reshape(3, -1, heads, window * window, width)
+    q, k, v = x.unbind(0)
+    attn = torch.softmax(q @ k.transpose(-2, -1) * scale + bias.float(), -1) @ v
+    y = attn.view(b, h // window, w // window, heads, window, window, width)
+    y = y.permute(0, 1, 4, 2, 5, 3, 6).reshape(b, h, w, heads * width)
+    return torch.roll(y, (shift, shift), (1, 2))
+
+
+@needs_kernel
+@pytest.mark.parametrize(("window", "shift"), [(8, 4), (16, 8), (8, 0)])
+def test_shifted_windows_without_the_mask(window: int, shift: int):
+    # TFDATv2's shifted windows wrap around unmasked; masked=True (the default) is
+    # Swin's, which differs exactly in the wrapped windows
+    generator = torch.Generator().manual_seed(4)
+    qkv = torch.randn(2, 2 * window, 3 * window, 3, 2, 16, generator=generator)
+    bias = torch.randn(2, window * window, window * window, generator=generator)
+    qkv, bias = qkv.cuda().half(), bias.cuda().half()
+    scale = 16**-0.5
+    unmasked = index_window.launch(qkv, bias, window, shift, 16, scale, masked=False)
+    expected = _rolled_windows(qkv, bias, window, shift, 16, scale)
+    torch.testing.assert_close(unmasked.float(), expected, rtol=0, atol=2e-3)
+    masked = index_window.launch(qkv, bias, window, shift, 16, scale)
+    assert torch.equal(masked, unmasked) == (shift == 0)
