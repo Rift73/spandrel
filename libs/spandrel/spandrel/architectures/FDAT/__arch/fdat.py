@@ -18,6 +18,7 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath
 
 from ...__arch_helpers.index_window import index_window_attention
+from ...__arch_helpers.padded_norm import KernelLayerNorm
 from ...__arch_helpers.token_dwconv import token_dwconv
 
 SampleMods = Literal[
@@ -693,7 +694,8 @@ class SimplifiedDATBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.btype = btype
-        self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        # (KernelLayerNorm: nn.LayerNorm's parameters, keys and exports)
+        self.n1, self.n2 = KernelLayerNorm(dim), KernelLayerNorm(dim)
         self.attn = (
             FastSpatialWindowAttention(dim, ws, nh, qkv_b, shift)
             if btype == "spatial"
