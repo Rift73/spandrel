@@ -43,8 +43,9 @@ dynamic = ["version"]
 license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
-# each architecture's original license
-"spandrel.architectures" = ["*/__arch/LICENSE"]
+# the original license of each vendored file
+"spandrel.architectures" = ["*/__arch/*LICENSE*"]
+"spandrel.util.timm" = ["LICENSE"]
 
 [tool.setuptools.dynamic]
 version = { attr = "spandrel.__version__" }
