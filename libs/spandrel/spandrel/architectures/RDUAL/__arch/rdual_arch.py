@@ -5103,12 +5103,13 @@ class RDUAL(nn.Module):
         features = stem + self.trunk_end(self.final_norm(h))
         t2 = self.tail[:4](features) + hr
         # Without gradients the deployed stage runs in bands: the same result
-        # with one band's expanded features alive instead of the frame's.
-        if (
-            not torch.is_grad_enabled()
-            and isinstance(self.tail[4], nn.Conv2d)
-            and isinstance(self.tail[6], nn.Conv2d)
-        ):
+        # with one band's expanded features alive instead of the frame's. Only a
+        # 2x tail ends in that one stage; 1x and 4x run theirs whole.
+        if not torch.is_grad_enabled() and [type(m) for m in self.tail[4:]] == [
+            nn.Conv2d,
+            nn.PixelShuffle,
+            nn.Conv2d,
+        ]:
             out = self._tail_bands(t2)
         else:
             out = self.tail[4:](t2)

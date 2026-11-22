@@ -157,21 +157,44 @@ def test_window_memory_modes(monkeypatch):
     torch.testing.assert_close(on_demand, default, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("size", [(5, 9), (37, 50), (64, 42)])
-def test_the_last_stage_in_bands_is_the_whole_frame_stage(monkeypatch, size):
-    # Without gradients the deployed tail runs in bands; with them, on the whole
-    # frame. Two rows of t2 per band, so bands meet inside the frame and at its edges.
-    model = RDUAL(scale=2, use_checkpoint=False).eval()
+@pytest.mark.parametrize(
+    ("scale", "size"),
+    [(2, (5, 9)), (2, (37, 50)), (2, (64, 42)), (1, (37, 50)), (4, (37, 50))],
+)
+def test_the_last_stage_in_bands_is_the_whole_frame_stage(monkeypatch, scale, size):
+    # Without gradients the deployed 2x tail runs in bands; with them, and at 1x and
+    # 4x, on the whole frame. Two rows of t2 per band, so bands meet inside the
+    # frame and at its edges.
+    model = RDUAL(scale=scale, use_checkpoint=False).eval()
     model.get_buffer("flow_loaded").fill_(True)
     model.prepare_for_export()
     monkeypatch.setattr(rdual_arch, "_TAIL_BAND_BYTES", 256 * size[1] * 4 * 2)
+    # The bands run tail[4]'s weights directly; the whole-frame stage calls it.
+    whole_frame = []
+    model.tail[4].register_forward_hook(lambda *_: whole_frame.append(True))
     frames = torch.rand(1, 2, 3, *size)
     guidance = torch.zeros(1, 1, 2, 2, (size[0] + 3) // 4 * 2, (size[1] + 3) // 4 * 2)
     with torch.no_grad():
         banded = model(frames, guidance)
+    assert len(whole_frame) == (0 if scale == 2 else 2)
     with torch.enable_grad():
         whole = model(frames, guidance)
+    assert len(whole_frame) == (2 if scale == 2 else 4)
+    assert banded.shape == (1, 2, 3, size[0] * scale, size[1] * scale)
     torch.testing.assert_close(banded, whole.detach())
+
+
+@pytest.mark.parametrize("scale", [1, 2, 4])
+def test_windows_without_gradients_match_the_clip_with_them(scale):
+    model = _model(scale=scale).eval()
+    model.prepare_for_export()
+    frames = torch.rand(1, 3, 3, 32, 40)
+    with torch.inference_mode():
+        window, _ = run_window(model, frames, 3)
+    with torch.enable_grad():
+        whole = model(frames)
+    assert window.shape == (1, 3, 3, 32 * scale, 40 * scale)
+    torch.testing.assert_close(window, whole.detach())
 
 
 def test_a_tile_that_covers_the_frame_is_the_untiled_window():
