@@ -51,6 +51,7 @@ from ..architectures import (
     SCUNet,
     SeemoRe,
     SMoSR,
+    SMoVSR,
     SwiftSRGAN,
     Swin2SR,
     SwinIR,
@@ -107,6 +108,7 @@ MAIN_REGISTRY.add(
     ArchSupport.from_architecture(MoESR.MoESRArch()),
     ArchSupport.from_architecture(GaterV3.GaterV3Arch()),
     ArchSupport.from_architecture(SMoSR.SMoSRArch()),
+    ArchSupport.from_architecture(SMoVSR.SMoVSRArch()),
     ArchSupport.from_architecture(RCAN.RCANArch()),
     # Before FDAT: a TFDAT file holds all the keys FDAT checks for as well.
     ArchSupport.from_architecture(TFDAT.TFDATArch()),
